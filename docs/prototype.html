@@ -1,0 +1,1139 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Agent Loop 驅動的通用會議成果 HTML 原型">
+  <title>會議成果｜Agent Loop 通用原型</title>
+  <style>
+    :root {
+      --canvas: #f4f2ed;
+      --paper: #fffdfa;
+      --paper-soft: #f9f7f2;
+      --ink: #1e2421;
+      --muted: #69716c;
+      --line: #dddcd5;
+      --line-strong: #c9c8c0;
+      --brand: #145f4b;
+      --brand-strong: #0b4536;
+      --brand-soft: #e1f1ea;
+      --amber: #9b5a0a;
+      --amber-soft: #fff0d9;
+      --red: #9d3939;
+      --red-soft: #fbe8e6;
+      --blue: #2d5e8b;
+      --blue-soft: #e5eff8;
+      --violet: #67558b;
+      --violet-soft: #eee9f8;
+      --shadow: 0 18px 46px rgb(29 39 34 / 8%);
+      --radius: 16px;
+      --sidebar: 264px;
+      --topbar: 64px;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+      --serif: "Iowan Old Style", "Noto Serif TC", "Songti TC", Georgia, serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      scroll-padding-top: calc(var(--topbar) + 28px);
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 82% 5%, rgb(20 95 75 / 8%), transparent 27rem),
+        var(--canvas);
+      color: var(--ink);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.7;
+    }
+
+    button, textarea, input { font: inherit; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    a { color: var(--brand); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    a:hover { color: var(--brand-strong); }
+    svg { display: block; }
+
+    .topbar {
+      position: fixed;
+      inset: 0 0 auto;
+      z-index: 50;
+      height: var(--topbar);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 0 24px;
+      border-bottom: 1px solid rgb(201 200 192 / 75%);
+      background: rgb(255 253 250 / 86%);
+      backdrop-filter: blur(18px);
+    }
+
+    .brand, .top-actions, .live-state, .meta-row, .button-content {
+      display: flex;
+      align-items: center;
+    }
+
+    .brand { gap: 10px; font-weight: 750; letter-spacing: -.02em; }
+    .brand-mark {
+      width: 28px;
+      aspect-ratio: 1;
+      display: grid;
+      place-items: center;
+      border-radius: 9px;
+      color: white;
+      background: var(--brand);
+      box-shadow: inset 0 0 0 1px rgb(255 255 255 / 18%);
+    }
+
+    .top-actions { gap: 10px; }
+    .live-state {
+      gap: 8px;
+      padding: 7px 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: var(--paper);
+      font-size: 13px;
+    }
+
+    .live-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #df4c45;
+      box-shadow: 0 0 0 4px rgb(223 76 69 / 13%);
+      animation: pulse 1.8s infinite;
+    }
+
+    @keyframes pulse {
+      50% { box-shadow: 0 0 0 7px rgb(223 76 69 / 4%); }
+    }
+
+    .btn {
+      min-height: 38px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 8px 14px;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      color: var(--ink);
+      background: var(--paper);
+      cursor: pointer;
+      font-weight: 650;
+      transition: transform .16s ease, border-color .16s ease, background .16s ease;
+    }
+
+    .btn:hover { transform: translateY(-1px); border-color: var(--brand); }
+    .btn:focus-visible, a:focus-visible, textarea:focus-visible, input:focus-visible {
+      outline: 3px solid rgb(20 95 75 / 24%);
+      outline-offset: 2px;
+    }
+
+    .btn-primary { color: white; border-color: var(--brand); background: var(--brand); }
+    .btn-primary:hover { background: var(--brand-strong); }
+    .btn-quiet { border-color: transparent; background: transparent; }
+    .menu-button { display: none; width: 40px; padding: 0; }
+
+    .app-shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: var(--sidebar) minmax(0, 1fr);
+      padding-top: var(--topbar);
+    }
+
+    .sidebar {
+      position: fixed;
+      z-index: 30;
+      top: var(--topbar);
+      bottom: 0;
+      width: var(--sidebar);
+      padding: 26px 18px;
+      overflow-y: auto;
+      border-right: 1px solid var(--line);
+      background: rgb(249 247 242 / 82%);
+    }
+
+    .nav-label {
+      margin: 0 10px 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .11em;
+      text-transform: uppercase;
+    }
+
+    .side-nav { display: grid; gap: 3px; margin-bottom: 24px; }
+    .side-nav a {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px;
+      border-radius: 9px;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 620;
+    }
+
+    .side-nav a:hover, .side-nav a.active { color: var(--brand); background: var(--brand-soft); }
+    .side-nav small { color: #90958f; font-size: 11px; }
+
+    .sidebar-card {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--paper);
+    }
+
+    .sidebar-card strong { display: block; margin-bottom: 4px; font-size: 13px; }
+    .sidebar-card p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+
+    main {
+      grid-column: 2;
+      width: min(1120px, calc(100% - 56px));
+      margin: 0 auto;
+      padding: 46px 0 96px;
+    }
+
+    .document-header { margin-bottom: 28px; }
+    .eyebrow {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      color: var(--brand);
+      font-size: 12px;
+      font-weight: 850;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before { content: ""; width: 22px; height: 2px; background: currentColor; }
+    h1, h2, h3, p { overflow-wrap: anywhere; }
+    h1 {
+      max-width: 850px;
+      margin: 0 0 14px;
+      font-family: var(--serif);
+      font-size: clamp(35px, 5vw, 58px);
+      line-height: 1.12;
+      letter-spacing: -.04em;
+    }
+
+    .lede { max-width: 760px; margin: 0; color: var(--muted); font-size: 17px; }
+    .meta-row { flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+    .meta-chip, .tag, .source-link, .speaker-filter {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+    }
+
+    .meta-chip { padding: 6px 10px; border: 1px solid var(--line); color: var(--muted); background: var(--paper); font-size: 12px; }
+    .tag { padding: 3px 8px; color: var(--brand); background: var(--brand-soft); font-size: 11px; font-weight: 750; }
+    .tag-amber { color: var(--amber); background: var(--amber-soft); }
+    .tag-violet { color: var(--violet); background: var(--violet-soft); }
+    .tag-blue { color: var(--blue); background: var(--blue-soft); }
+
+    .section { margin-top: 64px; }
+    .section-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 18px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .section-kicker { margin: 0 0 2px; color: var(--brand); font-size: 11px; font-weight: 850; letter-spacing: .1em; text-transform: uppercase; }
+    h2 { margin: 0; font-family: var(--serif); font-size: clamp(25px, 3vw, 34px); line-height: 1.25; letter-spacing: -.025em; }
+    h3 { margin: 0 0 8px; font-size: 16px; line-height: 1.35; }
+    .section-note { max-width: 470px; margin: 0; color: var(--muted); font-size: 13px; text-align: right; }
+
+    .grid { display: grid; gap: 16px; }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-sidebar { grid-template-columns: minmax(0, 1.6fr) minmax(280px, .8fr); }
+
+    .card {
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+      box-shadow: 0 1px 0 rgb(255 255 255 / 75%) inset;
+    }
+
+    .card-soft { background: var(--paper-soft); }
+    .card-brand { border-color: rgb(20 95 75 / 20%); background: linear-gradient(145deg, var(--brand-soft), var(--paper)); }
+    .metric { font-family: var(--serif); font-size: 29px; line-height: 1.1; }
+    .metric-label { margin-top: 5px; color: var(--muted); font-size: 12px; }
+
+    .control-panel {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid rgb(20 95 75 / 26%);
+      border-radius: 20px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+    }
+
+    .control-panel::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 4px;
+      background: var(--brand);
+    }
+
+    .control-main { padding: 24px 26px; }
+    .control-title { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+    .control-title h2 { font-family: var(--sans); font-size: 18px; letter-spacing: -.01em; }
+    .prompt-label { display: block; margin-bottom: 8px; font-size: 12px; font-weight: 800; }
+    .prompt-box {
+      width: 100%;
+      min-height: 108px;
+      resize: vertical;
+      padding: 13px 14px;
+      border: 1px solid var(--line-strong);
+      border-radius: 11px;
+      color: var(--ink);
+      background: var(--paper-soft);
+      line-height: 1.65;
+    }
+
+    .prompt-help { display: flex; justify-content: space-between; gap: 16px; margin-top: 8px; color: var(--muted); font-size: 11px; }
+    .loop-strip {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      border-top: 1px solid var(--line);
+      background: var(--paper-soft);
+    }
+
+    .loop-step { position: relative; padding: 14px 16px; border-right: 1px solid var(--line); }
+    .loop-step:last-child { border-right: 0; }
+    .loop-step::after {
+      content: "";
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      right: -5px;
+      width: 8px;
+      height: 8px;
+      border-top: 1px solid var(--line-strong);
+      border-right: 1px solid var(--line-strong);
+      background: var(--paper-soft);
+      transform: translateY(-50%) rotate(45deg);
+    }
+
+    .loop-step:last-child::after { display: none; }
+    .loop-index { color: var(--brand); font-size: 10px; font-weight: 850; }
+    .loop-name { display: block; font-size: 12px; font-weight: 750; }
+    .loop-status { color: var(--muted); font-size: 10px; }
+    .loop-step.processing { background: var(--brand-soft); }
+    .loop-step.processing .loop-status { color: var(--brand); }
+
+    .notice {
+      display: flex;
+      gap: 12px;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--paper-soft);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .notice strong { color: var(--ink); }
+    .notice-amber { border-color: #ead0a8; background: var(--amber-soft); }
+    .notice-violet { border-color: #d6cbe9; background: var(--violet-soft); }
+
+    .summary-list, .clean-list, .check-list { margin: 0; padding: 0; list-style: none; }
+    .summary-list { display: grid; gap: 12px; }
+    .summary-list li { position: relative; padding-left: 22px; }
+    .summary-list li::before { content: ""; position: absolute; top: .72em; left: 2px; width: 7px; height: 7px; border-radius: 50%; background: var(--brand); }
+    .clean-list { display: grid; gap: 9px; }
+    .clean-list li { padding-bottom: 9px; border-bottom: 1px dashed var(--line); }
+    .clean-list li:last-child { padding-bottom: 0; border-bottom: 0; }
+
+    .source-link {
+      padding: 2px 7px;
+      color: var(--blue);
+      background: var(--blue-soft);
+      font-size: 10px;
+      font-weight: 730;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .source-link:hover { color: white; background: var(--blue); }
+    .source-link.note { color: var(--violet); background: var(--violet-soft); }
+    .source-link.note:hover { color: white; background: var(--violet); }
+
+    .toc-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .toc-link {
+      min-height: 92px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      color: var(--ink);
+      background: var(--paper);
+      text-decoration: none;
+      transition: border-color .16s, transform .16s;
+    }
+
+    .toc-link:hover { transform: translateY(-2px); border-color: var(--brand); }
+    .toc-link small { color: var(--muted); }
+    .toc-link span { color: var(--brand); font-weight: 800; }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 13px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); background: var(--paper-soft); font-size: 11px; letter-spacing: .03em; }
+    tr:last-child td { border-bottom: 0; }
+    td strong { display: block; }
+    .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .status { display: inline-flex; padding: 3px 8px; border-radius: 999px; font-size: 10px; font-weight: 780; }
+    .status-confirmed { color: var(--brand); background: var(--brand-soft); }
+    .status-open { color: var(--amber); background: var(--amber-soft); }
+    .status-risk { color: var(--red); background: var(--red-soft); }
+
+    .diagram-card { min-height: 270px; display: grid; place-items: center; overflow: auto; }
+    .mermaid { width: 100%; text-align: center; }
+    .mermaid svg { max-width: 100% !important; height: auto; margin: auto; }
+
+    .document-block { padding: clamp(22px, 4vw, 42px); border: 1px solid var(--line); border-radius: 20px; background: var(--paper); box-shadow: var(--shadow); }
+    .document-block h3 { margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--line); font-family: var(--serif); font-size: 22px; }
+    .document-block h3:first-of-type { margin-top: 22px; }
+    .document-block p { max-width: 82ch; }
+    .doc-cover { padding-bottom: 24px; border-bottom: 2px solid var(--ink); }
+    .doc-cover-label { color: var(--brand); font-size: 11px; font-weight: 850; letter-spacing: .1em; }
+    .doc-cover h2 { max-width: 700px; margin-top: 8px; font-size: clamp(28px, 4vw, 44px); }
+    .doc-cover p { color: var(--muted); }
+
+    .decision { display: grid; grid-template-columns: 42px 1fr auto; gap: 14px; align-items: start; padding: 17px 0; border-bottom: 1px solid var(--line); }
+    .decision:last-child { border-bottom: 0; }
+    .decision-index { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 10px; color: var(--brand); background: var(--brand-soft); font-size: 12px; font-weight: 850; }
+    .decision p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+    .decision-links { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+
+    .suggestion-card { position: relative; padding-top: 48px; }
+    .suggestion-card::before { content: "AI 建議・非會議決議"; position: absolute; top: 15px; left: 20px; color: var(--violet); font-size: 10px; font-weight: 850; letter-spacing: .07em; }
+
+    .note-item { scroll-margin-top: 90px; }
+    .note-time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; }
+
+    .transcript-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+    .search-box { min-width: min(280px, 100%); padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: var(--paper); }
+    .speaker-filter { padding: 6px 10px; border: 1px solid var(--line); color: var(--muted); background: var(--paper); cursor: pointer; font-size: 11px; }
+    .speaker-filter.active { color: var(--brand); border-color: var(--brand); background: var(--brand-soft); }
+
+    .transcript { display: grid; gap: 10px; }
+    .utterance {
+      display: grid;
+      grid-template-columns: 84px 130px 1fr;
+      gap: 15px;
+      padding: 17px 18px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--paper);
+      scroll-margin-top: 90px;
+      transition: border-color .2s, background .2s;
+    }
+
+    .utterance:target { border-color: var(--blue); background: var(--blue-soft); }
+    .utterance[hidden] { display: none; }
+    .timestamp { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; text-decoration: none; }
+    .speaker { font-weight: 780; }
+    .speaker small { display: block; color: var(--muted); font-size: 10px; font-weight: 550; }
+    .utterance p { margin: 0; }
+    mark { padding: 0 2px; color: inherit; background: #ffe79c; }
+
+    .footer { margin-top: 70px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+    .toast {
+      position: fixed;
+      z-index: 80;
+      right: 24px;
+      bottom: 24px;
+      max-width: 360px;
+      padding: 13px 16px;
+      border-radius: 11px;
+      color: white;
+      background: #202a25;
+      box-shadow: var(--shadow);
+      opacity: 0;
+      transform: translateY(12px);
+      pointer-events: none;
+      transition: opacity .2s, transform .2s;
+    }
+
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .mobile-overlay { display: none; }
+
+    @media (max-width: 900px) {
+      .app-shell { grid-template-columns: 1fr; }
+      .sidebar { transform: translateX(-100%); transition: transform .22s ease; box-shadow: var(--shadow); }
+      body.nav-open .sidebar { transform: translateX(0); }
+      .mobile-overlay { position: fixed; z-index: 20; inset: var(--topbar) 0 0; background: rgb(0 0 0 / 28%); }
+      body.nav-open .mobile-overlay { display: block; }
+      main { grid-column: 1; width: min(100% - 32px, 760px); }
+      .menu-button { display: inline-flex; }
+      .brand-text { display: none; }
+      .grid-3, .toc-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid-sidebar { grid-template-columns: 1fr; }
+      .loop-strip { grid-template-columns: 1fr; }
+      .loop-step { border-right: 0; border-bottom: 1px solid var(--line); }
+      .loop-step:last-child { border-bottom: 0; }
+      .loop-step::after { display: none; }
+      .section-head { align-items: start; flex-direction: column; gap: 6px; }
+      .section-note { text-align: left; }
+    }
+
+    @media (max-width: 640px) {
+      .topbar { padding: 0 12px; }
+      .live-state span, .btn-label { display: none; }
+      .btn { padding-inline: 10px; }
+      main { padding-top: 30px; }
+      .grid-2, .grid-3, .toc-grid { grid-template-columns: 1fr; }
+      .meta-row { align-items: start; flex-direction: column; }
+      .prompt-help { flex-direction: column; }
+      .decision { grid-template-columns: 38px 1fr; }
+      .decision-links { grid-column: 2; justify-content: flex-start; }
+      .utterance { grid-template-columns: 70px 1fr; }
+      .utterance p { grid-column: 1 / -1; }
+    }
+
+    @media print {
+      :root { --paper: white; --paper-soft: #f7f7f5; --ink: #111; --muted: #555; --line: #d8d8d5; }
+      @page { size: A4; margin: 17mm 15mm; }
+      body { background: white; font-size: 11pt; }
+      .topbar, .sidebar, .mobile-overlay, .control-panel, .no-print, .toast { display: none !important; }
+      .app-shell { display: block; padding: 0; }
+      main { width: 100%; margin: 0; padding: 0; }
+      .document-header { margin-top: 0; }
+      .section { margin-top: 34px; break-inside: auto; }
+      .card, .document-block, .table-wrap, .utterance { box-shadow: none; break-inside: avoid; }
+      .toc-link { min-height: auto; }
+      a { color: inherit; text-decoration: none; }
+      .source-link { border: 1px solid #bbb; background: white; }
+      .utterance { grid-template-columns: 65px 105px 1fr; }
+      h1 { font-size: 32pt; }
+      h2 { font-size: 21pt; }
+      h3 { break-after: avoid; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar no-print">
+    <div class="brand">
+      <button class="btn menu-button" id="menuButton" type="button" aria-label="開啟導覽">☰</button>
+      <span class="brand-mark" aria-hidden="true">M</span>
+      <span class="brand-text">Meeting Intelligence</span>
+    </div>
+    <div class="top-actions">
+      <div class="live-state" title="摘要生成不會中斷錄音">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span>錄製中・42:18</span>
+      </div>
+      <button class="btn" id="snapshotButton" type="button">
+        <span aria-hidden="true">↻</span><span class="btn-label">建立摘要快照</span>
+      </button>
+      <button class="btn btn-primary" id="printButton" type="button">
+        <span aria-hidden="true">⇩</span><span class="btn-label">匯出文件</span>
+      </button>
+    </div>
+  </header>
+
+  <div class="app-shell">
+    <aside class="sidebar no-print" id="sidebar">
+      <p class="nav-label">成果導覽</p>
+      <nav class="side-nav" aria-label="文件段落">
+        <a href="#overview">成果摘要 <small>01</small></a>
+        <a href="#agent-loop">生成方向 <small>02</small></a>
+        <a href="#evidence-map">證據關係 <small>03</small></a>
+        <a href="#main-document">詳細主文 <small>04</small></a>
+        <a href="#decisions">決議與行動 <small>05</small></a>
+        <a href="#gaps">缺口與建議 <small>06</small></a>
+        <a href="#notes">人工筆記 <small>07</small></a>
+        <a href="#transcript">完整逐字稿 <small>08</small></a>
+      </nav>
+      <p class="nav-label">本輪狀態</p>
+      <div class="sidebar-card">
+        <strong>摘要版本 v3</strong>
+        <p>涵蓋逐字稿至 00:38:52。後續錄音與逐字稿仍持續寫入。</p>
+      </div>
+    </aside>
+
+    <button class="mobile-overlay" id="mobileOverlay" type="button" aria-label="關閉導覽"></button>
+
+    <main>
+      <header class="document-header">
+        <div class="eyebrow">Agent-generated meeting outcome</div>
+        <h1>網站改版合作範圍與執行共識</h1>
+        <p class="lede">
+          本頁是通用 Agent Loop 的輸出示例。文件結構由本次會議內容與使用者指引推導，
+          並非由「會議類型 → 固定模板」規則決定。
+        </p>
+        <div class="meta-row">
+          <span class="meta-chip">2026 年 7 月 31 日・14:00–14:47</span>
+          <span class="meta-chip">4 位與會者</span>
+          <span class="meta-chip">繁體中文＋English terms</span>
+          <span class="meta-chip">本機文件・BYOK</span>
+          <span class="tag tag-amber">示例內容</span>
+        </div>
+      </header>
+
+      <section class="section" id="overview" data-nav-section>
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Outcome at a glance</p>
+            <h2>成果摘要</h2>
+          </div>
+          <p class="section-note">每項重要結論都可跳回逐字稿或人工筆記，不把 AI 推論偽裝成會議事實。</p>
+        </div>
+
+        <div class="grid grid-3" style="margin-bottom: 16px">
+          <div class="card"><div class="metric">6</div><div class="metric-label">已確認決議</div></div>
+          <div class="card"><div class="metric">5</div><div class="metric-label">待辦與負責人</div></div>
+          <div class="card"><div class="metric">3</div><div class="metric-label">待補資訊</div></div>
+        </div>
+
+        <div class="grid grid-sidebar">
+          <article class="card card-brand">
+            <h3>本次會議形成的共識</h3>
+            <ul class="summary-list">
+              <li>第一階段聚焦企業官網資訊架構、視覺系統與 CMS 建置；會員功能不納入本階段。 <a class="source-link" href="#t0842">逐字稿 08:42</a></li>
+              <li>預計八週完成可驗收版本，正式上線日仍取決於客戶素材交付時間。 <a class="source-link" href="#t1835">逐字稿 18:35</a></li>
+              <li>報價需拆分設計、開發與維運選配，並清楚列示超出範圍的變更計價方式。 <a class="source-link note" href="#n03">筆記 N-03</a></li>
+              <li>本輪成果應優先成為可供雙方確認範圍的文件，而不是只生成一般會議摘要。</li>
+            </ul>
+          </article>
+          <aside class="card">
+            <h3>快速前往</h3>
+            <ul class="clean-list">
+              <li><a href="#scope-table">範圍與交付項目</a></li>
+              <li><a href="#commercial-table">費用與條件</a></li>
+              <li><a href="#actions-table">行動項目</a></li>
+              <li><a href="#gaps">待確認缺口</a></li>
+              <li><a href="#transcript">完整逐字稿</a></li>
+            </ul>
+          </aside>
+        </div>
+      </section>
+
+      <section class="section no-print" id="agent-loop" data-nav-section>
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">User-guided, not hard-coded</p>
+            <h2>本次生成方向</h2>
+          </div>
+          <p class="section-note">Prompt 只引導本輪輸出；Agent 仍須以會議證據為準，缺少資料時不得自行補造。</p>
+        </div>
+
+        <div class="control-panel">
+          <div class="control-main">
+            <div class="control-title">
+              <h2>使用者附加 Prompt</h2>
+              <span class="tag">可自由修改</span>
+            </div>
+            <label class="prompt-label" for="guidancePrompt">你希望這次會議最終形成什麼成果？</label>
+            <textarea class="prompt-box" id="guidancePrompt">請根據雙方討論，產出一份能直接交由客戶確認的合作範圍文件。清楚列出交付項目、排除項目、時程、費用假設、驗收方式與尚待確認的問題。所有重要結論必須連回逐字稿或人工筆記；AI 的補充建議要與會議決議分開。</textarea>
+            <div class="prompt-help">
+              <span>這是示例指引，不會被保存成固定會議分類規則。</span>
+              <button class="btn btn-primary" id="runLoopButton" type="button">執行下一輪</button>
+            </div>
+          </div>
+          <div class="loop-strip" id="loopStrip" aria-label="Agent Loop 進度">
+            <div class="loop-step"><span class="loop-index">01</span><span class="loop-name">理解目標</span><span class="loop-status">已完成</span></div>
+            <div class="loop-step"><span class="loop-index">02</span><span class="loop-name">蒐集證據</span><span class="loop-status">已完成</span></div>
+            <div class="loop-step"><span class="loop-index">03</span><span class="loop-name">規劃文件</span><span class="loop-status">已完成</span></div>
+            <div class="loop-step"><span class="loop-index">04</span><span class="loop-name">檢查缺口</span><span class="loop-status">3 項待確認</span></div>
+            <div class="loop-step"><span class="loop-index">05</span><span class="loop-name">驗證輸出</span><span class="loop-status">引用已連結</span></div>
+          </div>
+        </div>
+
+        <div class="notice notice-amber" style="margin-top: 14px">
+          <span aria-hidden="true">◇</span>
+          <div><strong>通用性原則：</strong>Agent 可以借用 SOW、提案、活動須知、訪談研究或決策紀錄等結構，但不能因關鍵字出現就強制套用。最終段落由證據與本輪 Prompt 共同決定。</div>
+        </div>
+      </section>
+
+      <section class="section" id="evidence-map" data-nav-section>
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Traceable reasoning</p>
+            <h2>內容如何形成</h2>
+          </div>
+          <p class="section-note">關係圖是成果導航，不公開模型的內部思維過程；只呈現可驗證的輸入、處理階段與輸出關係。</p>
+        </div>
+
+        <div class="grid grid-2">
+          <div class="card diagram-card">
+            <pre class="mermaid">
+flowchart LR
+    P[本輪使用者 Prompt] --> G[成果目標]
+    T[逐字稿] --> E[會議證據]
+    N[人工筆記] --> E
+    A[附件與連結] --> E
+    G --> D[動態文件規劃]
+    E --> D
+    D --> O[成果主文]
+    D --> Q[資訊缺口]
+    D --> S[AI 補充建議]
+    O --> V{引用與一致性驗證}
+    Q --> V
+    S --> V
+    V -->|通過| H[可交付 HTML]
+    V -->|需補充| G
+            </pre>
+          </div>
+          <div class="card">
+            <h3>本輪採用的內容策略</h3>
+            <ul class="clean-list">
+              <li><strong>主要成果：</strong>合作範圍確認文件 <span class="tag tag-amber">本輪推導</span></li>
+              <li><strong>事實來源：</strong>逐字稿、人工筆記、會議附件</li>
+              <li><strong>結構片段：</strong>範圍、交付、費用假設、驗收、缺口</li>
+              <li><strong>驗證規則：</strong>決議必須有來源；推論必須標示；缺值保留未知</li>
+              <li><strong>輸出語言：</strong>繁體中文，保留 CMS、SLA、UAT 等原始術語</li>
+            </ul>
+            <div class="notice" style="margin-top: 16px">
+              下一次會議即使內容相似，只要使用者目的不同，Agent 也可以規劃成執行清單、風險評估、研究報告或其他文件形態。
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="main-document" data-nav-section>
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Generated primary artifact</p>
+            <h2>詳細主文</h2>
+          </div>
+          <p class="section-note">以下是依示例會議與 Prompt 動態組成的成果，不代表系統內建固定格式。</p>
+        </div>
+
+        <article class="document-block">
+          <header class="doc-cover">
+            <div class="doc-cover-label">本輪推導成果・範例</div>
+            <h2>企業網站改版｜合作範圍確認稿</h2>
+            <p>文件版本 v0.3・待雙方確認・根據 2026/07/31 會議內容生成</p>
+          </header>
+
+          <h3>1. 背景與成果目標</h3>
+          <p>
+            本次合作目標是重整企業官網的資訊層級、視覺一致性及內容維護流程，
+            使行銷團隊能透過 CMS 自主更新主要頁面。第一階段以公開網站為範圍，
+            會員中心與既有 ERP 串接暫不納入。 <a class="source-link" href="#t0842">逐字稿 08:42</a>
+          </p>
+
+          <h3>2. 建議合作範圍</h3>
+          <div class="table-wrap" id="scope-table">
+            <table>
+              <thead>
+                <tr><th>工作面向</th><th>本輪確認內容</th><th>驗收依據</th><th>狀態／來源</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>資訊架構</strong>Information Architecture</td>
+                  <td>盤點並重整主要導覽；預計涵蓋首頁、關於、服務、案例、最新消息與聯絡頁。</td>
+                  <td>雙方確認 sitemap 與頁面清單。</td>
+                  <td><span class="status status-confirmed">已確認</span><br><a class="source-link" href="#t1150">11:50</a></td>
+                </tr>
+                <tr>
+                  <td><strong>UI 視覺設計</strong></td>
+                  <td>建立響應式頁面與可重用設計規則；桌面與行動裝置皆需涵蓋。</td>
+                  <td>核准頁面設計稿與 design tokens。</td>
+                  <td><span class="status status-confirmed">已確認</span><br><a class="source-link note" href="#n01">N-01</a></td>
+                </tr>
+                <tr>
+                  <td><strong>CMS 與前端建置</strong></td>
+                  <td>提供內容管理能力及公開網站實作；CMS 品牌待技術評估後確認。</td>
+                  <td>UAT 清單通過，主要內容可由管理介面維護。</td>
+                  <td><span class="status status-open">部分待定</span><br><a class="source-link" href="#t2418">24:18</a></td>
+                </tr>
+                <tr>
+                  <td><strong>內容搬遷</strong></td>
+                  <td>協助建立內容格式；實際搬遷筆數與責任分工尚未確認。</td>
+                  <td>待補充後定義。</td>
+                  <td><span class="status status-risk">資訊缺口</span><br><a class="source-link" href="#t3155">31:55</a></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>3. 排除項目與變更原則</h3>
+          <ul>
+            <li>第一階段不包含會員登入、個人化後台及 ERP 深度串接。 <a class="source-link" href="#t0842">08:42</a></li>
+            <li>第三方授權、付費字型、雲端主機與外部服務費用應獨立列示。</li>
+            <li>經確認範圍外的新頁型或新功能，先估算影響並取得書面確認後執行。 <a class="source-link note" href="#n03">N-03</a></li>
+          </ul>
+
+          <h3>4. 預定節奏</h3>
+          <div class="card diagram-card" style="box-shadow: none">
+            <pre class="mermaid">
+gantt
+    title 八週執行節奏（待素材時程確認）
+    dateFormat  YYYY-MM-DD
+    axisFormat  %m/%d
+    section 定義
+    需求與內容盤點       :a1, 2026-08-10, 7d
+    Sitemap 確認        :a2, after a1, 4d
+    section 設計
+    Wireframe 與視覺方向 :b1, after a2, 12d
+    主要頁面確認         :milestone, after b1, 0d
+    section 建置
+    前端與 CMS           :c1, after b1, 18d
+    UAT 與修正           :c2, after c1, 8d
+            </pre>
+          </div>
+
+          <h3>5. 商務條件草案</h3>
+          <div class="table-wrap" id="commercial-table">
+            <table>
+              <thead><tr><th>項目</th><th>計價方式</th><th>目前資訊</th><th>依據</th></tr></thead>
+              <tbody>
+                <tr><td>策略與設計</td><td>固定專案費</td><td class="num">NT$ 180,000（示例）</td><td><a class="source-link" href="#t3540">35:40</a></td></tr>
+                <tr><td>前端與 CMS</td><td>固定專案費</td><td class="num">NT$ 260,000（示例）</td><td><a class="source-link" href="#t3540">35:40</a></td></tr>
+                <tr><td>上線後維運</td><td>月費選配</td><td>方案與 SLA 待提供</td><td><a class="source-link note" href="#n04">N-04</a></td></tr>
+                <tr><td>付款節點</td><td>里程碑</td><td>40%／40%／20%，尚待雙方確認</td><td><span class="status status-open">待確認</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="notice notice-amber" style="margin-top: 14px">
+            <span aria-hidden="true">!</span>
+            <span><strong>示例聲明：</strong>金額用於呈現 HTML 資訊設計；實際系統只可引用會議或附件中存在的數值，否則必須標示「待提供」。</span>
+          </p>
+
+          <h3>6. 驗收與完成定義</h3>
+          <p>
+            Agent 根據討論整理出初步驗收方向：已核准頁型完成響應式實作、核心瀏覽器測試通過、
+            CMS 可維護指定欄位、阻斷上線的 UAT 問題完成修正。瀏覽器版本、效能門檻與內容完成責任尚未在會議中定案，列入待確認事項。
+          </p>
+        </article>
+      </section>
+
+      <section class="section" id="decisions" data-nav-section>
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Decisions & ownership</p>
+            <h2>決議與行動項目</h2>
+          </div>
+          <p class="section-note">只有被會議內容支持的項目才列為決議；建議不會混入此區。</p>
+        </div>
+
+        <div class="card" style="margin-bottom: 16px">
+          <div class="decision">
+            <span class="decision-index">D1</span>
+            <div><strong>第一階段不製作會員功能</strong><p>保留未來擴充可能，但不納入本次報價與八週時程。</p></div>
+            <div class="decision-links"><a class="source-link" href="#t0842">08:42</a></div>
+          </div>
+          <div class="decision">
+            <span class="decision-index">D2</span>
+            <div><strong>報價拆分為設計、開發、維運選配</strong><p>讓客戶能分辨一次性建置與後續服務成本。</p></div>
+            <div class="decision-links"><a class="source-link note" href="#n03">N-03</a><a class="source-link" href="#t3540">35:40</a></div>
+          </div>
+          <div class="decision">
+            <span class="decision-index">D3</span>
+            <div><strong>先確認 sitemap，再進入完整視覺設計</strong><p>避免頁面範圍未定時開始大量畫面製作。</p></div>
+            <div class="decision-links"><a class="source-link" href="#t1150">11:50</a></div>
+          </div>
+        </div>
+
+        <div class="table-wrap" id="actions-table">
+          <table>
+            <thead><tr><th>行動項目</th><th>負責人</th><th>期限</th><th>狀態</th><th>來源</th></tr></thead>
+            <tbody>
+              <tr><td>提供新版品牌規範與可用圖片清單</td><td>林怡君</td><td class="num">08/05</td><td><span class="status status-open">進行中</span></td><td><a class="source-link" href="#t2744">27:44</a></td></tr>
+              <tr><td>提出 CMS 技術選項與成本差異</td><td>語者 2 <small>待確認姓名</small></td><td class="num">08/04</td><td><span class="status status-open">待處理</span></td><td><a class="source-link" href="#t2418">24:18</a></td></tr>
+              <tr><td>寄送拆分版報價與範圍確認稿</td><td>王志明</td><td class="num">08/03</td><td><span class="status status-open">待處理</span></td><td><a class="source-link" href="#t4052">40:52</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" id="gaps" data-nav-section>
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Gaps before completion</p>
+            <h2>待確認缺口與 AI 補充建議</h2>
+          </div>
+          <p class="section-note">AI 可以主動探索與引導，但不得把補充建議改寫成已同意事項。</p>
+        </div>
+
+        <div class="grid grid-3" style="margin-bottom: 16px">
+          <article class="card">
+            <span class="status status-risk">缺少證據</span>
+            <h3 style="margin-top: 12px">內容搬遷責任</h3>
+            <p>尚未確認文章筆數、語系及由誰負責輸入。這會直接影響費用與上線日。</p>
+            <a class="source-link" href="#t3155">討論位置 31:55</a>
+          </article>
+          <article class="card">
+            <span class="status status-open">尚未定案</span>
+            <h3 style="margin-top: 12px">驗收效能門檻</h3>
+            <p>會議提及「速度要好」，但未定義裝置、網路環境或量化門檻。</p>
+            <a class="source-link" href="#t3827">討論位置 38:27</a>
+          </article>
+          <article class="card">
+            <span class="status status-open">語者待確認</span>
+            <h3 style="margin-top: 12px">技術負責人姓名</h3>
+            <p>語者 2 未自我介紹；系統不從他人提及推定身份，需由使用者確認。</p>
+            <a class="source-link" href="#t2418">發言位置 24:18</a>
+          </article>
+        </div>
+
+        <div class="grid grid-2">
+          <article class="card suggestion-card">
+            <h3>下一輪建議追問</h3>
+            <ul class="clean-list">
+              <li>請確認既有內容總量、語系與搬遷責任人。</li>
+              <li>請定義 UAT 通過條件及阻斷／非阻斷問題的分級方式。</li>
+              <li>請確認維運時段、回應時間與 SLA 是否需要納入。</li>
+            </ul>
+          </article>
+          <article class="card suggestion-card">
+            <h3>文件完整性建議</h3>
+            <ul class="clean-list">
+              <li>在正式版附上 sitemap 或交付清單附件，降低範圍歧義。</li>
+              <li>將「客戶素材延遲」列為時程假設，而非供應商固定承諾。</li>
+              <li>正式報價前再次驗證稅額、第三方費用及付款節點。</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="notes" data-nav-section>
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Human context</p>
+            <h2>人工筆記</h2>
+          </div>
+          <p class="section-note">人工筆記具有較高摘要權重，但仍保留原文與時間，不靜默改寫。</p>
+        </div>
+        <div class="grid grid-2">
+          <article class="card note-item" id="n01"><span class="note-time">N-01・14:12</span><h3>視覺要延續品牌的新綠色系</h3><p>首頁不要像傳統企業站；希望案例與成果更容易被看見。</p></article>
+          <article class="card note-item" id="n03"><span class="note-time">N-03・14:36</span><h3>報價務必拆項</h3><p>設計／開發／維運分開，範圍外變更需先報價確認。</p></article>
+          <article class="card note-item" id="n04"><span class="note-time">N-04・14:39</span><h3>補一份維運選配</h3><p>列出月費、服務時段、回應時間；SLA 尚未談完。</p></article>
+          <article class="card note-item" id="n05"><span class="note-time">N-05・14:43</span><h3>下次帶 sitemap</h3><p>最好直接用頁面清單確認範圍，不要只有口頭描述。</p></article>
+        </div>
+      </section>
+
+      <section class="section" id="transcript" data-nav-section>
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Full trace</p>
+            <h2>完整逐字稿</h2>
+          </div>
+          <p class="section-note">預設名稱只採用明確自我介紹；無法確認時保留「語者 N」。</p>
+        </div>
+
+        <div class="transcript-tools no-print" style="margin-bottom: 14px">
+          <input class="search-box" id="transcriptSearch" type="search" placeholder="搜尋逐字稿…" aria-label="搜尋逐字稿">
+          <button class="speaker-filter active" type="button" data-speaker="all">全部</button>
+          <button class="speaker-filter" type="button" data-speaker="王志明">王志明</button>
+          <button class="speaker-filter" type="button" data-speaker="林怡君">林怡君</button>
+          <button class="speaker-filter" type="button" data-speaker="語者 2">語者 2</button>
+        </div>
+
+        <div class="transcript" id="transcriptList">
+          <article class="utterance" id="t0210" data-speaker="王志明">
+            <a class="timestamp" href="#t0210">02:10</a>
+            <div class="speaker">王志明<small>自我介紹・已確認</small></div>
+            <p>我是王志明，今天我這邊會先把目前理解的網站改版目標整理一下，再一起確認哪些內容要放進這一階段。</p>
+          </article>
+          <article class="utterance" id="t0842" data-speaker="林怡君">
+            <a class="timestamp" href="#t0842">08:42</a>
+            <div class="speaker">林怡君<small>使用者已確認</small></div>
+            <p>第一階段先不要會員功能，公開網站跟 CMS 做好比較重要。ERP 串接也可以等下一階段再說。</p>
+          </article>
+          <article class="utterance" id="t1150" data-speaker="王志明">
+            <a class="timestamp" href="#t1150">11:50</a>
+            <div class="speaker">王志明<small>已確認</small></div>
+            <p>那我們先交 sitemap 跟頁面清單，這一版確認之後才往完整 UI 走，範圍會比較清楚。</p>
+          </article>
+          <article class="utterance" id="t1835" data-speaker="王志明">
+            <a class="timestamp" href="#t1835">18:35</a>
+            <div class="speaker">王志明<small>已確認</small></div>
+            <p>正常希望八週可以到 UAT，但前提是圖片跟文案要照排程給。如果素材晚兩週，上線時間也要一起調整。</p>
+          </article>
+          <article class="utterance" id="t2418" data-speaker="語者 2">
+            <a class="timestamp" href="#t2418">24:18</a>
+            <div class="speaker">語者 2<small>未能推論身份</small></div>
+            <p>CMS 我會整理兩個技術選項，一個部署簡單，一個後續彈性比較高，也會把授權跟維護成本放進比較。</p>
+          </article>
+          <article class="utterance" id="t2744" data-speaker="林怡君">
+            <a class="timestamp" href="#t2744">27:44</a>
+            <div class="speaker">林怡君<small>已確認</small></div>
+            <p>新版品牌規範我下週三以前給，圖片我會先整理哪些有原始檔，哪些要重拍。</p>
+          </article>
+          <article class="utterance" id="t3155" data-speaker="林怡君">
+            <a class="timestamp" href="#t3155">31:55</a>
+            <div class="speaker">林怡君<small>已確認</small></div>
+            <p>舊文章要不要全部搬我現在還不確定，可能需要內部再盤一次，英文版也不一定同步。</p>
+          </article>
+          <article class="utterance" id="t3540" data-speaker="王志明">
+            <a class="timestamp" href="#t3540">35:40</a>
+            <div class="speaker">王志明<small>已確認</small></div>
+            <p>報價我會把策略設計、前端跟 CMS、上線後維運拆開，第三方費用也另外列，不會混在建置費裡面。</p>
+          </article>
+          <article class="utterance" id="t3827" data-speaker="林怡君">
+            <a class="timestamp" href="#t3827">38:27</a>
+            <div class="speaker">林怡君<small>已確認</small></div>
+            <p>網站速度要好，尤其手機不要等很久，但技術數字我不熟，你們可以先建議怎麼定。</p>
+          </article>
+          <article class="utterance" id="t4052" data-speaker="王志明">
+            <a class="timestamp" href="#t4052">40:52</a>
+            <div class="speaker">王志明<small>已確認</small></div>
+            <p>好，我週一把拆分報價跟今天的範圍確認稿一起寄出，未確認的地方我會直接標在文件裡，不會先假設。</p>
+          </article>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <p>本文件由會議逐字稿、人工筆記與本輪使用者指引生成。AI 建議不等同會議決議；正式對外使用前請由負責人確認。</p>
+        <p>生成版本 v3・逐字稿涵蓋至 00:38:52・HTML 原型</p>
+      </footer>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    (() => {
+      const body = document.body;
+      const toast = document.getElementById('toast');
+      const menuButton = document.getElementById('menuButton');
+      const mobileOverlay = document.getElementById('mobileOverlay');
+      const search = document.getElementById('transcriptSearch');
+      const utterances = [...document.querySelectorAll('.utterance')];
+      const filters = [...document.querySelectorAll('.speaker-filter')];
+      let selectedSpeaker = 'all';
+      let toastTimer;
+      let snapshotVersion = 3;
+
+      function showToast(message) {
+        toast.textContent = message;
+        toast.classList.add('show');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
+      }
+
+      function closeNav() {
+        body.classList.remove('nav-open');
+        menuButton.setAttribute('aria-expanded', 'false');
+      }
+
+      menuButton.addEventListener('click', () => {
+        const open = body.classList.toggle('nav-open');
+        menuButton.setAttribute('aria-expanded', String(open));
+      });
+      mobileOverlay.addEventListener('click', closeNav);
+      document.querySelectorAll('.side-nav a').forEach(link => link.addEventListener('click', closeNav));
+
+      document.getElementById('printButton').addEventListener('click', () => window.print());
+
+      document.getElementById('snapshotButton').addEventListener('click', () => {
+        snapshotVersion += 1;
+        showToast(`摘要快照 v${snapshotVersion} 已建立；錄音與逐字稿持續進行。`);
+      });
+
+      document.getElementById('runLoopButton').addEventListener('click', async event => {
+        const button = event.currentTarget;
+        const prompt = document.getElementById('guidancePrompt').value.trim();
+        if (!prompt) {
+          showToast('請先輸入本輪生成指引。');
+          return;
+        }
+
+        button.disabled = true;
+        button.textContent = '探索中…';
+        const steps = [...document.querySelectorAll('.loop-step')];
+        for (const step of steps) {
+          steps.forEach(item => item.classList.remove('processing'));
+          step.classList.add('processing');
+          await new Promise(resolve => setTimeout(resolve, 260));
+        }
+        steps.forEach(item => item.classList.remove('processing'));
+        button.disabled = false;
+        button.textContent = '執行下一輪';
+        showToast('介面示範完成：正式應用將把 Prompt、會議證據與現有文件送入下一輪 Agent。');
+      });
+
+      function applyTranscriptFilter() {
+        const query = search.value.trim().toLocaleLowerCase('zh-Hant');
+        for (const utterance of utterances) {
+          const speakerMatches = selectedSpeaker === 'all' || utterance.dataset.speaker === selectedSpeaker;
+          const textMatches = !query || utterance.textContent.toLocaleLowerCase('zh-Hant').includes(query);
+          utterance.hidden = !(speakerMatches && textMatches);
+        }
+      }
+
+      search.addEventListener('input', applyTranscriptFilter);
+      filters.forEach(filter => filter.addEventListener('click', () => {
+        selectedSpeaker = filter.dataset.speaker;
+        filters.forEach(item => item.classList.toggle('active', item === filter));
+        applyTranscriptFilter();
+      }));
+
+      const navLinks = [...document.querySelectorAll('.side-nav a')];
+      const navById = new Map(navLinks.map(link => [link.getAttribute('href').slice(1), link]));
+      const observer = new IntersectionObserver(entries => {
+        const visible = entries.filter(entry => entry.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+        if (!visible) return;
+        navLinks.forEach(link => link.classList.remove('active'));
+        navById.get(visible.target.id)?.classList.add('active');
+      }, { rootMargin: '-20% 0px -65%', threshold: [0, .2, .5] });
+      document.querySelectorAll('[data-nav-section]').forEach(section => observer.observe(section));
+
+      window.addEventListener('hashchange', () => {
+        const target = document.getElementById(location.hash.slice(1));
+        if (target?.classList.contains('utterance')) {
+          target.animate(
+            [{ boxShadow: '0 0 0 0 rgb(45 94 139 / 0)' }, { boxShadow: '0 0 0 5px rgb(45 94 139 / 18%)' }, { boxShadow: '0 0 0 0 rgb(45 94 139 / 0)' }],
+            { duration: 1200 }
+          );
+        }
+      });
+    })();
+  </script>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+
+    const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: 'strict',
+      theme: dark ? 'dark' : 'base',
+      fontFamily: 'Inter, Noto Sans TC, sans-serif',
+      themeVariables: dark ? {} : {
+        primaryColor: '#e1f1ea',
+        primaryTextColor: '#1e2421',
+        primaryBorderColor: '#145f4b',
+        lineColor: '#69716c',
+        secondaryColor: '#fff0d9',
+        tertiaryColor: '#e5eff8'
+      }
+    });
+
+    try {
+      await mermaid.run({ nodes: document.querySelectorAll('.mermaid') });
+    } catch (error) {
+      console.error('Mermaid rendering failed:', error);
+    }
+  </script>
+</body>
+</html>

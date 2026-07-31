@@ -1,0 +1,28 @@
+# Rust / Tauri
+/target/
+**/target/
+
+# JavaScript
+/node_modules/
+**/node_modules/
+/dist/
+**/dist/
+
+# Local application data
+*.db
+*.db-shm
+*.db-wal
+/recordings/
+/exports/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
