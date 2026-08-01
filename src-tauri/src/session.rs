@@ -678,13 +678,15 @@ impl Session {
     /// 來源送進來的逐字稿要通過同一組優先權規則，
     /// Fixture 與真實 STT 都不例外。
     fn apply_transcript_input(&mut self, input: TranscriptInput) {
-        match &input {
-            TranscriptInput::Partial {
-                speaker_id, track, ..
-            }
-            | TranscriptInput::Final {
-                speaker_id, track, ..
-            } => self.ensure_speaker(speaker_id, *track),
+        // partial 的語者立刻提出，UI 在打字階段就要顯示是誰在講。
+        // final 的語者等去重決定之後才提出：重連後 Provider 會給同一段音訊
+        // 一個全新的 speaker id，先提出的話會在名單上長出一個不存在的人，
+        // 而那段內容本身會被區間去重丟掉。
+        if let TranscriptInput::Partial {
+            speaker_id, track, ..
+        } = &input
+        {
+            self.ensure_speaker(speaker_id, *track);
         }
         match input {
             TranscriptInput::Partial {
@@ -775,6 +777,8 @@ impl Session {
                         self.intervals.insert(key, segment_id);
                     }
                 }
+                // 去重過關了，這才是一段新內容，它的語者值得記進日誌
+                self.ensure_speaker(&speaker_id, track);
                 self.segments.insert(
                     segment_id,
                     SegmentRecord {
@@ -1030,12 +1034,14 @@ impl Session {
         if name.trim().is_empty() {
             return CommandReceipt::rejected("語者名稱為空");
         }
+        // journal_guard 要在領域檢查之前。反過來的話，磁碟寫不進去會被報成
+        // 「尚未聽到這位語者發言」，使用者於是去找錯的問題。
+        if let Some(r) = self.journal_guard() {
+            return r;
+        }
         // 沒被提出過的語者不能確認：投影裡沒有那一列，確認會無聲消失
         if !self.speakers.contains_key(speaker_id) {
             return CommandReceipt::rejected("尚未聽到這位語者發言");
-        }
-        if let Some(r) = self.journal_guard() {
-            return r;
         }
         let (id, name) = (speaker_id.to_owned(), name.trim().to_owned());
         if let Some(rec) = self.speakers.get_mut(&id) {
@@ -1531,7 +1537,7 @@ pub fn create_snapshot(
     tauri::async_runtime::spawn(async move {
         let worker = app.clone();
         // SQLite 與 Agent 迴圈都是同步的，放進 blocking pool 才不會卡住事件泵
-        let _ = tauri::async_runtime::spawn_blocking(move || {
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
             let session: State<SessionHandle> = worker.state();
             let store: State<StoreHandle> = worker.state();
             run_generation(
@@ -1543,6 +1549,23 @@ pub fn create_snapshot(
             );
         })
         .await;
+
+        // 背景工作 panic 時也必須落在 GenerationFailed。丟掉這個錯誤的話，
+        // 這一輪會永遠停在 running：畫面顯示生成中，沒有重試路徑，
+        // 而使用者不會知道它其實已經死了。
+        if outcome.is_err() {
+            let session: State<SessionHandle> = app.state();
+            let store: State<StoreHandle> = app.state();
+            let _ = session.with(|s| {
+                s.finish_generation(
+                    version,
+                    Vec::new(),
+                    serde_json::json!({}),
+                    Some("生成工作異常結束".to_owned()),
+                )
+            });
+            flush(&session, &store);
+        }
     });
     receipt
 }
@@ -1573,7 +1596,10 @@ pub fn run_generation(
         .reader()
         .map_err(|e| e.to_string())
         .and_then(|st| {
-            crate::agent::generate(
+            // 整趟生成共用一個讀取快照。跨輪讀到不同的世界，會讓已經草擬好的
+            // 區塊在下一輪驗證時因為證據變了而被丟掉。
+            st.begin_read_snapshot().map_err(|e| e.to_string())?;
+            let out = crate::agent::generate(
                 &st,
                 &crate::agent::GenerationRequest {
                     meeting,
@@ -1585,7 +1611,10 @@ pub fn run_generation(
                 planner,
                 &crate::agent::CharUpperBound,
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+            // 讀取快照一定要收掉，連線隨後就丟棄，但先 COMMIT 讓意圖明確
+            let _ = st.end_read_snapshot();
+            out
         })
         .map(|r| {
             let blocks = r
@@ -2290,15 +2319,6 @@ mod tests {
     #[test]
     fn test_a_journal_failure_rejects_every_command_that_would_create_events() {
         let (mut s, _store, _m) = with_store();
-        s.speakers.insert(
-            "s1".into(),
-            SpeakerRecord {
-                ordinal: 1,
-                proposed_name: None,
-                confirmed_name: None,
-                track: Track::System,
-            },
-        );
         s.journal_failed("磁碟已滿".into());
         for r in [
             s.add_note("記一筆"),
@@ -2802,5 +2822,44 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, "completed");
         assert_eq!(run.through_event_seq, through);
+    }
+
+    #[test]
+    fn test_a_deduped_replay_does_not_leave_a_phantom_speaker() {
+        let store = StoreHandle::temp().unwrap();
+        let m = store.exclusive().unwrap().create_meeting("測試").unwrap();
+        // 重連之後 Provider 對同一段音訊給了全新的 segment id 與全新的語者標籤
+        let mut s = scripted_for(
+            m,
+            vec![
+                vec![TranscriptInput::Final {
+                    segment_id: 1,
+                    speaker_id: "spk_0".into(),
+                    text: "報價要分三項".into(),
+                    track: Track::System,
+                }],
+                vec![TranscriptInput::Final {
+                    segment_id: 77,
+                    speaker_id: "spk_9".into(),
+                    text: "報價要分三項".into(),
+                    track: Track::System,
+                }],
+            ],
+        );
+        s.tick(100);
+        s.tick(100);
+        let batch = s.take_journal();
+        store.exclusive().unwrap().append(m, &batch).unwrap();
+
+        let d = store.exclusive().unwrap().meeting(m).unwrap();
+        assert_eq!(d.segments.len(), 1, "重播的音訊長出了第二個片段");
+        // 那段內容被丟掉了，它的語者就不該留在名單上
+        assert_eq!(
+            d.speakers.len(),
+            1,
+            "被去重丟掉的重播留下了一個不存在的語者：{:?}",
+            d.speakers
+        );
+        assert_eq!(d.speakers[0].speaker_id, "spk_0");
     }
 }

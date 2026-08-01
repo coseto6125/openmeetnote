@@ -254,6 +254,13 @@ describe('precedence is identical across all three layers', () => {
     expect(m.segments[0].text).toBe('第二次改');
   });
 
+  test('an_equal_revision_between_two_provider_results_changes_nothing', () => {
+    // Rust 兩層有同名測試。同版本互蓋只會改寫時間戳，但三層必須同時擋。
+    let m = applyBatch(emptyMeeting, batchOf([finalized(1, 10, '第一次')], 0));
+    m = applyBatch(m, batchOf([finalized(2, 10, '同版本重送', 1)], 1));
+    expect(m.segments[0].text).toBe('第一次');
+  });
+
   test('an_equal_revision_from_a_provider_does_not_displace_a_user_edit', () => {
     // 等版本號是三層規則裡最容易寫歪的一格，Rust 兩層各有一個同名測試
     let m = applyBatch(emptyMeeting, batchOf([finalized(1, 10, '原始')], 0));

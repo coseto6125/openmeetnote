@@ -31,6 +31,9 @@ pub enum DbError {
     /// 資料庫比程式新。相容它就是猜未知欄位的語意，因此拒絕開啟。
     #[error("資料庫 schema 版本 {found} 高於本程式支援的 {supported}，請升級應用程式")]
     TooNew { found: i64, supported: i64 },
+    /// 開發期間建立的舊 v1。版本號相同但欄位不同，不會被 migration 接住。
+    #[error("這個資料庫是開發期間的舊 schema 建立的，請刪除後重新啟動")]
+    StaleDevSchema,
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -65,6 +68,17 @@ pub fn open_reader(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        if r.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn prepare(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -92,6 +106,14 @@ fn migrate(conn: &Connection) -> Result<()> {
             found: current,
             supported: SCHEMA_VERSION,
         });
+    }
+
+    // v1 尚未發布，開發期間被就地改過兩次。版本號相同但欄位不同的資料庫
+    // 不會重跑 migration，之後只會在某個查詢上炸出看不懂的錯誤。這個檢查
+    // 把它變成一句看得懂的話。v1 發布之後這段連同註解一起刪掉，
+    // 屆時任何 schema 變更都必須是新的 migration。
+    if current == SCHEMA_VERSION && !has_column(conn, "speakers", "created_event_seq")? {
+        return Err(DbError::StaleDevSchema);
     }
 
     for (version, sql) in MIGRATIONS.iter().filter(|(v, _)| *v > current) {
@@ -205,5 +227,21 @@ mod tests {
         assert!(insert(1, 100).is_ok());
         // 標成靜音卻有 captured 長度：矛盾，必須擋下
         assert!(insert(1, 500).is_err());
+    }
+
+    #[test]
+    fn an_older_in_development_v1_is_refused_with_a_readable_reason() {
+        let conn = Connection::open_in_memory().unwrap();
+        prepare(&conn).unwrap();
+        // 模擬開發期間那版：version 記成 1，但 speakers 少一個欄位
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+             INSERT INTO schema_migrations VALUES (1, 'x');
+             CREATE TABLE speakers (id TEXT, meeting_id INTEGER, ordinal INTEGER);",
+        )
+        .unwrap();
+        let err = migrate(&conn).unwrap_err();
+        assert!(matches!(err, DbError::StaleDevSchema));
+        assert!(err.to_string().contains("請刪除"));
     }
 }

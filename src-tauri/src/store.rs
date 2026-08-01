@@ -416,6 +416,23 @@ pub struct Store {
 pub struct StoreHandle {
     inner: std::sync::Mutex<Store>,
     path: std::path::PathBuf,
+    /// 只有 `temp()` 建的把手會設。正式環境的資料庫絕不自動刪除。
+    #[cfg(test)]
+    ephemeral: bool,
+}
+
+#[cfg(test)]
+impl Drop for StoreHandle {
+    fn drop(&mut self) {
+        if !self.ephemeral {
+            return;
+        }
+        // 測試用的檔案自己收乾淨。一輪測試上百個 sqlite3 加 -wal 留在
+        // /tmp 裡，下次跑的時候誰也分不出哪些還活著。
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+        }
+    }
 }
 
 /// 鎖損毀或連線開不起來。呼叫端一律 fail closed。
@@ -434,6 +451,8 @@ impl StoreHandle {
         Ok(Self {
             inner: std::sync::Mutex::new(Store::new(conn)),
             path,
+            #[cfg(test)]
+            ephemeral: false,
         })
     }
 
@@ -460,8 +479,15 @@ impl StoreHandle {
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
-        let _ = std::fs::remove_file(&path);
-        Self::open(path)
+        // -wal 與 -shm 也要清。留著舊的 -wal 對上新建的資料庫，
+        // SQLite 會把它當成需要復原的日誌套進去。pid 會被回收，
+        // 所以「上次那個檔案不存在」不是可以假設的事。
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        let mut handle = Self::open(path)?;
+        handle.ephemeral = true;
+        Ok(handle)
     }
 
     /// 有時限的寫入嘗試,只給測試用。
@@ -784,18 +810,23 @@ impl Store {
         meeting: MeetingId,
         through_event_seq: u64,
     ) -> Result<Vec<StoredSegment>> {
+        // 選版本的規則必須與 Session、投影、前端 reducer 完全一致：
+        // 使用者修訂勝過 Provider，版本號其次。用純 MAX(revision) 的話，
+        // 使用者改過之後 Provider 又送一版，畫面顯示使用者的內容，
+        // 匯出的文件卻引用 Provider 的 —— 更正在離開 app 的那份成果裡消失。
         let mut stmt = self.conn.prepare(
-            "SELECT r.segment_id, r.revision, r.origin, r.speaker_id, r.text, r.track,
-                    r.meeting_start_ms, r.meeting_end_ms
-             FROM transcript_segment_revisions r
-             WHERE r.meeting_id = ?1
-               AND r.created_event_seq <= ?2
-               AND r.revision = (
-                   SELECT MAX(r2.revision) FROM transcript_segment_revisions r2
-                   WHERE r2.meeting_id = r.meeting_id
-                     AND r2.segment_id = r.segment_id
-                     AND r2.created_event_seq <= ?2)
-             ORDER BY r.meeting_start_ms, r.segment_id",
+            "SELECT segment_id, revision, origin, speaker_id, text, track,
+                    meeting_start_ms, meeting_end_ms
+             FROM (
+                 SELECT r.*, ROW_NUMBER() OVER (
+                            PARTITION BY r.segment_id
+                            ORDER BY (r.origin = 'user') DESC, r.revision DESC
+                        ) AS rn
+                 FROM transcript_segment_revisions r
+                 WHERE r.meeting_id = ?1 AND r.created_event_seq <= ?2
+             )
+             WHERE rn = 1
+             ORDER BY meeting_start_ms, segment_id",
         )?;
         let rows = stmt.query_map(params![meeting, through_event_seq as i64], |r| {
             Ok(StoredSegment {
@@ -807,7 +838,7 @@ impl Store {
                 track: Track::parse(&r.get::<_, String>(5)?).unwrap_or(Track::System),
                 meeting_start_ms: r.get::<_, i64>(6)? as u64,
                 meeting_end_ms: r.get::<_, i64>(7)? as u64,
-                user_edited: false,
+                user_edited: Origin::parse(&r.get::<_, String>(2)?) == Some(Origin::User),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -840,6 +871,16 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// 快照涵蓋範圍內的人工筆記。
+    ///
+    /// 已知缺口:`removed` 與 `text` 沒有以游標界定,因為 `NoteRemoved` 與
+    /// `NoteEdited` 目前沒有生產者。接上編輯與刪除的 UI 時,這兩件事要一起做,
+    /// 否則游標就管不住筆記:
+    ///
+    /// - 刪除要記 `removed_event_seq`,游標之後的刪除不影響早先的快照。
+    /// - 編輯要換一個版本身分。引用的 `source_revision` 是筆記的 `event_seq`,
+    ///   就地改文字而不換版本,等於同一個版本指向不同內容,§9.6 的逐字比對
+    ///   會對著改過的文字驗一段沒人說過的引文。
     pub fn notes_through(
         &self,
         meeting: MeetingId,
@@ -859,6 +900,24 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 開一個讀取快照,之後所有 SELECT 看到同一個已提交狀態。
+    ///
+    /// 生成會跨多輪讀取證據:先建索引,每一輪再驗證引用。這些讀取如果各自
+    /// 是獨立的隱含交易,中途提交的寫入會讓前後看到不同的世界。WAL 下的
+    /// BEGIN DEFERRED 把讀取釘在一個快照上,而且不阻塞寫入者。
+    ///
+    /// 不可變的內容(片段版本)本來就不受影響,真正需要這層保護的是可變欄位:
+    /// `notes.removed`、`notes.text`、`attachments.status`、`speakers` 的確認名稱。
+    pub fn begin_read_snapshot(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        Ok(())
+    }
+
+    pub fn end_read_snapshot(&self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
     }
 
     /// 引用驗證要用的證據原文（§9.6）。
@@ -1187,10 +1246,12 @@ fn project(
             insert_revision(tx, meeting, seq, segment, now)?;
             let user_edited = matches!(event, DomainEvent::TranscriptSegmentEdited { .. })
                 || segment.origin == Origin::User;
-            // 兩條規則，必須與 Session 的判定完全相同（§5.3）：
+            // 三條規則，逐字對應前端的 supersedes 與 Session 的判定（§5.3）：
             //
-            // 1. 指標只前進不後退，擋掉 Provider 重連後重送的舊版本。
-            // 2. Provider 不得覆蓋使用者修訂，版本號再高也不行。
+            // 1. Provider 不得覆蓋使用者修訂，版本號再高也不行。
+            // 2. 版本號較高才前進，擋掉 Provider 重連後重送的舊版本。
+            // 3. 版本號相同時只有「使用者蓋 Provider」成立。相同版本互蓋雖然
+            //    改不到文字（revisions 是 DO NOTHING），但會改寫 meeting_start_ms。
             //
             // 第二條原本只寫在 Session 裡，這裡靠 MAX(revision) 近似，結果是
             // 兩層規則不等價：Provider 的 r3 會蓋掉使用者的 r2。不等價的兩層
@@ -1204,8 +1265,11 @@ fn project(
                      stability        = 'final',
                      user_edited      = MAX(user_edited, excluded.user_edited),
                      meeting_start_ms = excluded.meeting_start_ms
-                 WHERE excluded.current_revision >= transcript_segments.current_revision
-                   AND (excluded.user_edited = 1 OR transcript_segments.user_edited = 0)",
+                 WHERE (excluded.user_edited = 1 OR transcript_segments.user_edited = 0)
+                   AND (excluded.current_revision > transcript_segments.current_revision
+                        OR (excluded.current_revision = transcript_segments.current_revision
+                            AND excluded.user_edited = 1
+                            AND transcript_segments.user_edited = 0))",
                 params![
                     meeting,
                     segment.segment_id as i64,
@@ -1223,6 +1287,10 @@ fn project(
         } => {
             // 只改指定版本的歸屬。這是 Provider 重新指派，不是新內容，
             // 因此不建立新 revision。
+            //
+            // 已知缺口：這違反「revisions 不可變」，舊游標的讀取會拿到現在的
+            // 歸屬，重新匯出一份舊文件時語者會變。目前沒有生產者；接上
+            // diarization 的二次校正時要改成建立新 revision，而不是就地改。
             let n = tx.execute(
                 "UPDATE transcript_segment_revisions SET speaker_id = ?4
                  WHERE meeting_id = ?1 AND segment_id = ?2 AND revision = ?3",
@@ -2396,5 +2464,106 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.meeting(m).unwrap().segments[0].text, "使用者改過");
+    }
+
+    #[test]
+    fn the_exported_evidence_shows_the_same_revision_the_screen_does() {
+        // 這條分歧的代價是使用者的更正在離開 app 的成果裡消失，
+        // 而畫面上完全看不出來。四層規則必須判出同一個版本。
+        let (mut s, m) = store();
+        let seqs = s
+            .append(
+                m,
+                &[
+                    (
+                        DomainEvent::TranscriptSegmentFinalized {
+                            segment: seg(1, 1, "原始", Origin::Provider),
+                        },
+                        tl(0),
+                    ),
+                    (
+                        DomainEvent::TranscriptSegmentEdited {
+                            segment: seg(1, 2, "使用者改過", Origin::User),
+                        },
+                        tl(10),
+                    ),
+                    (
+                        DomainEvent::TranscriptSegmentRevised {
+                            segment: seg(1, 3, "Provider 的 r3", Origin::Provider),
+                        },
+                        tl(20),
+                    ),
+                ],
+            )
+            .unwrap();
+        let cursor = *seqs.last().unwrap();
+        let on_screen = &s.meeting(m).unwrap().segments[0];
+        let in_evidence = &s.segments_through(m, cursor).unwrap()[0];
+        assert_eq!(on_screen.text, "使用者改過");
+        assert_eq!(in_evidence.text, on_screen.text);
+        assert_eq!(in_evidence.revision, on_screen.revision);
+        assert!(in_evidence.user_edited, "證據沒有標示這段被使用者改過");
+    }
+
+    #[test]
+    fn evidence_before_a_user_edit_still_shows_what_was_current_then() {
+        // 游標的意義不變：早於使用者修訂的快照仍然看到當時的 Provider 版本
+        let (mut s, m) = store();
+        let seqs = s
+            .append(
+                m,
+                &[(
+                    DomainEvent::TranscriptSegmentFinalized {
+                        segment: seg(1, 1, "當時的內容", Origin::Provider),
+                    },
+                    tl(0),
+                )],
+            )
+            .unwrap();
+        let early = seqs[0];
+        s.append(
+            m,
+            &[(
+                DomainEvent::TranscriptSegmentEdited {
+                    segment: seg(1, 2, "之後改的", Origin::User),
+                },
+                tl(10),
+            )],
+        )
+        .unwrap();
+        assert_eq!(s.segments_through(m, early).unwrap()[0].text, "當時的內容");
+    }
+
+    #[test]
+    fn an_identical_revision_number_does_not_displace_the_current_pointer() {
+        // 等版本號那一格：三層規則裡最容易寫歪的地方，四種組合都要一致
+        let (mut s, m) = store();
+        s.append(
+            m,
+            &[(
+                DomainEvent::TranscriptSegmentFinalized {
+                    segment: seg(1, 1, "第一次", Origin::Provider),
+                },
+                tl(0),
+            )],
+        )
+        .unwrap();
+        // Provider 對 Provider，同版本：不動
+        let mut same = seg(1, 1, "同版本重送", Origin::Provider);
+        same.meeting_start_ms = 999_999;
+        s.append(
+            m,
+            &[(
+                DomainEvent::TranscriptSegmentRevised { segment: same },
+                tl(10),
+            )],
+        )
+        .unwrap();
+        let d = s.meeting(m).unwrap();
+        assert_eq!(d.segments[0].text, "第一次");
+        assert_eq!(
+            d.segments[0].meeting_start_ms, 1000,
+            "同版本重送改寫了片段的起始時間"
+        );
     }
 }
