@@ -1127,3 +1127,16 @@ svg { display: block; }
   .page-split { grid-template-columns: minmax(0, 1fr); }
   .page { height: auto; overflow: visible; }
 }
+
+/* 語者手動命名。§8.3 的自動推定接上之前，這是唯一的命名入口。 */
+.spk-input {
+  flex: none;
+  width: 92px;
+  padding: 2px 7px;
+  border: 1px solid var(--live);
+  border-radius: 6px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+}

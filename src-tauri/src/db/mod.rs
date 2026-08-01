@@ -51,6 +51,16 @@ pub fn open_in_memory() -> Result<Connection> {
     Ok(conn)
 }
 
+/// 唯讀連線，供背景工作在不阻塞寫入的情況下讀取證據。
+///
+/// 不跑 migration：schema 由持有寫入連線的那一方負責，讀取者只是跟上。
+/// 開成唯讀也是刻意的，讓「背景工作不寫資料庫」變成連線層的事實而不是約定。
+pub fn open_reader(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.pragma_update(None, "busy_timeout", 5_000)?;
+    Ok(conn)
+}
+
 fn prepare(conn: &Connection) -> Result<()> {
     // busy_timeout 必須設：生成與錄音在不同交易寫入，瞬間競爭時
     // 預設行為是立刻回 SQLITE_BUSY，等一下就好的事不該變成錯誤。

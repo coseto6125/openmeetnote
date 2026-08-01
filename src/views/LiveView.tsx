@@ -13,22 +13,34 @@ import {
   snapshotDocument,
   type DocumentBlock,
 } from '../session';
-import type { Degrade, MeetingModel, Snapshot } from '../meeting';
+import type { Degrade, MeetingModel, Snapshot, Speaker } from '../meeting';
 import { Spine, type SpinePause } from '../components/Spine';
 
-interface SpeakerMeta {
-  id: string;
-  fallback: string;
-  track: 'mic' | 'system';
-  proposedName?: string;
-  color: string;
+/**
+ * 語者的顯示樣式。
+ *
+ * 這裡只放顏色與稱呼規則，人是誰由後端的 speakers 決定。
+ * 先前這是一個寫死的常數陣列，於是後端有一整張 speakers 表卻沒人填，
+ * 語者確認也就無聲消失。
+ */
+const SPEAKER_COLORS = ['var(--violet)', '#3f7fa6', '#8a6d3b', '#4f7a5e', '#7a4f6d'];
+
+/**
+ * §8.4 的名稱優先順序：確認名 > 暫定名 > 依軌道與出現序的預設稱呼。
+ *
+ * 預設稱呼裡的編號只數遠端語者。ordinal 是全域的出現序，麥克風軌會佔掉一格，
+ * 直接拿來顯示的話「我」之後的第一位遠端語者會叫「語者 3」，看起來像少了一個人。
+ */
+function displayName(s: Speaker, all: Speaker[]): string {
+  if (s.confirmedName) return s.confirmedName;
+  if (s.proposedName) return s.proposedName;
+  // 軌道先驗只到「本機 vs 遠端」，不能再往「遠端只有一人」推（§8.1）
+  if (s.track === 'mic') return '我';
+  const nth = all.filter((x) => x.track === 'system' && x.ordinal <= s.ordinal).length;
+  return `語者 ${nth}`;
 }
 
-const SPEAKERS: SpeakerMeta[] = [
-  { id: 'me', fallback: '我', track: 'mic', color: 'var(--live)' },
-  { id: 's1', fallback: '語者 1', track: 'system', proposedName: '陳其昀', color: 'var(--violet)' },
-  { id: 's2', fallback: '語者 2', track: 'system', color: '#3f7fa6' },
-];
+const colorOf = (s: Speaker) => SPEAKER_COLORS[(s.ordinal - 1) % SPEAKER_COLORS.length];
 
 export interface LiveViewProps {
   model: MeetingModel;
@@ -55,6 +67,10 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
   const [rejectedSpeakers, setRejectedSpeakers] = useState<string[]>([]);
   const [noteDraft, setNoteDraft] = useState('');
   const [blocks, setBlocks] = useState<DocumentBlock[]>([]);
+  const [naming, setNaming] = useState<string | null>(null);
+  // 受控輸入。非受控的話 blur 讀到的值取決於瀏覽器何時同步 DOM，
+  // 而 HistoryView 的改名本來就是受控的，兩處不該有兩種寫法。
+  const [nameDraft, setNameDraft] = useState('');
   const streamRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
 
@@ -73,9 +89,16 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
 
   /* ── 衍生資料 ─────────────────────────────────────────── */
 
+  const speakerOf = useCallback(
+    (id: string) => model.speakers.find((s) => s.id === id),
+    [model.speakers],
+  );
   const nameOf = useCallback(
-    (id: string) => model.confirmedNames[id] ?? SPEAKERS.find((s) => s.id === id)?.fallback ?? id,
-    [model.confirmedNames],
+    (id: string) => {
+      const s = speakerOf(id);
+      return s ? displayName(s, model.speakers) : id;
+    },
+    [speakerOf, model.speakers],
   );
 
   const finalCount = model.segments.filter((s) => s.stability === 'final').length;
@@ -87,18 +110,20 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
   const degrade = localDegrade ?? model.degrade;
   const live = model.state === 'recording' || model.state === 'paused';
 
-  const pending = SPEAKERS.filter(
-    (s) => s.proposedName && !model.confirmedNames[s.id] && !rejectedSpeakers.includes(s.id),
+  // 暫定名稱來自 §8.3 的自我介紹推定，目前沒有生產者，因此這個清單通常是空的。
+  // 保留這條路徑是為了讓 M3 接上時不必重寫確認流程。
+  const pending = model.speakers.filter(
+    (s) => s.proposedName && !s.confirmedName && !rejectedSpeakers.includes(s.id),
   );
 
   const spineSegments = useMemo(
     () =>
       model.segments.map((s) => ({
         meetingTimeMs: s.meetingTimeMs,
-        track: SPEAKERS.find((x) => x.id === s.speakerId)?.track ?? 'system',
+        track: speakerOf(s.speakerId)?.track ?? 'system',
         final: s.stability === 'final',
       })),
-    [model.segments],
+    [model.segments, speakerOf],
   );
 
   const spinePauses: SpinePause[] = useMemo(
@@ -163,6 +188,16 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
     else if (r.note) setLocalDegrade({ title: '筆記未送出', body: r.note, tone: 'warn' });
   };
 
+  const submitName = async (speakerId: string, raw: string) => {
+    setNaming(null);
+    const name = raw.trim();
+    if (!name) return;
+    const r = await commands.confirmSpeaker(speakerId, name);
+    if (!r.accepted && r.note) {
+      setLocalDegrade({ title: '語者名稱未儲存', body: r.note, tone: 'warn' });
+    }
+  };
+
   const seek = (ms: number) => {
     const target =
       model.segments.find((s) => s.meetingTimeMs >= ms) ??
@@ -224,7 +259,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                 );
               }
               const seg = row.seg;
-              const meta = SPEAKERS.find((s) => s.id === seg.speakerId);
+              const meta = speakerOf(seg.speakerId);
               return (
                 <article
                   className="utt"
@@ -236,7 +271,10 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                   <span className="utt-time num">{mmss(seg.meetingTimeMs)}</span>
                   <div className="utt-body">
                     <span className="utt-who">
-                      <span className="who-swatch" style={{ background: meta?.color }} />
+                      <span
+                        className="who-swatch"
+                        style={{ background: meta ? colorOf(meta) : 'var(--muted)' }}
+                      />
                       {nameOf(seg.speakerId)}
                     </span>
                     <span className="utt-text">{seg.text}</span>
@@ -332,16 +370,19 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
           <section className="card">
             <div className="card-head">
               <span className="card-title">語者</span>
-              <span className="count num">{SPEAKERS.length}</span>
+              <span className="count num">{model.speakers.length}</span>
               {pending.length > 0 && <span className="spk-pending">{pending.length} 待確認</span>}
             </div>
-            {SPEAKERS.map((s) => {
+            {model.speakers.length === 0 && (
+              <p className="hint">還沒有人發言。語者會在第一次聽到聲音時出現。</p>
+            )}
+            {model.speakers.map((s) => {
               const isPending = pending.some((p) => p.id === s.id);
               return (
                 <div className="spk-row" key={s.id}>
                   <span className="spk-name">
-                    <span className="who-swatch" style={{ background: s.color }} />
-                    {isPending ? s.proposedName : nameOf(s.id)}
+                    <span className="who-swatch" style={{ background: colorOf(s) }} />
+                    {isPending ? s.proposedName : displayName(s, model.speakers)}
                     {isPending ? (
                       <span className="spk-pending">待確認</span>
                     ) : (
@@ -352,7 +393,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                     <>
                       <button
                         className="mini mini-yes"
-                        onClick={() => commands.confirmSpeaker(s.id, s.proposedName!)}
+                        onClick={() => void commands.confirmSpeaker(s.id, s.proposedName!)}
                       >
                         是
                       </button>
@@ -364,6 +405,34 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                       </button>
                     </>
                   )}
+                  {/* 沒有暫定名稱時的手動命名。§8.3 的自我介紹推定還沒接上，
+                      在那之前這是使用者唯一能給語者名字的地方。 */}
+                  {!isPending &&
+                    (naming === s.id ? (
+                      <input
+                        className="spk-input"
+                        autoFocus
+                        value={nameDraft}
+                        placeholder="輸入名稱"
+                        onChange={(e) => setNameDraft(e.target.value)}
+                        onBlur={() => void submitName(s.id, nameDraft)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') void submitName(s.id, nameDraft);
+                          if (e.key === 'Escape') setNaming(null);
+                        }}
+                      />
+                    ) : (
+                      <button
+                        className="mini"
+                        disabled={!live}
+                        onClick={() => {
+                          setNameDraft(s.confirmedName ?? '');
+                          setNaming(s.id);
+                        }}
+                      >
+                        {s.confirmedName ? '改名' : '命名'}
+                      </button>
+                    ))}
                 </div>
               );
             })}
@@ -505,6 +574,17 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
           }}
         >
           STT 斷線並重連
+        </button>
+        <button
+          disabled={!model.speakers.length}
+          onClick={() => {
+            // 走與手動命名完全相同的命令路徑，只是不必經過鍵盤。
+            // 自動化能可靠點擊但送不進按鍵，而這條路徑值得被真的按過一次。
+            const first = model.speakers[0];
+            if (first) void submitName(first.id, '陳其昀');
+          }}
+        >
+          命名第一位語者
         </button>
         <button onClick={() => commands.injectFault('generationFailed')}>生成失敗</button>
         <button

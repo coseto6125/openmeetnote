@@ -42,6 +42,15 @@ export type SessionEvent =
       meetingTimeMs: number;
       capturedAudioMs: number;
     }
+  /** 第一次聽到某位語者。track 讓 UI 依 §8.1 的軌道先驗給預設稱呼。 */
+  | {
+      kind: 'speakerProposed';
+      seq: number;
+      speakerId: string;
+      ordinal: number;
+      proposedName: string | null;
+      track: 'mic' | 'system';
+    }
   | { kind: 'speakerConfirmed'; seq: number; speakerId: string; name: string }
   | { kind: 'snapshotCreated'; seq: number; version: number; throughEventSeq: number; meetingTimeMs: number }
   | { kind: 'generationCompleted'; seq: number; version: number }
@@ -93,12 +102,21 @@ export interface ProjectedSegment {
   meetingTimeMs: number;
 }
 
+export interface ProjectedSpeaker {
+  speakerId: string;
+  ordinal: number;
+  proposedName: string | null;
+  confirmedName: string | null;
+  track: 'mic' | 'system';
+}
+
 export interface SessionProjection {
   state: MeetingState;
   seq: number;
   meetingTimeMs: number;
   capturedAudioMs: number;
   segments: ProjectedSegment[];
+  speakers: ProjectedSpeaker[];
   notes: { noteId: number; text: string; meetingTimeMs: number; capturedAudioMs: number }[];
   snapshots: {
     version: number;

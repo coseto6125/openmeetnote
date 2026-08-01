@@ -15,39 +15,11 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ProviderKind {
-    Stt,
-    Llm,
-}
-
-impl ProviderKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ProviderKind::Stt => "stt",
-            ProviderKind::Llm => "llm",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "stt" => Some(ProviderKind::Stt),
-            "llm" => Some(ProviderKind::Llm),
-            _ => None,
-        }
-    }
-
-    /// 環境變數前綴，例如 `OPENMEETNOTE_STT_PROVIDER`。
-    fn env_prefix(self) -> &'static str {
-        match self {
-            ProviderKind::Stt => "OPENMEETNOTE_STT",
-            ProviderKind::Llm => "OPENMEETNOTE_LLM",
-        }
-    }
-}
+// 這兩個型別 store 也要用。放在 model 而不是這裡，
+// 否則 store 與 config 會互相引用。
+pub use crate::model::{ProviderKind, StoredProvider};
 
 /// 某個欄位的最終值與它的來源。
 ///
@@ -205,17 +177,6 @@ impl SecretStore for OsSecretStore {
 
 /* ── 解析 ───────────────────────────────────────────────────────── */
 
-/// GUI 存下來的非敏感設定，對應 `provider_settings` 資料表。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StoredProvider {
-    pub provider: String,
-    pub model: String,
-    pub base_url: String,
-    #[serde(default)]
-    pub options: String,
-}
-
 /// 環境變數的讀取來源。測試注入假的 map，正式環境讀真的 env。
 pub trait Env {
     fn get(&self, key: &str) -> Option<String>;
@@ -334,13 +295,10 @@ impl Default for ConfigHandle {
 
 #[tauri::command]
 pub fn get_settings(
-    store: State<crate::session::StoreHandle>,
+    store: State<crate::store::StoreHandle>,
     config: State<ConfigHandle>,
 ) -> Result<Vec<ResolvedProvider>, String> {
-    let st = store
-        .0
-        .lock()
-        .map_err(|_| "資料庫連線狀態已損毀".to_owned())?;
+    let st = store.write().map_err(|e| e.to_string())?;
     [ProviderKind::Stt, ProviderKind::Llm]
         .into_iter()
         .map(|kind| {
@@ -357,17 +315,14 @@ pub fn get_settings(
 
 #[tauri::command]
 pub fn save_provider(
-    store: State<crate::session::StoreHandle>,
+    store: State<crate::store::StoreHandle>,
     kind: String,
     provider: String,
     model: String,
     base_url: String,
 ) -> Result<(), String> {
     let kind = ProviderKind::parse(&kind).ok_or("未知的 Provider 類別")?;
-    let mut st = store
-        .0
-        .lock()
-        .map_err(|_| "資料庫連線狀態已損毀".to_owned())?;
+    let mut st = store.write().map_err(|e| e.to_string())?;
     st.set_provider_settings(
         kind,
         &StoredProvider {

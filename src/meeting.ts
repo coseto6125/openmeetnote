@@ -24,6 +24,20 @@ export interface Segment {
   stability: 'partial' | 'final';
 }
 
+/**
+ * 一位語者。
+ *
+ * 名稱優先順序（§8.4）：使用者確認的名稱勝過暫定名稱，暫定名稱勝過
+ * 依軌道與出現序給的預設稱呼。這裡不從逐字稿內容推定任何人的身份。
+ */
+export interface Speaker {
+  id: string;
+  ordinal: number;
+  track: 'mic' | 'system';
+  proposedName: string | null;
+  confirmedName: string | null;
+}
+
 export interface Note {
   id: number;
   text: string;
@@ -61,7 +75,7 @@ export interface MeetingModel {
   activeVersion: number | null;
   levels: { mic: number; system: number };
   health: { mic: Health; system: Health; stt: Health };
-  confirmedNames: Record<string, string>;
+  speakers: Speaker[];
   /** 已套用的最大 seq。收到不銜接的批次就代表中間漏了事件 */
   appliedSeq: number;
   /** 偵測到缺號，畫面內容不可信，必須 resync */
@@ -82,18 +96,29 @@ export const emptyMeeting: MeetingModel = {
   activeVersion: null,
   levels: { mic: 0, system: 0 },
   health: { mic: 'ok', system: 'ok', stt: 'ok' },
-  confirmedNames: {},
+  speakers: [],
   appliedSeq: 0,
   desynced: false,
   journalError: null,
   degrade: null,
 };
 
-/** 版本較新，或同版本但來自使用者，才允許覆寫既有內容。 */
+/**
+ * 能否覆寫既有內容。
+ *
+ * 這條規則在 Session、Store 與這裡各有一份。三份存在的理由是它們隔著不同的
+ * 邊界（Session 決定要不要產生事件、Store 守投影、這裡守畫面），但它們必須
+ * 判出完全相同的結果 —— 曾經有一版本規則不等價，Provider 的 r3 可以蓋掉
+ * 使用者的 r2，而下層看起來像是擋得住。
+ *
+ * 順序是刻意的：先看來源再看版本。Provider 的結果永遠不覆蓋使用者修訂，
+ * 版本號再高也一樣。
+ */
 function supersedes(
   incoming: { revision: number; origin: Origin },
   current: { revision: number; origin: Origin },
 ): boolean {
+  if (current.origin === 'user' && incoming.origin === 'provider') return false;
   if (incoming.revision > current.revision) return true;
   if (incoming.revision < current.revision) return false;
   return incoming.origin === 'user' && current.origin === 'provider';
@@ -174,8 +199,31 @@ function applyEvent(m: MeetingModel, ev: SessionEvent, batch: SessionEventBatch)
             ],
           };
 
+    case 'speakerProposed':
+      // 決定性事件一律去重：重連或批次重送不能長出第二位語者
+      return m.speakers.some((s) => s.id === ev.speakerId)
+        ? m
+        : {
+            ...m,
+            speakers: [
+              ...m.speakers,
+              {
+                id: ev.speakerId,
+                ordinal: ev.ordinal,
+                track: ev.track,
+                proposedName: ev.proposedName,
+                confirmedName: null,
+              },
+            ].sort((a, b) => a.ordinal - b.ordinal),
+          };
+
     case 'speakerConfirmed':
-      return { ...m, confirmedNames: { ...m.confirmedNames, [ev.speakerId]: ev.name } };
+      return {
+        ...m,
+        speakers: m.speakers.map((s) =>
+          s.id === ev.speakerId ? { ...s, confirmedName: ev.name } : s,
+        ),
+      };
 
     case 'snapshotCreated':
       return m.snapshots.some((s) => s.version === ev.version)
@@ -292,6 +340,13 @@ export function fromProjection(m: MeetingModel, p: SessionProjection): MeetingMo
       revision: s.revision,
       origin: s.origin,
       stability: 'final' as const,
+    })),
+    speakers: p.speakers.map((s) => ({
+      id: s.speakerId,
+      ordinal: s.ordinal,
+      track: s.track,
+      proposedName: s.proposedName,
+      confirmedName: s.confirmedName,
     })),
     notes: p.notes.map((n) => ({
       id: n.noteId,

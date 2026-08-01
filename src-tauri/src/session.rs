@@ -25,7 +25,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::model::{Timeline, Track};
-use crate::store::{DomainEvent, MeetingId, SegmentRevision, Store};
+use crate::store::{DomainEvent, MeetingId, SegmentRevision, Store, StoreHandle};
 
 pub const EVENT_CHANNEL: &str = "session://events";
 
@@ -82,6 +82,14 @@ pub enum SessionEvent {
         meeting_time_ms: u64,
         captured_audio_ms: u64,
     },
+    /// 第一次聽到某位語者。帶軌道，UI 才能依 §8.1 的軌道先驗給預設稱呼。
+    SpeakerProposed {
+        seq: u64,
+        speaker_id: String,
+        ordinal: u32,
+        proposed_name: Option<String>,
+        track: Track,
+    },
     SpeakerConfirmed {
         seq: u64,
         speaker_id: String,
@@ -126,6 +134,7 @@ impl SessionEvent {
             SessionEvent::TranscriptFinalized { seq, .. }
             | SessionEvent::TranscriptEdited { seq, .. }
             | SessionEvent::NoteAdded { seq, .. }
+            | SessionEvent::SpeakerProposed { seq, .. }
             | SessionEvent::SpeakerConfirmed { seq, .. }
             | SessionEvent::SnapshotCreated { seq, .. }
             | SessionEvent::GenerationCompleted { seq, .. }
@@ -192,6 +201,7 @@ pub struct SessionProjection {
     pub meeting_time_ms: u64,
     pub captured_audio_ms: u64,
     pub segments: Vec<ProjectedSegment>,
+    pub speakers: Vec<ProjectedSpeaker>,
     pub notes: Vec<ProjectedNote>,
     pub snapshots: Vec<ProjectedSnapshot>,
     pub pauses: Vec<ProjectedPause>,
@@ -206,6 +216,16 @@ pub struct ProjectedSegment {
     pub speaker_id: String,
     pub text: String,
     pub meeting_time_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectedSpeaker {
+    pub speaker_id: String,
+    pub ordinal: u32,
+    pub proposed_name: Option<String>,
+    pub confirmed_name: Option<String>,
+    pub track: Track,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -375,6 +395,14 @@ struct SnapshotRecord {
     state: &'static str,
 }
 
+#[derive(Debug, Clone)]
+struct SpeakerRecord {
+    ordinal: u32,
+    proposed_name: Option<String>,
+    confirmed_name: Option<String>,
+    track: Track,
+}
+
 struct SegmentRecord {
     speaker_id: String,
     text: String,
@@ -405,6 +433,11 @@ pub struct Session {
     /// 重連與輪替之後 Provider 的識別碼全都會變，唯一不變的是音訊區間，
     /// 因此去重鍵是它，不是 Provider 給的 segment id。
     intervals: HashMap<(Track, u64, u64), u64>,
+    /// 已經提出過的語者與它們的出現序。
+    ///
+    /// 語者必須先被 `SpeakerProposed` 才能被確認：投影裡沒有那一列的話，
+    /// 確認會更新 0 列而畫面照樣顯示成功。這個對照表就是那條前提。
+    speakers: HashMap<String, SpeakerRecord>,
     notes: Vec<NoteRecord>,
     snapshots: Vec<SnapshotRecord>,
     pauses: Vec<ProjectedPause>,
@@ -443,6 +476,7 @@ impl Session {
             next_note_id: 1,
             segments: HashMap::new(),
             intervals: HashMap::new(),
+            speakers: HashMap::new(),
             notes: Vec::new(),
             snapshots: Vec::new(),
             pauses: Vec::new(),
@@ -602,9 +636,56 @@ impl Session {
         }
     }
 
+    /// 第一次聽到某位語者時把它記進日誌。
+    ///
+    /// 在 partial 就提出而不是等定稿：語者存在與否跟那句話會不會定稿無關，
+    /// 而且 UI 在 partial 階段就要顯示是誰在講。partial 本身仍然不進日誌。
+    ///
+    /// 暫定名稱目前一律為 None。§8.3 的自我介紹推定是 M3 的工作，
+    /// 在那之前不憑軌道或發言順序猜任何人的真實身份。
+    fn ensure_speaker(&mut self, speaker_id: &str, track: Track) {
+        if self.speakers.contains_key(speaker_id) {
+            return;
+        }
+        let ordinal = self.speakers.len() as u32 + 1;
+        self.speakers.insert(
+            speaker_id.to_owned(),
+            SpeakerRecord {
+                ordinal,
+                proposed_name: None,
+                confirmed_name: None,
+                track,
+            },
+        );
+        let id = speaker_id.to_owned();
+        self.record(
+            DomainEvent::SpeakerProposed {
+                speaker_id: id.clone(),
+                ordinal,
+                proposed_name: None,
+                provider_labels: vec![id.clone()],
+            },
+            |seq| SessionEvent::SpeakerProposed {
+                seq,
+                speaker_id: id,
+                ordinal,
+                proposed_name: None,
+                track,
+            },
+        );
+    }
+
     /// 來源送進來的逐字稿要通過同一組優先權規則，
     /// Fixture 與真實 STT 都不例外。
     fn apply_transcript_input(&mut self, input: TranscriptInput) {
+        match &input {
+            TranscriptInput::Partial {
+                speaker_id, track, ..
+            }
+            | TranscriptInput::Final {
+                speaker_id, track, ..
+            } => self.ensure_speaker(&speaker_id.clone(), *track),
+        }
         match input {
             TranscriptInput::Partial {
                 segment_id,
@@ -832,6 +913,21 @@ impl Session {
             meeting_time_ms: self.meeting_time_ms,
             captured_audio_ms: self.captured_audio_ms,
             segments,
+            speakers: {
+                let mut v: Vec<_> = self
+                    .speakers
+                    .iter()
+                    .map(|(id, r)| ProjectedSpeaker {
+                        speaker_id: id.clone(),
+                        ordinal: r.ordinal,
+                        proposed_name: r.proposed_name.clone(),
+                        confirmed_name: r.confirmed_name.clone(),
+                        track: r.track,
+                    })
+                    .collect();
+                v.sort_by_key(|s| s.ordinal);
+                v
+            },
             notes: self
                 .notes
                 .iter()
@@ -934,10 +1030,17 @@ impl Session {
         if name.trim().is_empty() {
             return CommandReceipt::rejected("語者名稱為空");
         }
+        // 沒被提出過的語者不能確認：投影裡沒有那一列，確認會無聲消失
+        if !self.speakers.contains_key(speaker_id) {
+            return CommandReceipt::rejected("尚未聽到這位語者發言");
+        }
         if let Some(r) = self.journal_guard() {
             return r;
         }
         let (id, name) = (speaker_id.to_owned(), name.trim().to_owned());
+        if let Some(rec) = self.speakers.get_mut(&id) {
+            rec.confirmed_name = Some(name.clone());
+        }
         let seq = self.record(
             DomainEvent::SpeakerConfirmed {
                 speaker_id: id.clone(),
@@ -1244,6 +1347,15 @@ impl SessionHandle {
 }
 
 impl SessionHandle {
+    /// 用既有的 Session 建一個把手，供測試直接驅動 `run_generation`。
+    #[cfg(test)]
+    fn from_session(session: Session) -> Self {
+        Self {
+            inner: Mutex::new(session),
+            epoch: Instant::now(),
+        }
+    }
+
     /// 換上全新的 Session。結束後開新會議走這條路，
     /// 而不是重置欄位：漏掉一個欄位就會把上一場的片段帶進新會議。
     fn reset(&self) {
@@ -1253,18 +1365,12 @@ impl SessionHandle {
     }
 }
 
+#[derive(Debug)]
 pub struct PoisonedSession;
 
 const POISONED_NOTE: &str = "工作階段狀態已損毀，請重新啟動應用程式";
 
 /* ── 持久化 ───────────────────────────────────────────────────────── */
-
-/// Store 的共用把手。
-///
-/// 與 `SessionHandle` 分成兩把鎖：寫 SQLite 不該卡住命令處理，
-/// 命令持鎖時也不該等磁碟。代價是兩者之間有個短暫的未落地窗口，
-/// 因此每個命令結束都 flush 一次，未落地的內容最多只有 STT 的一個節流窗。
-pub struct StoreHandle(pub Mutex<Store>);
 
 /// 把 Session 累積的決定性事件寫進 SQLite。
 ///
@@ -1280,9 +1386,9 @@ pub fn flush(session: &SessionHandle, store: &StoreHandle) {
     if batch.is_empty() {
         return;
     }
-    let result = match store.0.lock() {
+    let result = match store.write() {
         Ok(mut st) => st.append(meeting, &batch).map_err(|e| e.to_string()),
-        Err(_) => Err("資料庫連線狀態已損毀".to_owned()),
+        Err(e) => Err(e.to_string()),
     };
     if let Err(reason) = result {
         let _ = session.with(|s| s.journal_failed(reason));
@@ -1344,7 +1450,7 @@ pub fn spawn_pump(app: AppHandle) {
 #[tauri::command]
 pub fn start_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> CommandReceipt {
     // 會議列在這裡建立，不在 app 啟動時：否則每開一次程式就多一列空會議
-    let created = match store.0.lock() {
+    let created = match store.write() {
         Ok(mut st) => {
             let title = format!("會議 {}", crate::clock::now_utc()[..16].replace('T', " "));
             st.create_meeting(&title)
@@ -1414,21 +1520,59 @@ pub fn create_snapshot(
     let Some((version, through)) = snapshot else {
         return receipt;
     };
-    let Ok(Some(meeting)) = state.with(|s| s.meeting_id()) else {
+    // 沒有會議就沒有東西可生成。run_generation 自己也會檢查，
+    // 這裡先擋是為了不要白開一個背景工作。
+    if state.with(|s| s.meeting_id()).ok().flatten().is_none() {
         return receipt;
-    };
+    }
 
-    // 生成在背景進行，錄音與逐字稿不中斷（§5.4.2）
+    // 生成在背景進行，錄音與逐字稿不中斷（§5.4.2）。
+    // 編排本身在 run_generation，這裡只負責把它送進背景。
     tauri::async_runtime::spawn(async move {
         let worker = app.clone();
-        // SQLite 與 Agent 迴圈都是同步的，放進 blocking pool 才不會卡住
-        // 事件泵那條 async 任務。
-        let outcome = tauri::async_runtime::spawn_blocking(move || {
-            let handle: State<StoreHandle> = worker.state();
-            let st = handle
-                .0
-                .lock()
-                .map_err(|_| "資料庫連線狀態已損毀".to_owned())?;
+        // SQLite 與 Agent 迴圈都是同步的，放進 blocking pool 才不會卡住事件泵
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let session: State<SessionHandle> = worker.state();
+            let store: State<StoreHandle> = worker.state();
+            run_generation(
+                &session,
+                &store,
+                &mut crate::agent::FixturePlanner,
+                version,
+                through,
+            );
+        })
+        .await;
+    });
+    receipt
+}
+
+/// 一輪摘要生成的完整編排。
+///
+/// 這個函式不碰 `AppHandle`，也不是 `#[tauri::command]`，因此測試可以直接
+/// 呼叫它。先前這段程式住在 spawn 的 closure 裡，唯一的驗證方式是打包出
+/// Windows 安裝檔再用滑鼠點一次 — 那個代價讓一個 `CHECK constraint` 的錯誤
+/// 活到了實機，而且畫面上還顯示「已完成」。
+///
+/// 失敗一律落在 `GenerationFailed`：快照游標保留，使用者可以直接重試，
+/// 而錄音與逐字稿全程不受影響。
+pub fn run_generation(
+    session: &SessionHandle,
+    store: &StoreHandle,
+    planner: &mut dyn crate::agent::Planner,
+    version: u32,
+    through: u64,
+) {
+    let Ok(Some(meeting)) = session.with(|s| s.meeting_id()) else {
+        return;
+    };
+
+    // 讀證據用另開的唯讀連線，不動寫入鎖。抱著寫入鎖跑完整趟 LLM 呼叫，
+    // 錄音的落地就會被卡住那麼久，那正好違反 §5.4.2 的「生成不中斷錄音」。
+    let produced = store
+        .reader()
+        .map_err(|e| e.to_string())
+        .and_then(|st| {
             crate::agent::generate(
                 &st,
                 &crate::agent::GenerationRequest {
@@ -1438,53 +1582,36 @@ pub fn create_snapshot(
                     budget: crate::agent::BudgetInputs::default(),
                     limits: crate::agent::Limits::default(),
                 },
-                &mut crate::agent::FixturePlanner,
+                planner,
                 &crate::agent::CharUpperBound,
             )
-            .map(|r| {
-                let blocks = r
-                    .blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| b.to_stored(i as u32))
-                    .collect::<Vec<_>>();
-                let usage = serde_json::json!({
-                    "rounds": r.rounds,
-                    "stopReason": r.stop_reason,
-                    "evidenceTokens": r.evidence_tokens,
-                    "segmentsOmitted": r.segments_omitted,
-                    "rejectedBlocks": r.rejected_blocks,
-                });
-                (blocks, usage)
-            })
             .map_err(|e| e.to_string())
         })
-        .await;
+        .map(|r| {
+            let blocks = r
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b.to_stored(i as u32))
+                .collect::<Vec<_>>();
+            let usage = serde_json::json!({
+                "rounds": r.rounds,
+                "stopReason": r.stop_reason,
+                "evidenceTokens": r.evidence_tokens,
+                "segmentsOmitted": r.segments_omitted,
+                "rejectedBlocks": r.rejected_blocks,
+                "degraded": r.degraded,
+            });
+            (blocks, usage)
+        });
 
-        let session: State<SessionHandle> = app.state();
-        match outcome {
-            Ok(Ok((blocks, usage))) => {
-                let _ = session.with(|s| s.finish_generation(version, blocks, usage, None));
-            }
-            Ok(Err(reason)) => {
-                let _ = session.with(|s| {
-                    s.finish_generation(version, Vec::new(), serde_json::json!({}), Some(reason))
-                });
-            }
-            Err(e) => {
-                let _ = session.with(|s| {
-                    s.finish_generation(
-                        version,
-                        Vec::new(),
-                        serde_json::json!({}),
-                        Some(e.to_string()),
-                    )
-                });
-            }
-        }
-        flush(&session, &app.state::<StoreHandle>());
-    });
-    receipt
+    let _ = match produced {
+        Ok((blocks, usage)) => session.with(|s| s.finish_generation(version, blocks, usage, None)),
+        Err(reason) => session.with(|s| {
+            s.finish_generation(version, Vec::new(), serde_json::json!({}), Some(reason))
+        }),
+    };
+    flush(session, store);
 }
 
 /// 某個摘要版本的成果區塊。
@@ -1518,10 +1645,7 @@ pub fn export_document(
 ) -> Result<String, String> {
     use tauri::Manager as _;
 
-    let st = store
-        .0
-        .lock()
-        .map_err(|_| "資料庫連線狀態已損毀".to_owned())?;
+    let st = store.write().map_err(|e| e.to_string())?;
     let run = st
         .runs(meeting_id)
         .map_err(|e| e.to_string())?
@@ -1636,10 +1760,7 @@ fn with_store<T, F>(store: &State<StoreHandle>, f: F) -> Result<T, String>
 where
     F: FnOnce(&mut Store) -> crate::store::Result<T>,
 {
-    let mut st = store
-        .0
-        .lock()
-        .map_err(|_| "資料庫連線狀態已損毀".to_owned())?;
+    let mut st = store.write().map_err(|e| e.to_string())?;
     f(&mut st).map_err(|e| e.to_string())
 }
 
@@ -1773,15 +1894,29 @@ mod tests {
                 .any(|e| matches!(e, SessionEvent::TranscriptPartial { .. })),
             "應該有 partial"
         );
-        assert_eq!(batch.first_seq, None, "partial 不得配發 seq");
-        assert_eq!(s.seq, 1, "只有先前的 MeetingStateChanged 佔用 seq");
+        // partial 本身不帶 seq。這一批唯一的 seq 來自「第一次聽到 s1」，
+        // 那是關於語者的決定性事實，與這句話會不會定稿無關。
+        assert!(batch
+            .events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::SpeakerProposed { .. })));
+        assert_eq!(s.seq, 2, "MeetingStateChanged 與 SpeakerProposed 各佔一個");
     }
 
     #[test]
     fn test_finalized_segment_advances_seq_exactly_once() {
         let mut s = scripted(vec![vec![final_(1, "完成")]]);
         s.tick(100);
-        assert_eq!(s.seq, 2, "start 佔 1，final 佔 1");
+        // start 佔 1，第一次聽到 s1 佔 1，final 佔 1
+        assert_eq!(s.seq, 3);
+        // 同一位語者第二次發言不再提出
+        s.source = Box::new({
+            let mut src = ScriptedSource::default();
+            src.push(vec![final_(2, "第二句")]);
+            src
+        });
+        s.tick(200);
+        assert_eq!(s.seq, 4, "重複的語者不得再配發一個 seq");
     }
 
     #[test]
@@ -2096,7 +2231,11 @@ mod tests {
         // 放進日誌會讓 through_event_seq 失去意義（§5.4.1）
         assert_eq!(
             kinds,
-            vec!["MeetingStateChanged", "TranscriptSegmentFinalized"]
+            vec![
+                "MeetingStateChanged",
+                "SpeakerProposed",
+                "TranscriptSegmentFinalized"
+            ]
         );
     }
 
@@ -2151,6 +2290,15 @@ mod tests {
     #[test]
     fn test_a_journal_failure_rejects_every_command_that_would_create_events() {
         let (mut s, _store, _m) = with_store();
+        s.speakers.insert(
+            "s1".into(),
+            SpeakerRecord {
+                ordinal: 1,
+                proposed_name: None,
+                confirmed_name: None,
+                track: Track::System,
+            },
+        );
         s.journal_failed("磁碟已滿".into());
         for r in [
             s.add_note("記一筆"),
@@ -2317,5 +2465,326 @@ mod tests {
         assert_eq!(s.active_meeting_id(), None);
         // 但 flush 仍要知道最後一批事件屬於哪場會議
         assert_eq!(s.meeting_id(), Some(m));
+    }
+
+    /* ── 語者（§8.3） ─────────────────────────────────────────── */
+
+    #[test]
+    fn test_a_speaker_is_proposed_before_it_can_be_confirmed() {
+        let mut store = Store::new(db::open_in_memory().unwrap());
+        let m = store.create_meeting("測試").unwrap();
+        let mut s = scripted_for(m, vec![vec![final_(1, "我先講")]]);
+        s.tick(100);
+        assert!(s.confirm_speaker("s1", "小明").accepted);
+        drain_to(&mut s, &mut store, m);
+
+        // 這正是先前無聲遺失的東西：畫面說已確認，磁碟上要真的有
+        let d = store.meeting(m).unwrap();
+        assert_eq!(d.speakers.len(), 1);
+        assert_eq!(d.speakers[0].speaker_id, "s1");
+        assert_eq!(d.speakers[0].confirmed_name.as_deref(), Some("小明"));
+        assert_eq!(d.speakers[0].ordinal, 1);
+    }
+
+    #[test]
+    fn test_confirming_a_speaker_nobody_has_heard_is_rejected() {
+        let mut s = recording();
+        let r = s.confirm_speaker("ghost", "誰");
+        assert!(!r.accepted);
+        assert!(r.note.unwrap().contains("尚未聽到"));
+    }
+
+    #[test]
+    fn test_speakers_are_numbered_in_order_of_first_appearance() {
+        let mut s = scripted(vec![
+            vec![TranscriptInput::Final {
+                segment_id: 1,
+                speaker_id: "b".into(),
+                text: "先".into(),
+                track: Track::System,
+            }],
+            vec![TranscriptInput::Final {
+                segment_id: 2,
+                speaker_id: "a".into(),
+                text: "後".into(),
+                track: Track::Mic,
+            }],
+        ]);
+        s.tick(100);
+        s.tick(200);
+        assert_eq!(s.speakers["b"].ordinal, 1);
+        assert_eq!(s.speakers["a"].ordinal, 2);
+        assert_eq!(s.speakers["a"].track, Track::Mic);
+    }
+
+    #[test]
+    fn test_a_proposed_speaker_carries_its_track_to_the_ui() {
+        let mut s = scripted(vec![vec![TranscriptInput::Final {
+            segment_id: 1,
+            speaker_id: "me".into(),
+            text: "我說的".into(),
+            track: Track::Mic,
+        }]]);
+        s.tick(100);
+        let batch = s.drain(0);
+        let proposed = batch
+            .events
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::SpeakerProposed { track, .. } => Some(*track),
+                _ => None,
+            })
+            .expect("沒有提出語者");
+        // §8.1 的軌道先驗只到「本機 vs 遠端」，稱呼由 UI 依它決定
+        assert_eq!(proposed, Track::Mic);
+    }
+
+    /* ── 生成編排（先前無法測試的那 60 行） ──────────────────── */
+
+    use crate::agent::{DraftRequest, Planner};
+    use crate::document::Block;
+
+    /// 錄好一場會議並凍結快照，回傳可直接驅動 `run_generation` 的兩個把手。
+    fn ready_to_generate() -> (
+        SessionHandle,
+        StoreHandle,
+        crate::store::MeetingId,
+        u32,
+        u64,
+    ) {
+        // 檔案型資料庫，因為 run_generation 會另開唯讀連線讀證據。
+        // 用記憶體資料庫的話那條連線看不到任何東西，測試就繞過了正式路徑。
+        let store = StoreHandle::temp().unwrap();
+        let m = store.write().unwrap().create_meeting("測試").unwrap();
+        let mut s = scripted_for(m, vec![vec![final_(1, "報價要拆成設計、開發、維運三項")]]);
+        s.tick(100);
+        let (receipt, snap) = s.create_snapshot();
+        assert!(receipt.accepted);
+        let (version, through) = snap.unwrap();
+        store.write().unwrap().append(m, &s.take_journal()).unwrap();
+        (SessionHandle::from_session(s), store, m, version, through)
+    }
+
+    #[test]
+    fn test_generation_output_reaches_the_database_not_just_the_screen() {
+        let (session, store, m, version, through) = ready_to_generate();
+        run_generation(
+            &session,
+            &store,
+            &mut crate::agent::FixturePlanner,
+            version,
+            through,
+        );
+
+        // 這正是先前那個 CHECK constraint 的 bug 會被擋下的地方：
+        // 畫面顯示「已完成」不算數，磁碟上要真的有區塊
+        let st = store.write().unwrap();
+        let run = st
+            .runs(m)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.version_no == version)
+            .unwrap();
+        assert_eq!(run.status, "completed");
+        assert!(!st.run_blocks(run.run_id).unwrap().is_empty());
+        assert!(session.with(|s| s.journal_error.clone()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_every_block_kind_the_planner_can_emit_is_writable() {
+        /// 一次吐出全部 12 種區塊，把 schema 與 BlockKind 釘在一起。
+        struct EveryKind;
+        impl Planner for EveryKind {
+            fn draft(&mut self, _req: &DraftRequest<'_>) -> crate::agent::Result<Vec<Block>> {
+                use crate::document::{BlockContent, BlockKind};
+                use crate::model::ClaimKind;
+                Ok(crate::document::ALL_BLOCK_KINDS
+                    .iter()
+                    .filter(|k| {
+                        // Fact 要引用，這個測試只關心「寫得進去嗎」
+                        k.required_claim_kind() != Some(ClaimKind::Fact)
+                    })
+                    .map(|k| Block {
+                        kind: *k,
+                        claim_kind: k.required_claim_kind().unwrap_or(ClaimKind::Inference),
+                        content: match k {
+                            BlockKind::Heading => BlockContent::Heading {
+                                level: 1,
+                                text: "標題".into(),
+                            },
+                            BlockKind::BulletList => BlockContent::Bullets {
+                                items: vec!["一".into()],
+                            },
+                            BlockKind::Table => BlockContent::Table {
+                                headers: vec!["項目".into()],
+                                rows: vec![vec!["設計".into()]],
+                            },
+                            BlockKind::MermaidDiagram => BlockContent::Mermaid {
+                                source: "graph TD".into(),
+                            },
+                            BlockKind::Callout => BlockContent::Callout {
+                                tone: "info".into(),
+                                title: "注意".into(),
+                                body: "內容".into(),
+                            },
+                            BlockKind::SourceLink => BlockContent::Link {
+                                label: "來源".into(),
+                                target: "#seg-1-r1".into(),
+                            },
+                            _ => BlockContent::Text {
+                                text: "內容".into(),
+                            },
+                        },
+                        source_refs: vec![],
+                    })
+                    .collect())
+            }
+        }
+
+        let (session, store, m, version, through) = ready_to_generate();
+        run_generation(&session, &store, &mut EveryKind, version, through);
+
+        assert!(
+            session.with(|s| s.journal_error.clone()).unwrap().is_none(),
+            "有區塊種類寫不進 schema"
+        );
+        let st = store.write().unwrap();
+        let run = st
+            .runs(m)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.version_no == version)
+            .unwrap();
+        assert_eq!(run.status, "completed");
+        assert!(st.run_blocks(run.run_id).unwrap().len() >= 8);
+    }
+
+    #[test]
+    fn test_a_planner_error_fails_the_run_and_keeps_the_snapshot_cursor() {
+        struct Broken;
+        impl Planner for Broken {
+            fn draft(&mut self, _req: &DraftRequest<'_>) -> crate::agent::Result<Vec<Block>> {
+                Err(crate::agent::AgentError::Provider(
+                    "Provider 回報限流".into(),
+                ))
+            }
+        }
+
+        let (session, store, m, version, through) = ready_to_generate();
+        run_generation(&session, &store, &mut Broken, version, through);
+
+        let st = store.write().unwrap();
+        let run = st
+            .runs(m)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.version_no == version)
+            .unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run.failure_reason.unwrap().contains("限流"));
+        // 游標保留，重試沿用同一個涵蓋範圍
+        assert_eq!(run.through_event_seq, through);
+    }
+
+    #[test]
+    fn test_recording_after_the_cursor_does_not_enter_this_round() {
+        let (session, store, m, version, through) = ready_to_generate();
+        // 生成開始之前又講了一句：它在游標之後，本輪不得引用
+        let late = session
+            .with(|s| {
+                s.apply_transcript_input(final_(2, "這句話在快照之後"));
+                s.take_journal()
+            })
+            .unwrap();
+        store.write().unwrap().append(m, &late).unwrap();
+
+        run_generation(
+            &session,
+            &store,
+            &mut crate::agent::FixturePlanner,
+            version,
+            through,
+        );
+
+        let st = store.write().unwrap();
+        let run = st
+            .runs(m)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.version_no == version)
+            .unwrap();
+        let text = format!("{:?}", st.run_blocks(run.run_id).unwrap());
+        assert!(
+            !text.contains("這句話在快照之後"),
+            "快照游標沒有凍結涵蓋範圍"
+        );
+        assert!(text.contains("報價要拆成設計"));
+    }
+
+    #[test]
+    fn test_recording_keeps_landing_while_a_snapshot_generates() {
+        use std::sync::mpsc;
+
+        /// 在 draft 裡卡住，模擬一趟真實的 LLM 往返。
+        struct Blocking {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Planner for Blocking {
+            fn draft(&mut self, req: &DraftRequest<'_>) -> crate::agent::Result<Vec<Block>> {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+                crate::agent::FixturePlanner.draft(req)
+            }
+        }
+
+        let (session, store, m, version, through) = ready_to_generate();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut p = Blocking {
+                    started: started_tx.clone(),
+                    release: release_rx,
+                };
+                run_generation(&session, &store, &mut p, version, through);
+            });
+
+            // 等生成真的進到模型那一步
+            started_rx.recv().unwrap();
+
+            // §5.4.2：這段期間錄音必須繼續落地。抱著寫入鎖跑生成的話，
+            // 這一行會卡到整趟生成結束。
+            store
+                .write()
+                .expect("生成期間拿不到寫入鎖")
+                .append(
+                    m,
+                    &[(
+                        DomainEvent::NoteAdded {
+                            note_id: 99,
+                            text: "生成期間記的一筆".into(),
+                        },
+                        Timeline::new(9_000, 9_000),
+                    )],
+                )
+                .expect("生成期間寫不進去");
+
+            release_tx.send(()).unwrap();
+        });
+
+        let st = store.write().unwrap();
+        // 生成期間寫進去的筆記還在
+        assert!(st.meeting(m).unwrap().notes.iter().any(|n| n.note_id == 99));
+        // 而且本輪成果仍然只涵蓋游標之前的內容
+        let run = st
+            .runs(m)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.version_no == version)
+            .unwrap();
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.through_event_seq, through);
     }
 }

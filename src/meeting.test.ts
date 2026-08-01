@@ -125,6 +125,15 @@ describe('sequence gap detection', () => {
           meetingTimeMs: 500,
         },
       ],
+      speakers: [
+        {
+          speakerId: 's1',
+          ordinal: 1,
+          proposedName: null,
+          confirmedName: '小明',
+          track: 'system',
+        },
+      ],
       notes: [{ noteId: 1, text: '筆記', meetingTimeMs: 800, capturedAudioMs: 800 }],
       snapshots: [
         { version: 1, throughEventSeq: 4, meetingTimeMs: 3000, state: 'completed' },
@@ -136,6 +145,7 @@ describe('sequence gap detection', () => {
     expect(m.appliedSeq).toBe(9);
     expect(m.segments[0].text).toBe('重新同步後的內容');
     expect(m.activeVersion).toBe(1);
+    expect(m.speakers[0].confirmedName).toBe('小明');
   });
 });
 
@@ -192,5 +202,55 @@ describe('local write failures', () => {
     m = applyBatch(m, { ...batchOf([note(3, 2, '三')], 2), journalError: '磁碟已滿' });
     expect(m.desynced).toBe(true);
     expect(m.journalError).toBe('磁碟已滿');
+  });
+});
+
+describe('speakers', () => {
+  const proposed = (seq: number, id: string, ordinal: number, track: 'mic' | 'system'): SessionEvent => ({
+    kind: 'speakerProposed',
+    seq,
+    speakerId: id,
+    ordinal,
+    proposedName: null,
+    track,
+  });
+
+  test('a_speaker_appears_once_however_often_the_batch_is_replayed', () => {
+    let m = applyBatch(emptyMeeting, batchOf([proposed(1, 's1', 1, 'system')], 0));
+    m = applyBatch(m, batchOf([proposed(1, 's1', 1, 'system')], 0));
+    expect(m.speakers).toHaveLength(1);
+  });
+
+  test('confirming_a_name_updates_the_speaker_rather_than_a_side_table', () => {
+    let m = applyBatch(emptyMeeting, batchOf([proposed(1, 's1', 1, 'system')], 0));
+    m = applyBatch(
+      m,
+      batchOf([{ kind: 'speakerConfirmed', seq: 2, speakerId: 's1', name: '小明' }], 1),
+    );
+    expect(m.speakers[0].confirmedName).toBe('小明');
+  });
+
+  test('speakers_stay_ordered_by_first_appearance', () => {
+    let m = applyBatch(emptyMeeting, batchOf([proposed(1, 'b', 2, 'system')], 0));
+    m = applyBatch(m, batchOf([proposed(2, 'a', 1, 'mic')], 1));
+    expect(m.speakers.map((s) => s.id)).toEqual(['a', 'b']);
+  });
+});
+
+describe('precedence is identical across all three layers', () => {
+  test('a_higher_provider_revision_still_loses_to_a_user_edit', () => {
+    let m = applyBatch(emptyMeeting, batchOf([finalized(1, 10, '原始')], 0));
+    m = applyBatch(m, batchOf([edited(2, 10, '使用者改過', 2)], 1));
+    // Provider 的 r3。版本號較大不代表它有權覆蓋（與 Rust 兩層同一條規則）
+    m = applyBatch(m, batchOf([finalized(3, 10, 'Provider 的 r3', 3)], 2));
+    expect(m.segments[0].text).toBe('使用者改過');
+    expect(m.segments[0].revision).toBe(2);
+  });
+
+  test('a_later_user_edit_still_wins_over_an_earlier_one', () => {
+    let m = applyBatch(emptyMeeting, batchOf([finalized(1, 10, '原始')], 0));
+    m = applyBatch(m, batchOf([edited(2, 10, '第一次改', 2)], 1));
+    m = applyBatch(m, batchOf([edited(3, 10, '第二次改', 3)], 2));
+    expect(m.segments[0].text).toBe('第二次改');
   });
 });

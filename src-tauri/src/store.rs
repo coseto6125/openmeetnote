@@ -405,6 +405,70 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Store 的共用把手。
+///
+/// 與 `SessionHandle` 分成兩把鎖：寫 SQLite 不該卡住命令處理，命令持鎖時
+/// 也不該等磁碟。代價是兩者之間有個短暫的未落地窗口，因此每個命令結束都
+/// flush 一次，未落地的內容最多只有 STT 的一個節流窗。
+///
+/// 住在 store 而不是 session：設定與歷史都要用它，掛在會議模組底下會逼
+/// 那些模組為了一個儲存把手而相依於會議。
+pub struct StoreHandle {
+    inner: std::sync::Mutex<Store>,
+    path: std::path::PathBuf,
+}
+
+/// 鎖損毀或連線開不起來。呼叫端一律 fail closed。
+#[derive(Debug)]
+pub struct StoreUnavailable;
+
+impl std::fmt::Display for StoreUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("資料庫連線狀態已損毀")
+    }
+}
+
+impl StoreHandle {
+    pub fn open(path: std::path::PathBuf) -> crate::db::Result<Self> {
+        let conn = crate::db::open(&path)?;
+        Ok(Self {
+            inner: std::sync::Mutex::new(Store::new(conn)),
+            path,
+        })
+    }
+
+    /// 寫入用的獨佔連線。持鎖時間必須短。
+    pub fn write(&self) -> std::result::Result<std::sync::MutexGuard<'_, Store>, StoreUnavailable> {
+        self.inner.lock().map_err(|_| StoreUnavailable)
+    }
+
+    /// 以暫存檔為底的把手，供測試走與正式環境完全相同的路徑。
+    ///
+    /// 不用記憶體資料庫：`reader()` 需要真的另開一條連線，而記憶體資料庫
+    /// 每個連線都是各自獨立的。測試若走不同的路徑，就抓不到那條路徑上的錯。
+    #[cfg(test)]
+    pub fn temp() -> crate::db::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "openmeetnote-test-{}-{}.sqlite3",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        Self::open(path)
+    }
+
+    /// 另開一條唯讀連線。
+    ///
+    /// 摘要生成要在整個模型往返期間讀證據。用主連線的話就得抱著寫入鎖，
+    /// 錄音的落地會被卡住整趟 LLM 呼叫 —— 那正是 §5.4.2 要避免的事。
+    /// WAL 模式允許一個寫入者與多個讀取者同時存在，所以這裡直接開新連線。
+    pub fn reader(&self) -> crate::db::Result<Store> {
+        Ok(Store::new(crate::db::open_reader(&self.path)?))
+    }
+}
+
 impl Store {
     pub fn new(conn: Connection) -> Self {
         Self { conn }
@@ -828,15 +892,15 @@ impl Store {
     /// 讀出 GUI 存下的非敏感 Provider 設定。沒有設定過就回預設值。
     pub fn provider_settings(
         &self,
-        kind: crate::config::ProviderKind,
-    ) -> Result<crate::config::StoredProvider> {
+        kind: crate::model::ProviderKind,
+    ) -> Result<crate::model::StoredProvider> {
         Ok(self
             .conn
             .query_row(
                 "SELECT provider, model, base_url, options FROM provider_settings WHERE kind = ?1",
                 params![kind.as_str()],
                 |r| {
-                    Ok(crate::config::StoredProvider {
+                    Ok(crate::model::StoredProvider {
                         provider: r.get(0)?,
                         model: r.get(1)?,
                         base_url: r.get(2)?,
@@ -851,8 +915,8 @@ impl Store {
     /// 寫入非敏感設定。這張表不放密鑰（§5.6、§14），型別上也沒有那個欄位。
     pub fn set_provider_settings(
         &mut self,
-        kind: crate::config::ProviderKind,
-        v: &crate::config::StoredProvider,
+        kind: crate::model::ProviderKind,
+        v: &crate::model::StoredProvider,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO provider_settings (kind, provider, model, base_url, options)
@@ -1015,6 +1079,22 @@ fn clear_projections(tx: &Transaction<'_>, meeting: MeetingId) -> Result<()> {
     Ok(())
 }
 
+/// 投影更新必須影響到列。
+///
+/// UPDATE 影響 0 列在 SQLite 眼中完全合法，於是「事件寫進日誌了，投影卻沒動」
+/// 這件事會安靜地發生：畫面顯示成功，磁碟上什麼都沒有。實際踩過一次
+/// （SpeakerConfirmed 更新一列不存在的 speakers），因此每個 UPDATE 分支
+/// 都要說出自己預期影響幾列，不符就當成日誌損壞往上報。
+fn expect_touched(seq: u64, what: &str, affected: usize) -> Result<()> {
+    if affected == 0 {
+        return Err(StoreError::Corrupt {
+            seq,
+            reason: format!("{what} 沒有對應的投影列，事件無法套用"),
+        });
+    }
+    Ok(())
+}
+
 /// 把一筆事件套用到投影。`append` 與 `rebuild_projections` 共用這一份。
 fn project(
     tx: &Transaction<'_>,
@@ -1029,7 +1109,7 @@ fn project(
         DomainEvent::MeetingStateChanged { state } => {
             // started_at / ended_at 用 COALESCE 只寫一次：重播時不能因為
             // 掛鐘變了就改寫歷史上的開始時間。
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE meetings SET state = ?2,
                      started_at = CASE WHEN ?3 THEN COALESCE(started_at, ?5) ELSE started_at END,
                      ended_at   = CASE WHEN ?4 THEN COALESCE(ended_at,   ?5) ELSE ended_at   END
@@ -1042,6 +1122,7 @@ fn project(
                     now
                 ],
             )?;
+            expect_touched(seq, "會議", n)?;
         }
 
         DomainEvent::TranscriptSegmentFinalized { segment }
@@ -1050,17 +1131,25 @@ fn project(
             insert_revision(tx, meeting, seq, segment, now)?;
             let user_edited = matches!(event, DomainEvent::TranscriptSegmentEdited { .. })
                 || segment.origin == Origin::User;
-            // 指標只前進不後退：Provider 重連後重送舊版本不得讓內容倒退（§5.3）
+            // 兩條規則，必須與 Session 的判定完全相同（§5.3）：
+            //
+            // 1. 指標只前進不後退，擋掉 Provider 重連後重送的舊版本。
+            // 2. Provider 不得覆蓋使用者修訂，版本號再高也不行。
+            //
+            // 第二條原本只寫在 Session 裡，這裡靠 MAX(revision) 近似，結果是
+            // 兩層規則不等價：Provider 的 r3 會蓋掉使用者的 r2。不等價的兩層
+            // 防禦比一層更糟，因為它讓人以為下層擋得住。
             tx.execute(
                 "INSERT INTO transcript_segments
                      (meeting_id, id, current_revision, stability, user_edited, meeting_start_ms)
                  VALUES (?1,?2,?3,'final',?4,?5)
                  ON CONFLICT (meeting_id, id) DO UPDATE SET
-                     current_revision = MAX(current_revision, excluded.current_revision),
+                     current_revision = excluded.current_revision,
                      stability        = 'final',
                      user_edited      = MAX(user_edited, excluded.user_edited),
                      meeting_start_ms = excluded.meeting_start_ms
-                 WHERE excluded.current_revision >= transcript_segments.current_revision",
+                 WHERE excluded.current_revision >= transcript_segments.current_revision
+                   AND (excluded.user_edited = 1 OR transcript_segments.user_edited = 0)",
                 params![
                     meeting,
                     segment.segment_id as i64,
@@ -1078,11 +1167,12 @@ fn project(
         } => {
             // 只改指定版本的歸屬。這是 Provider 重新指派，不是新內容，
             // 因此不建立新 revision。
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE transcript_segment_revisions SET speaker_id = ?4
                  WHERE meeting_id = ?1 AND segment_id = ?2 AND revision = ?3",
                 params![meeting, *segment_id as i64, *revision as i64, speaker_id],
             )?;
+            expect_touched(seq, &format!("片段 {segment_id} r{revision}"), n)?;
         }
 
         DomainEvent::NoteAdded { note_id, text } => {
@@ -1103,17 +1193,19 @@ fn project(
             )?;
         }
         DomainEvent::NoteEdited { note_id, text } => {
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE notes SET text = ?3 WHERE meeting_id = ?1 AND id = ?2",
                 params![meeting, *note_id as i64, text],
             )?;
+            expect_touched(seq, &format!("筆記 {note_id}"), n)?;
         }
         DomainEvent::NoteRemoved { note_id } => {
             // 標記而不是刪除：已匯出的文件可能引用它，實體刪除會讓引用指向虛空
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE notes SET removed = 1 WHERE meeting_id = ?1 AND id = ?2",
                 params![meeting, *note_id as i64],
             )?;
+            expect_touched(seq, &format!("筆記 {note_id}"), n)?;
         }
 
         DomainEvent::SpeakerProposed {
@@ -1145,21 +1237,26 @@ fn project(
         }
         DomainEvent::SpeakerConfirmed { speaker_id, name }
         | DomainEvent::SpeakerRenamed { speaker_id, name } => {
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE speakers SET confirmed_name = ?3, status = 'confirmed'
                  WHERE meeting_id = ?1 AND id = ?2",
                 params![meeting, speaker_id, name],
             )?;
+            // 沒有先被 SpeakerProposed 過的語者不能被確認：那代表 UI 在
+            // 確認一個日誌裡不存在的人，而確認結果會無聲消失
+            expect_touched(seq, &format!("語者 {speaker_id}"), n)?;
         }
         DomainEvent::SpeakerMerged {
             from_speaker_id,
             into_speaker_id,
         } => {
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE speakers SET status = 'merged', merged_into = ?3
                  WHERE meeting_id = ?1 AND id = ?2",
                 params![meeting, from_speaker_id, into_speaker_id],
             )?;
+            expect_touched(seq, &format!("語者 {from_speaker_id}"), n)?;
+            // 底下的片段改派可以是 0 列：這位語者可能還沒說過話
             tx.execute(
                 "UPDATE transcript_segment_revisions SET speaker_id = ?3
                  WHERE meeting_id = ?1 AND speaker_id = ?2",
@@ -1198,10 +1295,11 @@ fn project(
             extraction_revision,
             chunks,
         } => {
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE attachments SET status = 'extracted' WHERE id = ?1",
                 params![attachment_id],
             )?;
+            expect_touched(seq, &format!("附件 {attachment_id}"), n)?;
             // 同一 extraction_revision 重播時先清掉，避免重建後 chunk 加倍
             tx.execute(
                 "DELETE FROM attachment_chunks
@@ -1226,10 +1324,11 @@ fn project(
             }
         }
         DomainEvent::AttachmentRemoved { attachment_id } => {
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE attachments SET status = 'removed' WHERE id = ?1",
                 params![attachment_id],
             )?;
+            expect_touched(seq, &format!("附件 {attachment_id}"), n)?;
         }
 
         DomainEvent::AudioSegmentFinalized { segment } => {
@@ -1294,10 +1393,11 @@ fn project(
             blocks,
             usage,
         } => {
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE generation_runs SET status = 'completed', usage = ?2 WHERE id = ?1",
                 params![run_id, serde_json::to_string(usage)?],
             )?;
+            expect_touched(seq, &format!("生成 {run_id}"), n)?;
             tx.execute(
                 "DELETE FROM document_blocks WHERE run_id = ?1",
                 params![run_id],
@@ -1337,10 +1437,11 @@ fn project(
         }
         DomainEvent::GenerationFailed { run_id, reason } => {
             // 失敗的 run 保留快照游標，重試可以沿用同一個涵蓋範圍
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE generation_runs SET status = 'failed', failure_reason = ?2 WHERE id = ?1",
                 params![run_id, reason],
             )?;
+            expect_touched(seq, &format!("生成 {run_id}"), n)?;
         }
     }
     Ok(())
@@ -1957,5 +2058,72 @@ mod tests {
         assert_eq!(list[0].meeting_time_ms, 5000);
         assert_eq!(list[0].state, MeetingState::Completed);
         assert!(list[0].started_at.is_some() && list[0].ended_at.is_some());
+    }
+
+    #[test]
+    fn a_higher_provider_revision_still_cannot_overwrite_a_user_edit() {
+        let (mut s, m) = store();
+        s.append(
+            m,
+            &[
+                (
+                    DomainEvent::TranscriptSegmentFinalized {
+                        segment: seg(1, 1, "原始", Origin::Provider),
+                    },
+                    tl(0),
+                ),
+                (
+                    DomainEvent::TranscriptSegmentEdited {
+                        segment: seg(1, 2, "使用者改過", Origin::User),
+                    },
+                    tl(10),
+                ),
+                // Provider 之後送出版本更高的結果。版本號比較大不代表它有權覆蓋。
+                (
+                    DomainEvent::TranscriptSegmentRevised {
+                        segment: seg(1, 3, "Provider 的 r3", Origin::Provider),
+                    },
+                    tl(20),
+                ),
+            ],
+        )
+        .unwrap();
+        let d = s.meeting(m).unwrap();
+        assert_eq!(d.segments[0].text, "使用者改過");
+        assert_eq!(d.segments[0].revision, 2);
+        // 該版本本身仍然存進 revisions，只是不成為目前指標
+        let n: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM transcript_segment_revisions WHERE meeting_id = ?1",
+                params![m],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3, "被拒絕的版本仍要留在不可變歷史裡");
+    }
+
+    #[test]
+    fn a_later_user_edit_still_wins_over_an_earlier_one() {
+        let (mut s, m) = store();
+        s.append(
+            m,
+            &[
+                (
+                    DomainEvent::TranscriptSegmentEdited {
+                        segment: seg(1, 1, "第一次改", Origin::User),
+                    },
+                    tl(0),
+                ),
+                (
+                    DomainEvent::TranscriptSegmentEdited {
+                        segment: seg(1, 2, "第二次改", Origin::User),
+                    },
+                    tl(10),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(s.meeting(m).unwrap().segments[0].text, "第二次改");
     }
 }

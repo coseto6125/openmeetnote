@@ -7,8 +7,6 @@ mod model;
 mod session;
 mod store;
 
-use std::sync::Mutex;
-
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -21,8 +19,7 @@ pub fn run() {
             // 提權才能寫，而且解除安裝會連同會議紀錄一起清掉。
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
-            let conn = db::open(&dir.join("openmeetnote.sqlite3"))?;
-            app.manage(session::StoreHandle(Mutex::new(store::Store::new(conn))));
+            app.manage(store::StoreHandle::open(dir.join("openmeetnote.sqlite3"))?);
 
             session::spawn_pump(app.handle().clone());
             Ok(())

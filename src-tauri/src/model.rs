@@ -174,6 +174,51 @@ impl ClaimKind {
     }
 }
 
+/* ── Provider 設定（§5.6） ──────────────────────────────────────── */
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderKind {
+    Stt,
+    Llm,
+}
+
+impl ProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderKind::Stt => "stt",
+            ProviderKind::Llm => "llm",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "stt" => Some(ProviderKind::Stt),
+            "llm" => Some(ProviderKind::Llm),
+            _ => None,
+        }
+    }
+
+    /// 環境變數前綴，例如 `OPENMEETNOTE_STT_PROVIDER`。
+    pub fn env_prefix(self) -> &'static str {
+        match self {
+            ProviderKind::Stt => "OPENMEETNOTE_STT",
+            ProviderKind::Llm => "OPENMEETNOTE_LLM",
+        }
+    }
+}
+
+/// GUI 存下來的非敏感設定，對應 `provider_settings` 資料表。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredProvider {
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub options: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
