@@ -17,6 +17,10 @@ use rusqlite::{Connection, OpenFlags};
 /// 目前的 schema 版本。新增 migration 時同步 +1。
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// 等鎖的時限。生成與錄音在不同連線上競爭，瞬間撞上時預設行為是立刻回
+/// SQLITE_BUSY，而等一下就好的事不該變成錯誤。讀寫兩條連線用同一個值。
+const BUSY_TIMEOUT_MS: i64 = 5_000;
+
 /// migration 以 `(version, sql)` 排序套用。版本必須連續。
 const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("migrations/001_initial.sql"))];
 
@@ -57,16 +61,14 @@ pub fn open_in_memory() -> Result<Connection> {
 /// 開成唯讀也是刻意的，讓「背景工作不寫資料庫」變成連線層的事實而不是約定。
 pub fn open_reader(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    conn.pragma_update(None, "busy_timeout", 5_000)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
     Ok(conn)
 }
 
 fn prepare(conn: &Connection) -> Result<()> {
-    // busy_timeout 必須設：生成與錄音在不同交易寫入，瞬間競爭時
-    // 預設行為是立刻回 SQLITE_BUSY，等一下就好的事不該變成錯誤。
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "busy_timeout", 5_000)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
 }

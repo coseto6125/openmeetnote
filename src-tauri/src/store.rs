@@ -437,8 +437,13 @@ impl StoreHandle {
         })
     }
 
-    /// 寫入用的獨佔連線。持鎖時間必須短。
-    pub fn write(&self) -> std::result::Result<std::sync::MutexGuard<'_, Store>, StoreUnavailable> {
+    /// 獨佔連線。讀寫都走這裡，持鎖時間必須短。
+    ///
+    /// 名字講的是鎖的性質，不是操作的方向：`get_settings` 與 `export_document`
+    /// 只讀也走這條，因為 `Store` 只有這一個入口。要並行讀取的是 `reader()`。
+    pub fn exclusive(
+        &self,
+    ) -> std::result::Result<std::sync::MutexGuard<'_, Store>, StoreUnavailable> {
         self.inner.lock().map_err(|_| StoreUnavailable)
     }
 
@@ -457,6 +462,30 @@ impl StoreHandle {
         ));
         let _ = std::fs::remove_file(&path);
         Self::open(path)
+    }
+
+    /// 有時限的寫入嘗試,只給測試用。
+    ///
+    /// `write()` 會一直等。測試若用它來證明「某某期間鎖是放開的」,規則被破壞時
+    /// 得到的是卡死而不是失敗,CI 上會燒掉整個 job 的時限才收場。
+    #[cfg(test)]
+    pub fn try_exclusive_for(
+        &self,
+        limit: std::time::Duration,
+    ) -> std::result::Result<std::sync::MutexGuard<'_, Store>, StoreUnavailable> {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            match self.inner.try_lock() {
+                Ok(g) => return Ok(g),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(StoreUnavailable),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(StoreUnavailable);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
     }
 
     /// 另開一條唯讀連線。
@@ -779,6 +808,33 @@ impl Store {
                 meeting_start_ms: r.get::<_, i64>(6)? as u64,
                 meeting_end_ms: r.get::<_, i64>(7)? as u64,
                 user_edited: false,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 快照涵蓋範圍內已經出現過的語者（§5.4.2）。
+    ///
+    /// 與 `segments_through` 同一個道理：本輪證據以游標凍結，游標之後才第一次
+    /// 發言的人不屬於這一輪。
+    pub fn speakers_through(
+        &self,
+        meeting: MeetingId,
+        through_event_seq: u64,
+    ) -> Result<Vec<StoredSpeaker>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ordinal, proposed_name, confirmed_name, status
+             FROM speakers
+             WHERE meeting_id = ?1 AND status <> 'merged' AND created_event_seq <= ?2
+             ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![meeting, through_event_seq as i64], |r| {
+            Ok(StoredSpeaker {
+                speaker_id: r.get(0)?,
+                ordinal: r.get::<_, i64>(1)? as u32,
+                proposed_name: r.get(2)?,
+                confirmed_name: r.get(3)?,
+                status: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1216,8 +1272,8 @@ fn project(
         } => {
             tx.execute(
                 "INSERT INTO speakers (meeting_id, id, ordinal, proposed_name, status,
-                                       provider_labels)
-                 VALUES (?1,?2,?3,?4,?5,?6)
+                                       provider_labels, created_event_seq)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)
                  ON CONFLICT (meeting_id, id) DO UPDATE SET
                      proposed_name   = excluded.proposed_name,
                      provider_labels = excluded.provider_labels",
@@ -1231,7 +1287,8 @@ fn project(
                     } else {
                         "unconfirmed"
                     },
-                    serde_json::to_string(provider_labels)?
+                    serde_json::to_string(provider_labels)?,
+                    seq as i64
                 ],
             )?;
         }
@@ -1269,10 +1326,10 @@ fn project(
             ..
         } => {
             tx.execute(
-                "INSERT INTO speakers (meeting_id, id, ordinal, status)
-                 VALUES (?1,?2,?3,'unconfirmed')
+                "INSERT INTO speakers (meeting_id, id, ordinal, status, created_event_seq)
+                 VALUES (?1,?2,?3,'unconfirmed',?4)
                  ON CONFLICT (meeting_id, id) DO NOTHING",
-                params![meeting, new_speaker_id, *ordinal as i64],
+                params![meeting, new_speaker_id, *ordinal as i64, seq as i64],
             )?;
         }
 
@@ -2125,5 +2182,219 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.meeting(m).unwrap().segments[0].text, "第二次改");
+    }
+
+    #[test]
+    fn replaying_every_event_kind_does_not_trip_the_row_count_contract() {
+        // expect_touched 讓「投影影響 0 列」變成錯誤。這個測試存在是為了證明
+        // 它不會在合法情況下誤判 —— 尤其是重建，重建會把每個事件再套用一次。
+        let (mut s, m) = store();
+        s.append(
+            m,
+            &[
+                (
+                    DomainEvent::MeetingStateChanged {
+                        state: MeetingState::Recording,
+                    },
+                    tl(0),
+                ),
+                (
+                    DomainEvent::SpeakerProposed {
+                        speaker_id: "s1".into(),
+                        ordinal: 1,
+                        proposed_name: Some("語者 1".into()),
+                        provider_labels: vec!["spk_0".into()],
+                    },
+                    tl(10),
+                ),
+                (
+                    DomainEvent::SpeakerProposed {
+                        speaker_id: "s2".into(),
+                        ordinal: 2,
+                        proposed_name: None,
+                        provider_labels: vec![],
+                    },
+                    tl(11),
+                ),
+                (
+                    DomainEvent::SpeakerRenamed {
+                        speaker_id: "s1".into(),
+                        name: "小明".into(),
+                    },
+                    tl(12),
+                ),
+                (
+                    DomainEvent::TranscriptSegmentFinalized {
+                        segment: seg(1, 1, "一", Origin::Provider),
+                    },
+                    tl(100),
+                ),
+                (
+                    DomainEvent::TranscriptSegmentRevised {
+                        segment: seg(1, 2, "一改", Origin::Provider),
+                    },
+                    tl(110),
+                ),
+                (
+                    DomainEvent::SpeakerReassigned {
+                        segment_id: 1,
+                        revision: 2,
+                        speaker_id: Some("s2".into()),
+                    },
+                    tl(120),
+                ),
+                (
+                    DomainEvent::NoteAdded {
+                        note_id: 1,
+                        text: "一".into(),
+                    },
+                    tl(200),
+                ),
+                (
+                    DomainEvent::NoteEdited {
+                        note_id: 1,
+                        text: "一改".into(),
+                    },
+                    tl(210),
+                ),
+                (DomainEvent::NoteRemoved { note_id: 1 }, tl(220)),
+                (
+                    DomainEvent::SpeakerSplit {
+                        from_speaker_id: "s2".into(),
+                        new_speaker_id: "s3".into(),
+                        ordinal: 3,
+                    },
+                    tl(230),
+                ),
+                (
+                    DomainEvent::SpeakerMerged {
+                        from_speaker_id: "s3".into(),
+                        into_speaker_id: "s2".into(),
+                    },
+                    tl(240),
+                ),
+                (
+                    DomainEvent::AttachmentAdded {
+                        attachment_id: 1,
+                        path: "/tmp/a.pdf".into(),
+                        mime: "application/pdf".into(),
+                        sha256: "x".into(),
+                    },
+                    tl(300),
+                ),
+                (
+                    DomainEvent::AttachmentExtracted {
+                        attachment_id: 1,
+                        extraction_revision: 1,
+                        chunks: vec![AttachmentChunk {
+                            page_no: Some(1),
+                            start_offset: 0,
+                            end_offset: 5,
+                            text: "hello".into(),
+                        }],
+                    },
+                    tl(310),
+                ),
+                (DomainEvent::AttachmentRemoved { attachment_id: 1 }, tl(320)),
+                (
+                    DomainEvent::AudioSegmentFinalized {
+                        segment: AudioSegment {
+                            id: 1,
+                            track: Track::Mic,
+                            source_epoch: 0,
+                            path: "/tmp/a.wav".into(),
+                            captured_start_ms: 0,
+                            captured_end_ms: 900,
+                            meeting_start_ms: 0,
+                            meeting_end_ms: 900,
+                            is_silence_fill: false,
+                            checksum: "sha".into(),
+                        },
+                    },
+                    tl(400),
+                ),
+                (
+                    DomainEvent::SnapshotCreated {
+                        document_id: 1,
+                        run_id: 1,
+                        parent_run_id: None,
+                        version_no: 1,
+                        purpose: "p".into(),
+                        title: "t".into(),
+                        through_event_seq: 10,
+                        prompt: String::new(),
+                    },
+                    tl(500),
+                ),
+                (
+                    DomainEvent::GenerationFailed {
+                        run_id: 1,
+                        reason: "限流".into(),
+                    },
+                    tl(510),
+                ),
+                (
+                    DomainEvent::SnapshotCreated {
+                        document_id: 1,
+                        run_id: 2,
+                        parent_run_id: Some(1),
+                        version_no: 2,
+                        purpose: "p".into(),
+                        title: "t".into(),
+                        through_event_seq: 12,
+                        prompt: String::new(),
+                    },
+                    tl(520),
+                ),
+                (
+                    DomainEvent::GenerationCompleted {
+                        run_id: 2,
+                        blocks: vec![],
+                        usage: serde_json::json!({}),
+                    },
+                    tl(530),
+                ),
+                (
+                    DomainEvent::MeetingStateChanged {
+                        state: MeetingState::Completed,
+                    },
+                    tl(600),
+                ),
+            ],
+        )
+        .expect("正常寫入時列數契約就誤判了");
+
+        let before = dump(&s, m);
+        // 重建會把同一批事件再套用一次。冪等的 INSERT 不會影響列數，
+        // 但每個 UPDATE 分支都會再跑一遍，這才是契約真正的壓力測試。
+        s.rebuild_projections(m).expect("重建時列數契約誤判");
+        assert_eq!(before, dump(&s, m));
+        s.rebuild_projections(m).expect("第二次重建時列數契約誤判");
+        assert_eq!(before, dump(&s, m));
+    }
+
+    #[test]
+    fn an_equal_revision_from_a_provider_does_not_displace_a_user_edit() {
+        // 等版本號是三層規則裡最容易寫歪的一格
+        let (mut s, m) = store();
+        s.append(
+            m,
+            &[
+                (
+                    DomainEvent::TranscriptSegmentEdited {
+                        segment: seg(1, 2, "使用者改過", Origin::User),
+                    },
+                    tl(0),
+                ),
+                (
+                    DomainEvent::TranscriptSegmentRevised {
+                        segment: seg(1, 2, "Provider 的同版本", Origin::Provider),
+                    },
+                    tl(10),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(s.meeting(m).unwrap().segments[0].text, "使用者改過");
     }
 }

@@ -575,17 +575,6 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
         >
           STT 斷線並重連
         </button>
-        <button
-          disabled={!model.speakers.length}
-          onClick={() => {
-            // 走與手動命名完全相同的命令路徑，只是不必經過鍵盤。
-            // 自動化能可靠點擊但送不進按鍵，而這條路徑值得被真的按過一次。
-            const first = model.speakers[0];
-            if (first) void submitName(first.id, '陳其昀');
-          }}
-        >
-          命名第一位語者
-        </button>
         <button onClick={() => commands.injectFault('generationFailed')}>生成失敗</button>
         <button
           onClick={() =>

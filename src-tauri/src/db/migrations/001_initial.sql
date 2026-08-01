@@ -72,6 +72,10 @@ CREATE TABLE speakers (
     -- Provider 對同一位語者用過的標籤，重連後標籤會變，保留供追溯
     provider_labels TEXT    NOT NULL DEFAULT '[]',
     merged_into     TEXT,
+    -- 第一次聽到這位語者的事件。快照要以游標凍結證據範圍，語者不能例外：
+    -- 沒有這一欄的話，生成期間新出現的人會被放進本輪的 Prompt，
+    -- 而本輪證據裡沒有他說過的任何一句話。
+    created_event_seq INTEGER NOT NULL,
     PRIMARY KEY (meeting_id, id)
 ) WITHOUT ROWID;
 

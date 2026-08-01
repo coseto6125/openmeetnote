@@ -138,8 +138,7 @@ pub fn build_index(
     let segments = store.segments_through(meeting, through_event_seq)?;
     let notes = store.notes_through(meeting, through_event_seq)?;
     let speakers = store
-        .meeting(meeting)?
-        .speakers
+        .speakers_through(meeting, through_event_seq)?
         .into_iter()
         .map(|s| s.confirmed_name.or(s.proposed_name).unwrap_or(s.speaker_id))
         .collect();
@@ -1013,5 +1012,32 @@ mod tests {
         assert!(r.degraded.is_empty());
         assert!(r.blocks.is_empty());
         assert!(r.rejected_blocks > 0);
+    }
+
+    #[test]
+    fn the_index_excludes_speakers_first_heard_after_the_cursor() {
+        let (mut s, m, cursor) = seeded();
+        // 快照凍結之後才第一次聽到的語者
+        s.append(
+            m,
+            &[(
+                DomainEvent::SpeakerProposed {
+                    speaker_id: "late".into(),
+                    ordinal: 9,
+                    proposed_name: None,
+                    provider_labels: vec![],
+                },
+                Timeline::new(99_000, 99_000),
+            )],
+        )
+        .unwrap();
+
+        let index = build_index(&s, m, cursor).unwrap();
+        // 片段與筆記都以游標凍結，語者沒有理由例外：本輪證據裡沒有這個人
+        // 說過的任何一句話，把他放進 Prompt 只會讓模型以為他在場。
+        assert!(
+            !index.speakers.iter().any(|n| n == "late"),
+            "游標之後才出現的語者進了本輪證據"
+        );
     }
 }

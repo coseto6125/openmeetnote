@@ -253,4 +253,12 @@ describe('precedence is identical across all three layers', () => {
     m = applyBatch(m, batchOf([edited(3, 10, '第二次改', 3)], 2));
     expect(m.segments[0].text).toBe('第二次改');
   });
+
+  test('an_equal_revision_from_a_provider_does_not_displace_a_user_edit', () => {
+    // 等版本號是三層規則裡最容易寫歪的一格，Rust 兩層各有一個同名測試
+    let m = applyBatch(emptyMeeting, batchOf([finalized(1, 10, '原始')], 0));
+    m = applyBatch(m, batchOf([edited(2, 10, '使用者改過', 2)], 1));
+    m = applyBatch(m, batchOf([finalized(3, 10, 'Provider 的同版本', 2)], 2));
+    expect(m.segments[0].text).toBe('使用者改過');
+  });
 });

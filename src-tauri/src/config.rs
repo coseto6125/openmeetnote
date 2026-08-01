@@ -298,7 +298,7 @@ pub fn get_settings(
     store: State<crate::store::StoreHandle>,
     config: State<ConfigHandle>,
 ) -> Result<Vec<ResolvedProvider>, String> {
-    let st = store.write().map_err(|e| e.to_string())?;
+    let st = store.exclusive().map_err(|e| e.to_string())?;
     [ProviderKind::Stt, ProviderKind::Llm]
         .into_iter()
         .map(|kind| {
@@ -322,7 +322,7 @@ pub fn save_provider(
     base_url: String,
 ) -> Result<(), String> {
     let kind = ProviderKind::parse(&kind).ok_or("未知的 Provider 類別")?;
-    let mut st = store.write().map_err(|e| e.to_string())?;
+    let mut st = store.exclusive().map_err(|e| e.to_string())?;
     st.set_provider_settings(
         kind,
         &StoredProvider {

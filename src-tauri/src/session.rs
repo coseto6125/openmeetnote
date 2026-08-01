@@ -684,7 +684,7 @@ impl Session {
             }
             | TranscriptInput::Final {
                 speaker_id, track, ..
-            } => self.ensure_speaker(&speaker_id.clone(), *track),
+            } => self.ensure_speaker(speaker_id, *track),
         }
         match input {
             TranscriptInput::Partial {
@@ -1386,7 +1386,7 @@ pub fn flush(session: &SessionHandle, store: &StoreHandle) {
     if batch.is_empty() {
         return;
     }
-    let result = match store.write() {
+    let result = match store.exclusive() {
         Ok(mut st) => st.append(meeting, &batch).map_err(|e| e.to_string()),
         Err(e) => Err(e.to_string()),
     };
@@ -1450,7 +1450,7 @@ pub fn spawn_pump(app: AppHandle) {
 #[tauri::command]
 pub fn start_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> CommandReceipt {
     // 會議列在這裡建立，不在 app 啟動時：否則每開一次程式就多一列空會議
-    let created = match store.write() {
+    let created = match store.exclusive() {
         Ok(mut st) => {
             let title = format!("會議 {}", crate::clock::now_utc()[..16].replace('T', " "));
             st.create_meeting(&title)
@@ -1645,7 +1645,7 @@ pub fn export_document(
 ) -> Result<String, String> {
     use tauri::Manager as _;
 
-    let st = store.write().map_err(|e| e.to_string())?;
+    let st = store.exclusive().map_err(|e| e.to_string())?;
     let run = st
         .runs(meeting_id)
         .map_err(|e| e.to_string())?
@@ -1760,7 +1760,7 @@ fn with_store<T, F>(store: &State<StoreHandle>, f: F) -> Result<T, String>
 where
     F: FnOnce(&mut Store) -> crate::store::Result<T>,
 {
-    let mut st = store.write().map_err(|e| e.to_string())?;
+    let mut st = store.exclusive().map_err(|e| e.to_string())?;
     f(&mut st).map_err(|e| e.to_string())
 }
 
@@ -2555,13 +2555,17 @@ mod tests {
         // 檔案型資料庫，因為 run_generation 會另開唯讀連線讀證據。
         // 用記憶體資料庫的話那條連線看不到任何東西，測試就繞過了正式路徑。
         let store = StoreHandle::temp().unwrap();
-        let m = store.write().unwrap().create_meeting("測試").unwrap();
+        let m = store.exclusive().unwrap().create_meeting("測試").unwrap();
         let mut s = scripted_for(m, vec![vec![final_(1, "報價要拆成設計、開發、維運三項")]]);
         s.tick(100);
         let (receipt, snap) = s.create_snapshot();
         assert!(receipt.accepted);
         let (version, through) = snap.unwrap();
-        store.write().unwrap().append(m, &s.take_journal()).unwrap();
+        store
+            .exclusive()
+            .unwrap()
+            .append(m, &s.take_journal())
+            .unwrap();
         (SessionHandle::from_session(s), store, m, version, through)
     }
 
@@ -2578,7 +2582,7 @@ mod tests {
 
         // 這正是先前那個 CHECK constraint 的 bug 會被擋下的地方：
         // 畫面顯示「已完成」不算數，磁碟上要真的有區塊
-        let st = store.write().unwrap();
+        let st = store.exclusive().unwrap();
         let run = st
             .runs(m)
             .unwrap()
@@ -2648,7 +2652,7 @@ mod tests {
             session.with(|s| s.journal_error.clone()).unwrap().is_none(),
             "有區塊種類寫不進 schema"
         );
-        let st = store.write().unwrap();
+        let st = store.exclusive().unwrap();
         let run = st
             .runs(m)
             .unwrap()
@@ -2673,7 +2677,7 @@ mod tests {
         let (session, store, m, version, through) = ready_to_generate();
         run_generation(&session, &store, &mut Broken, version, through);
 
-        let st = store.write().unwrap();
+        let st = store.exclusive().unwrap();
         let run = st
             .runs(m)
             .unwrap()
@@ -2696,7 +2700,7 @@ mod tests {
                 s.take_journal()
             })
             .unwrap();
-        store.write().unwrap().append(m, &late).unwrap();
+        store.exclusive().unwrap().append(m, &late).unwrap();
 
         run_generation(
             &session,
@@ -2706,7 +2710,7 @@ mod tests {
             through,
         );
 
-        let st = store.write().unwrap();
+        let st = store.exclusive().unwrap();
         let run = st
             .runs(m)
             .unwrap()
@@ -2741,6 +2745,7 @@ mod tests {
         let (session, store, m, version, through) = ready_to_generate();
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let wrote = std::sync::atomic::AtomicBool::new(false);
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -2754,27 +2759,38 @@ mod tests {
             // 等生成真的進到模型那一步
             started_rx.recv().unwrap();
 
-            // §5.4.2：這段期間錄音必須繼續落地。抱著寫入鎖跑生成的話，
-            // 這一行會卡到整趟生成結束。
-            store
-                .write()
-                .expect("生成期間拿不到寫入鎖")
-                .append(
-                    m,
-                    &[(
-                        DomainEvent::NoteAdded {
-                            note_id: 99,
-                            text: "生成期間記的一筆".into(),
-                        },
-                        Timeline::new(9_000, 9_000),
-                    )],
-                )
-                .expect("生成期間寫不進去");
+            // §5.4.2：這段期間錄音必須繼續落地。
+            //
+            // 這裡不能直接 assert：生成執行緒還在等 release，而 thread::scope
+            // 會先 join 再讓 panic 傳出去，斷言失敗只會變成卡死。因此先記下
+            // 結果、無條件放行，離開 scope 之後才斷言。
+            // 時限也是必要的：規則被破壞時要在兩秒內判定，不是等到 CI 逾時。
+            let ok = match store.try_exclusive_for(std::time::Duration::from_secs(2)) {
+                Ok(mut st) => st
+                    .append(
+                        m,
+                        &[(
+                            DomainEvent::NoteAdded {
+                                note_id: 99,
+                                text: "生成期間記的一筆".into(),
+                            },
+                            Timeline::new(9_000, 9_000),
+                        )],
+                    )
+                    .is_ok(),
+                Err(_) => false,
+            };
+            wrote.store(ok, std::sync::atomic::Ordering::SeqCst);
 
             release_tx.send(()).unwrap();
         });
 
-        let st = store.write().unwrap();
+        assert!(
+            wrote.load(std::sync::atomic::Ordering::SeqCst),
+            "生成期間拿不到寫入鎖：生成抱著鎖跑完了整趟"
+        );
+
+        let st = store.exclusive().unwrap();
         // 生成期間寫進去的筆記還在
         assert!(st.meeting(m).unwrap().notes.iter().any(|n| n.note_id == 99));
         // 而且本輪成果仍然只涵蓋游標之前的內容
