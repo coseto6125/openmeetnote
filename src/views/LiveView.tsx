@@ -13,6 +13,7 @@ import {
   snapshotDocument,
   type DocumentBlock,
 } from '../session';
+import { speakerDisplayName } from '../meeting';
 import type { Degrade, MeetingModel, Snapshot, Speaker } from '../meeting';
 import { Spine, type SpinePause } from '../components/Spine';
 import { DocumentView, type CitedSegment } from '../components/DocumentView';
@@ -26,20 +27,7 @@ import { DocumentView, type CitedSegment } from '../components/DocumentView';
  */
 const SPEAKER_COLORS = ['var(--violet)', '#3f7fa6', '#8a6d3b', '#4f7a5e', '#7a4f6d'];
 
-/**
- * §8.4 的名稱優先順序：確認名 > 暫定名 > 依軌道與出現序的預設稱呼。
- *
- * 預設稱呼裡的編號只數遠端語者。ordinal 是全域的出現序，麥克風軌會佔掉一格，
- * 直接拿來顯示的話「我」之後的第一位遠端語者會叫「語者 3」，看起來像少了一個人。
- */
-function displayName(s: Speaker, all: Speaker[]): string {
-  if (s.confirmedName) return s.confirmedName;
-  if (s.proposedName) return s.proposedName;
-  // 軌道先驗只到「本機 vs 遠端」，不能再往「遠端只有一人」推（§8.1）
-  if (s.track === 'mic') return '我';
-  const nth = all.filter((x) => x.track === 'system' && x.ordinal <= s.ordinal).length;
-  return `語者 ${nth}`;
-}
+const displayName = speakerDisplayName;
 
 const colorOf = (s: Speaker) => SPEAKER_COLORS[(s.ordinal - 1) % SPEAKER_COLORS.length];
 
@@ -606,75 +594,79 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
         </aside>
       </div>
 
-      <details className="harness">
-        <summary>模擬事件</summary>
-        <button
-          onClick={() => {
-            const last = [...model.segments]
-              .reverse()
-              .find((s) => s.stability === 'final' && s.origin === 'provider');
-            if (!last) return;
-            const next = last.text.endsWith('。')
-              ? `${last.text.slice(0, -1)}，這點下次要再確認。`
-              : `${last.text}（已修訂）`;
-            commands.editTranscript(last.id, next);
-          }}
-        >
-          修訂最後一段逐字稿
-        </button>
-        <button
-          onClick={() => {
-            commands.injectFault('micLost');
-            setLocalDegrade({
-              title: '麥克風已中斷',
-              body: '系統音訊仍在錄，你的發言目前不會進入逐字稿。重新接上裝置後自動恢復，錄音沒有中斷。',
-              tone: 'bad',
-            });
-          }}
-        >
-          麥克風中斷
-        </button>
-        <button
-          onClick={() => {
-            commands.injectFault('micRestored');
-            setLocalDegrade(null);
-          }}
-        >
-          麥克風恢復
-        </button>
-        <button
-          onClick={() => {
-            commands.injectFault('sttDown');
-            setLocalDegrade({
-              title: '逐字稿服務斷線',
-              body: '音訊仍在寫入本機，斷線期間的內容會在恢復後補上。錄音沒有中斷。',
-              tone: 'warn',
-            });
-            setTimeout(() => {
-              commands.injectFault('sttUp');
+      {/* 降級狀態的手動觸發。只在開發建置裡出現：它偽造的是「麥克風掉了」
+          「生成失敗」這些狀態，在使用者手上等於一個會說謊的按鈕。 */}
+      {import.meta.env.DEV && (
+        <details className="harness">
+          <summary>模擬事件</summary>
+          <button
+            onClick={() => {
+              const last = [...model.segments]
+                .reverse()
+                .find((s) => s.stability === 'final' && s.origin === 'provider');
+              if (!last) return;
+              const next = last.text.endsWith('。')
+                ? `${last.text.slice(0, -1)}，這點下次要再確認。`
+                : `${last.text}（已修訂）`;
+              commands.editTranscript(last.id, next);
+            }}
+          >
+            修訂最後一段逐字稿
+          </button>
+          <button
+            onClick={() => {
+              commands.injectFault('micLost');
               setLocalDegrade({
-                title: '逐字稿已恢復',
-                body: '斷線期間的音訊已排入補轉錄，完成後會插回原本的時間位置。',
+                title: '麥克風已中斷',
+                body: '系統音訊仍在錄，你的發言目前不會進入逐字稿。重新接上裝置後自動恢復，錄音沒有中斷。',
+                tone: 'bad',
+              });
+            }}
+          >
+            麥克風中斷
+          </button>
+          <button
+            onClick={() => {
+              commands.injectFault('micRestored');
+              setLocalDegrade(null);
+            }}
+          >
+            麥克風恢復
+          </button>
+          <button
+            onClick={() => {
+              commands.injectFault('sttDown');
+              setLocalDegrade({
+                title: '逐字稿服務斷線',
+                body: '音訊仍在寫入本機，斷線期間的內容會在恢復後補上。錄音沒有中斷。',
                 tone: 'warn',
               });
-            }, 3600);
-          }}
-        >
-          STT 斷線並重連
-        </button>
-        <button onClick={() => commands.injectFault('generationFailed')}>生成失敗</button>
-        <button
-          onClick={() =>
-            setLocalDegrade({
-              title: '磁碟空間不足',
-              body: '已寫完目前分段並準備安全停止。已完成的音訊、逐字稿與筆記都會保留，這不是崩潰。',
-              tone: 'bad',
-            })
-          }
-        >
-          磁碟空間不足
-        </button>
-      </details>
+              setTimeout(() => {
+                commands.injectFault('sttUp');
+                setLocalDegrade({
+                  title: '逐字稿已恢復',
+                  body: '斷線期間的音訊已排入補轉錄，完成後會插回原本的時間位置。',
+                  tone: 'warn',
+                });
+              }, 3600);
+            }}
+          >
+            STT 斷線並重連
+          </button>
+          <button onClick={() => commands.injectFault('generationFailed')}>生成失敗</button>
+          <button
+            onClick={() =>
+              setLocalDegrade({
+                title: '磁碟空間不足',
+                body: '已寫完目前分段並準備安全停止。已完成的音訊、逐字稿與筆記都會保留，這不是崩潰。',
+                tone: 'bad',
+              })
+            }
+          >
+            磁碟空間不足
+          </button>
+        </details>
+      )}
     </>
   );
 }

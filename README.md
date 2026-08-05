@@ -40,6 +40,32 @@ makes on its own.
 
 ---
 
+## What it looks like
+
+Every claim in the generated document carries the timestamps it came from.
+Clicking one jumps to that line in the transcript, which is the only thing a
+citation is for.
+
+![The generated document, with a citation chip under every claim](./docs/images/document.png)
+
+Live transcript on the left, speakers and summary versions on the right. The
+gutter shows which part of the meeting the current summary covers, so "the
+summary is 3 minutes behind" is visible rather than inferred.
+
+![Recording, with the live transcript and the coverage gutter](./docs/images/live.png)
+
+History searches titles, transcripts and notes, and a finished meeting can be
+summarized later — which is when most people actually want it.
+
+![History, with a finished meeting reopened](./docs/images/history.png)
+
+<sub>Screenshots are rendered from the real front end by
+[`scripts/screenshots.mjs`](./scripts/screenshots.mjs); the meeting in them is
+invented. A public README is not a good place for someone's actual meeting
+minutes.</sub>
+
+---
+
 ## Status
 
 **Windows** is verified on real hardware end to end: dual-track capture, live

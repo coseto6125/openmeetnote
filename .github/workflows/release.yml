@@ -20,6 +20,9 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
+  # playwright 只有 scripts/screenshots.mjs 用得到。少了這一行，每次
+  # pnpm install 都會去抓上百 MB 的瀏覽器，而這裡從來不跑那支腳本
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
 
 jobs:
   build:

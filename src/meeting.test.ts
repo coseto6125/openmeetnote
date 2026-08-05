@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'vitest';
-import { applyBatch, emptyMeeting, fromProjection, type MeetingModel } from './meeting';
+import {
+  applyBatch,
+  emptyMeeting,
+  fromProjection,
+  speakerDisplayName,
+  type MeetingModel,
+} from './meeting';
 import type { SessionEvent, SessionEventBatch, SessionProjection } from './session';
 
 /** 依序組批次，prevHighSeq 自動銜接，模擬正常的事件流。 */
@@ -355,5 +361,43 @@ describe('生成失敗', () => {
 
     expect(m.snapshots[0].state).toBe('completed');
     expect(m.activeVersion).toBe(1);
+  });
+});
+
+describe('speaker display name', () => {
+  const s = (ordinal: number, track: 'mic' | 'system', proposed = null, confirmed = null) => ({
+    ordinal,
+    track,
+    proposedName: proposed as string | null,
+    confirmedName: confirmed as string | null,
+  });
+
+  test('confirmed_name_wins_over_proposed', () => {
+    const all = [s(1, 'system', '王小明' as never, '陳大文' as never)];
+    expect(speakerDisplayName(all[0], all)).toBe('陳大文');
+  });
+
+  test('proposed_name_is_used_when_nothing_is_confirmed', () => {
+    const all = [s(1, 'system', '王小明' as never)];
+    expect(speakerDisplayName(all[0], all)).toBe('王小明');
+  });
+
+  test('the_mic_track_is_always_me', () => {
+    const all = [s(1, 'mic')];
+    expect(speakerDisplayName(all[0], all)).toBe('我');
+  });
+
+  // ordinal 是全域出現序，麥克風軌佔掉第一格。照它編號的話第一位遠端語者
+  // 會叫「語者 2」，看起來像有一個人不見了。
+  test('default_numbering_skips_the_mic_track', () => {
+    const all = [s(1, 'mic'), s(2, 'system'), s(3, 'system')];
+    expect(all.map((x) => speakerDisplayName(x, all))).toEqual(['我', '語者 1', '語者 2']);
+  });
+
+  // 歷史分頁曾經直接印內部 id，同一句話在錄音分頁是「沈立群」、在歷史分頁是
+  // 「s2」。兩邊現在共用這個函式，這條測試守的是那個規則本身。
+  test('numbering_is_stable_when_a_remote_speaker_gets_a_name', () => {
+    const all = [s(1, 'mic'), s(2, 'system', null, '沈立群' as never), s(3, 'system')];
+    expect(all.map((x) => speakerDisplayName(x, all))).toEqual(['我', '沈立群', '語者 2']);
   });
 });
