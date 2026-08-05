@@ -68,16 +68,12 @@ pub fn platform_capture() -> Result<Box<dyn AudioCapture>, AudioError> {
     }
     #[cfg(target_os = "macos")]
     {
-        Err(AudioError::Unsupported(
-            "macOS 的系統音訊擷取（ScreenCaptureKit）尚未實作。\
-             目前可以用其他工具錄成 16 kHz 單聲道 WAV，再用離線轉錄工具處理。"
-                .into(),
-        ))
+        Ok(Box::new(macos::MacCapture::default()))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Err(AudioError::Unsupported(
-            "這個平台沒有音訊擷取實作，目前只有 Windows。".into(),
+            "這個平台沒有音訊擷取實作，目前只有 Windows 與 macOS。".into(),
         ))
     }
 }

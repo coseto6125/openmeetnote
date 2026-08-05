@@ -23,7 +23,7 @@ use super::paraformer::Paraformer;
 use super::speakers::{speaker_at, SpeakerBook, SpeakerSpan};
 use super::whisper::Whisper;
 use super::{Result, SttError};
-use crate::audio::{platform_capture, AudioCapture, Chunk, SAMPLE_RATE};
+use crate::audio::{platform_capture, AudioCapture, AudioError, Chunk, SAMPLE_RATE};
 use crate::model::Track;
 use crate::session::{TranscriptInput, TranscriptSource};
 
@@ -208,7 +208,12 @@ impl LocalSttSource {
     /// 模型載入失敗就直接失敗，不退回 fixture：靜默換成假逐字稿會讓使用者
     /// 以為會議被記錄下來了。
     pub fn start(models: ModelPaths) -> Result<Self> {
-        let mut capture = platform_capture().map_err(|e| SttError::Audio(e.to_string()))?;
+        // 只有「這個平台沒有實作」才映成 NoCapture。裝置不見了、擷取起不來
+        // 都是真的失敗，不該讓上層退回 fixture。
+        let mut capture = platform_capture().map_err(|e| match e {
+            AudioError::Unsupported(m) => SttError::NoCapture(m),
+            other => SttError::Audio(other.to_string()),
+        })?;
         let audio_rx = capture
             .start()
             .map_err(|e| SttError::Audio(e.to_string()))?;

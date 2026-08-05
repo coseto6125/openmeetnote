@@ -60,6 +60,11 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
+          # sherpa-rs-sys 把預先編好的 onnxruntime 下載到這裡，而它不在
+          # target/ 底下。只快取 target/ 的話，快取命中時 build script 會
+          # 被跳過、-L 路徑照樣送給連結器，但函式庫已經不在了 —— 冷快取
+          # 會過、熱快取必掛，最難查的那種紅燈
+          cache-directories: ~/.cache/sherpa-rs
       - name: Install Linux build deps
         run: |
           sudo apt-get update
@@ -81,6 +86,11 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
+          # sherpa-rs-sys 把預先編好的 onnxruntime 下載到這裡，而它不在
+          # target/ 底下。只快取 target/ 的話，快取命中時 build script 會
+          # 被跳過、-L 路徑照樣送給連結器，但函式庫已經不在了 —— 冷快取
+          # 會過、熱快取必掛，最難查的那種紅燈
+          cache-directories: ~/.cache/sherpa-rs
       - name: Install Linux build deps
         run: |
           sudo apt-get update
@@ -103,8 +113,11 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+          # runner 本身就是 arm64，這一格可以真的把測試跑起來 ——
+          # src/audio/macos.rs 的單元測試在 Linux 上連編譯都不存在
           - target: aarch64-apple-darwin
             os: macos-latest
+            native: true
           - target: x86_64-apple-darwin
             os: macos-latest
     steps:
@@ -116,11 +129,22 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
+          # sherpa-rs-sys 把預先編好的 onnxruntime 下載到這裡，而它不在
+          # target/ 底下。只快取 target/ 的話，快取命中時 build script 會
+          # 被跳過、-L 路徑照樣送給連結器，但函式庫已經不在了 —— 冷快取
+          # 會過、熱快取必掛，最難查的那種紅燈
+          cache-directories: ~/.cache/sherpa-rs
           key: ${{ matrix.target }}
       - name: Check
         run: >
           cargo clippy --manifest-path src-tauri/Cargo.toml -p openmeetnote
           --target ${{ matrix.target }} --all-targets -- -D warnings
+
+      - name: Test (native)
+        if: matrix.native
+        run: >
+          cargo test --manifest-path src-tauri/Cargo.toml -p openmeetnote --lib
+          --target ${{ matrix.target }}
 
   # ── workflow YAML 本身 ───────────────────────────────────────
   actionlint:

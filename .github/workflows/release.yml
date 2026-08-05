@@ -3,12 +3,9 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # 手動觸發只建置不發布（publish 那個 job 要求 ref 是 v* tag）。
+  # 拿來在打 tag 前確認打包步驟本身沒問題 —— tag 只能發一次。
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Build only, do not publish a release'
-        required: false
-        default: 'true'
 
 permissions:
   contents: read
@@ -58,6 +55,11 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
+          # sherpa-rs-sys 把預先編好的 onnxruntime 下載到這裡，而它不在
+          # target/ 底下。只快取 target/ 的話，快取命中時 build script 會
+          # 被跳過、-L 路徑照樣送給連結器，但函式庫已經不在了 —— 冷快取
+          # 會過、熱快取必掛，最難查的那種紅燈
+          cache-directories: ~/.cache/sherpa-rs
           key: release-${{ matrix.target }}
 
       - run: pnpm install --frozen-lockfile
@@ -76,9 +78,11 @@ jobs:
           $base = "src-tauri/target/${{ matrix.target }}/release"
           Copy-Item "$base/openmeetnote.exe" $out
           Get-ChildItem "$base/*.dll" | Copy-Item -Destination $out
-          Copy-Item "vocabulary.txt" $out -ErrorAction SilentlyContinue
+          Copy-Item "vocabulary.txt" $out
+          # 安裝檔是額外的，可執行檔才是必要的：模型要放在 exe 旁邊，
+          # 走安裝流程反而多一層目錄要找
           Get-ChildItem -Recurse "$base/bundle" -Include *.msi,*.exe |
-            Copy-Item -Destination $out -ErrorAction SilentlyContinue
+            Copy-Item -Destination $out
           Compress-Archive -Path $out -DestinationPath "$out.zip"
           "ASSET=$out.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -88,9 +92,14 @@ jobs:
           out="openmeetnote-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$out"
           base="src-tauri/target/${{ matrix.target }}/release"
-          find "$base/bundle" \( -name '*.dmg' -o -name '*.app' \) -maxdepth 2 \
-            -exec cp -R {} "$out/" \; 2>/dev/null || true
-          cp vocabulary.txt "$out/" 2>/dev/null || true
+          # -maxdepth 要放在其他 expression 之前，BSD find 才不會抱怨
+          find "$base/bundle" -maxdepth 2 \( -name '*.dmg' -o -name '*.app' \) \
+            -exec cp -R {} "$out/" \;
+          cp vocabulary.txt "$out/"
+          # find -exec 找不到東西也回傳 0，不擋的話會發出一包只有 vocabulary.txt
+          # 的壓縮檔，而那要等到有人下載才會發現
+          test -d "$out"/*.app || { echo "::error::bundle 裡沒有 .app"; ls -R "$base/bundle"; exit 1; }
+          # .app 是目錄，裡面有 symlink 與執行權限，用 tar 而不是 zip
           tar -czf "$out.tar.gz" "$out"
           echo "ASSET=$out.tar.gz" >> "$GITHUB_ENV"
 

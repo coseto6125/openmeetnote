@@ -150,6 +150,11 @@ pub struct Token {
 pub enum SttError {
     #[error("讀取音訊失敗：{0}")]
     Audio(String),
+    /// 這個平台沒有音訊擷取實作。與其他音訊失敗分開成一個變體，是因為
+    /// 只有這一種適合退回 fixture —— 開發機是 Linux，不退回就跑不完
+    /// 整條流程。其餘失敗退回 fixture 等於讓一場錄不到聲音的會議開始。
+    #[error("{0}")]
+    NoCapture(String),
     #[error("模型載入失敗：{0}")]
     Load(String),
     #[error("轉錄失敗：{0}")]

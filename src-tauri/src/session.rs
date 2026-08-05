@@ -1895,15 +1895,13 @@ pub fn start_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> 
             }
         }
         Err(e) => {
-            // 這個平台還沒有擷取實作時（目前是 Windows 以外）留著 fixture，
-            // 否則開發環境根本無法跑完整流程。其餘失敗一律拒絕：
-            // 錄不到聲音卻讓會議開始，等於保證事後才發現整場沒錄到。
-            // 平台沒有擷取實作時留著 fixture，開發環境才跑得完整條流程。
-            // 其餘失敗一律拒絕：錄不到聲音卻讓會議開始，等於保證事後才
-            // 發現整場沒錄到。
-            let unsupported =
-                e.to_string().contains("尚未實作") || e.to_string().contains("沒有音訊擷取實作");
-            if !unsupported {
+            // 平台沒有擷取實作時（Windows 與 macOS 以外）留著 fixture，
+            // 開發環境才跑得完整條流程。其餘失敗一律拒絕：錄不到聲音卻
+            // 讓會議開始，等於保證事後才發現整場沒錄到。
+            //
+            // 比對變體而不是錯誤訊息：訊息改一個字，就會讓「拒絕開始」
+            // 悄悄變成「用假逐字稿繼續」，而那是這裡最不能出的錯。
+            if !matches!(e, crate::stt::SttError::NoCapture(_)) {
                 return CommandReceipt::rejected(&format!("無法開始擷取音訊：{e}"));
             }
             eprintln!("此平台沒有音訊擷取實作，改用 fixture 逐字稿");
