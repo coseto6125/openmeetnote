@@ -46,9 +46,11 @@ makes on its own.
 and final transcripts, AI summary, citation verification, export, search.
 
 **macOS is beta.** The ScreenCaptureKit + CoreAudio capture path compiles in
-CI for both Apple Silicon and Intel, and every layer above it is
-platform-independent and tested — but the author has no Mac, so it has never
-been run on real hardware. If you try it, [an issue saying what
+CI for both Apple Silicon and Intel, its unit tests run natively on the
+arm64 runner, and every layer above it is platform-independent and tested —
+but the author has no Mac, so nothing above the unit tests has met real
+audio hardware, and the two permission dialogs have never actually appeared.
+If you try it, [an issue saying what
 happened](https://github.com/coseto6125/openmeetnote/issues) is genuinely
 useful.
 

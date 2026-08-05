@@ -39,7 +39,7 @@ OpenMeetNote 的前提是模型一定會這樣，而唯一撐得住的防線是�
 
 **Windows** 實機驗證過整條鏈：雙軌擷取、即時稿與定稿、AI 摘要、引用驗證、匯出、搜尋。
 
-**macOS 是 beta。** ScreenCaptureKit + CoreAudio 那條路徑在 CI 上對 Apple Silicon 與 Intel 都編得過，它上面每一層都與平台無關而且都有測試 — 但作者沒有 Mac，這份程式碼從來沒有在真機上跑過。你如果試了，[開一個 issue 說發生什麼事](https://github.com/coseto6125/openmeetnote/issues)會很有用。
+**macOS 是 beta。** ScreenCaptureKit + CoreAudio 那條路徑在 CI 上對 Apple Silicon 與 Intel 都編得過，它的單元測試在 arm64 runner 上原生跑起來，它上面每一層都與平台無關而且都有測試。但作者沒有 Mac，所以單元測試以上的東西都沒有碰過真的音訊硬體，兩個權限對話框也從來沒有實際彈出過。你如果試了，[開一個 issue 說發生什麼事](https://github.com/coseto6125/openmeetnote/issues)會很有用。
 
 Windows 上跑過兩小時 soak：393 個定稿批次、2586 個片段、25594 字，記憶體在 2.13 到 2.21 GB 之間有界震盪沒有上升趨勢，行程存活，會議正常收尾。
 
