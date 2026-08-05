@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>OpenMeetNote records your voice so it can appear in the meeting transcript. Audio stays on this machine.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>OpenMeetNote captures system audio so remote participants appear in the transcript. Screen contents are never read or stored.</string>
+</dict>
+</plist>
