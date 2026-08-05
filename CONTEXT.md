@@ -104,3 +104,18 @@ whisper 因此慢九倍（RTF 3.96 對 0.55）。驗證方式是反組譯數 AVX
 分辨方法是看崩潰位移變不變：補了 Rust 側之後位移完全沒動，代表根本沒走到
 那幾行。這種情況要換路徑而不是繼續補 —— 語者分辨改走聲紋比對，同樣達得到
 目的，只是切點精度較差。
+
+## CI 的失敗形狀
+
+**建置產物快取與下載快取不同步。** `sherpa-rs-sys` 的 build script 把預編的
+onnxruntime 下載到 `~/.cache/sherpa-rs`，那個路徑不在 `target/` 底下。只快取
+`target/` 的話，快取命中時 build script 被判定為不需重跑，它的 `-L` 旗標照樣
+送給連結器，但指向的目錄已經不存在，於是 `unable to find library -lonnxruntime`。
+症狀是冷快取全綠、熱快取必掛，看起來像隨機失敗。凡是 build script 會往
+`target/` 以外的地方寫東西，那個位置就必須跟 `target/` 用同一把快取鑰匙。
+
+**跨平台程式碼的唯一驗證是 CI 那一格。** 開發機是 Linux，`src/audio/macos.rs`
+在本機連 type check 都跑不到。這代表兩件事：那一格不能設成選配，而且光有
+`cargo clippy` 不夠 —— `clippy -D warnings` 的 dead code 檢查抓到過
+`platform_capture()` 根本沒接上 macOS 實作（整個模組編得過但永遠不會被呼叫），
+但模組內的單元測試從來沒有執行過。arm64 runner 是原生的，那一格要真的跑測試。
