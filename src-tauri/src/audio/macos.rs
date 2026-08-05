@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use rubato::audioadapter_buffers::direct::SequentialSlice;
 use rubato::{Fft, FixedSync, Resampler};
 use screencapturekit::prelude::*;
 
@@ -128,7 +129,7 @@ impl SCStreamOutputTrait for SystemAudioSink {
         let Ok(mut batcher) = self.batcher.lock() else {
             return;
         };
-        for buffer in list.buffers() {
+        for buffer in list.iter() {
             let bytes = buffer.data();
             // 設定要的是 32-bit float 單聲道；不是四的倍數代表格式與預期不符，
             // 硬解會產生噪音，寧可丟掉這一批並讓音量條停住
@@ -245,6 +246,9 @@ struct MicPipeline {
     /// 重取樣器一次要固定長度的輸入，湊不滿的留到下一次回呼
     carry: Vec<f32>,
     frames_in: usize,
+    /// 重取樣輸出的暫存。音訊回呼裡不配置記憶體，配置的耗時不可預測，
+    /// 撞上一次就是一段掉幀
+    out: Vec<f32>,
     batcher: Batcher,
 }
 
@@ -255,6 +259,7 @@ impl MicPipeline {
                 resampler: None,
                 carry: Vec::new(),
                 frames_in: 0,
+                out: Vec::new(),
                 batcher,
             });
         }
@@ -263,10 +268,12 @@ impl MicPipeline {
         let resampler = Fft::<f32>::new(in_rate, SAMPLE_RATE as usize, 1024, 1, FixedSync::Input)
             .map_err(|e| format!("建立重取樣器失敗（{in_rate} Hz → 16 kHz）：{e}"))?;
         let frames_in = resampler.input_frames_next();
+        let out = vec![0.0; resampler.output_frames_max()];
         Ok(Self {
             resampler: Some(resampler),
             carry: Vec::with_capacity(frames_in * 2),
             frames_in,
+            out,
             batcher,
         })
     }
@@ -291,9 +298,17 @@ impl MicPipeline {
         while self.carry.len() >= self.frames_in {
             let rest = self.carry.split_off(self.frames_in);
             let block = std::mem::replace(&mut self.carry, rest);
-            match resampler.process(&[block], None) {
-                Ok(out) => {
-                    if !self.batcher.push(&out[0]) {
+            // 兩個 `expect` 都是恆等式：frames 就是各自緩衝區自己的長度，
+            // 而 SizeError 只在 buf.len() < channels * frames 時發生
+            let out_frames = self.out.len();
+            let input =
+                SequentialSlice::new(&block, 1, block.len()).expect("frames 取自 block 自身的長度");
+            let mut output = SequentialSlice::new_mut(&mut self.out, 1, out_frames)
+                .expect("out 的長度就是 output_frames_max()");
+            match resampler.process_into_buffer(&input, &mut output, None) {
+                // 寫進去的幀數每次可能不同，只送實際寫到的那一段
+                Ok((_, written)) => {
+                    if !self.batcher.push(&self.out[..written]) {
                         return false;
                     }
                 }
