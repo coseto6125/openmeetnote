@@ -8,7 +8,15 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
-export type MeetingState = 'idle' | 'recording' | 'paused' | 'stopping' | 'finalizing' | 'completed';
+export type MeetingState =
+  | 'idle'
+  | 'recording'
+  | 'paused'
+  | 'stopping'
+  | 'finalizing'
+  | 'completed'
+  /** 沒有正常走完：崩潰或被強制關閉，逐字稿可能斷在半句話 */
+  | 'failed';
 export type Health = 'ok' | 'degraded' | 'lost';
 export type Origin = 'provider' | 'user';
 
@@ -52,7 +60,14 @@ export type SessionEvent =
       track: 'mic' | 'system';
     }
   | { kind: 'speakerConfirmed'; seq: number; speakerId: string; name: string }
-  | { kind: 'snapshotCreated'; seq: number; version: number; throughEventSeq: number; meetingTimeMs: number }
+  | {
+      kind: 'snapshotCreated';
+      seq: number;
+      version: number;
+      throughEventSeq: number;
+      meetingTimeMs: number;
+      prompt: string;
+    }
   | { kind: 'generationCompleted'; seq: number; version: number }
   | { kind: 'generationFailed'; seq: number; version: number; reason: string }
   /** 帶轉換當下的兩條時間軸，UI 不必從批次邊界回推 */
@@ -123,6 +138,7 @@ export interface SessionProjection {
     throughEventSeq: number;
     meetingTimeMs: number;
     state: 'queued' | 'running' | 'completed' | 'failed';
+    prompt: string;
   }[];
   pauses: { fromMs: number; toMs: number | null }[];
 }
@@ -138,7 +154,9 @@ export const commands = {
     invoke<CommandReceipt>('confirm_speaker', { speakerId, name }),
   editTranscript: (segmentId: number, text: string) =>
     invoke<CommandReceipt>('edit_transcript', { segmentId, text }),
-  createSnapshot: () => invoke<CommandReceipt>('create_snapshot'),
+  /** 本輪 Prompt 決定這一版文件的方向。留空代表讓 Agent Loop 依證據自行規劃。 */
+  createSnapshot: (prompt?: string) =>
+    invoke<CommandReceipt>('create_snapshot', { prompt: prompt?.trim() || null }),
   stop: () => invoke<CommandReceipt>('stop_meeting'),
   /** 事件缺號或重新載入之後，用完整投影重建，而不是帶著破洞繼續套用增量 */
   resync: () => invoke<SessionProjection>('resync'),
@@ -226,8 +244,22 @@ export const snapshotDocument = (meetingId: number, versionNo: number) =>
 
 export const activeMeeting = () => invoke<number | null>('active_meeting');
 
+/** 搜尋命中的一場會議，連同它為什麼命中。 */
+export interface MeetingHit {
+  summary: MeetingSummary;
+  excerpts: {
+    kind: 'transcript' | 'note';
+    segmentId: number | null;
+    meetingTimeMs: number;
+    text: string;
+  }[];
+  totalHits: number;
+}
+
 export const history = {
   list: () => invoke<MeetingSummary[]>('list_meetings'),
+  /** 搜尋標題、逐字稿與人工筆記。空字串在後端回空陣列。 */
+  search: (query: string) => invoke<MeetingHit[]>('search_meetings', { query }),
   open: (meetingId: number) => invoke<MeetingDetail>('open_meeting', { meetingId }),
   rename: (meetingId: number, title: string) =>
     invoke<void>('rename_meeting', { meetingId, title }),
@@ -235,6 +267,17 @@ export const history = {
   /** 匯出成果 HTML，回傳寫出的檔案路徑。 */
   exportDocument: (meetingId: number, runId: number) =>
     invoke<string>('export_document', { meetingId, runId }),
+  /**
+   * 為一場已結束的會議建立摘要，回傳新的版本號。
+   *
+   * 這條路徑不經過 Session，因此關掉程式重開之後仍然可用 —— 「開完會、
+   * 隔天想做摘要」是最常見的用法。進行中的那一場會被拒絕，那條走錄音分頁。
+   */
+  summarize: (meetingId: number, prompt: string) =>
+    invoke<number>('summarize_meeting', { meetingId, prompt }),
+  /** 在檔案總管裡選取匯出的檔案。路徑由後端重算，前端不傳路徑。 */
+  revealExport: (meetingId: number, versionNo: number) =>
+    invoke<void>('reveal_export', { meetingId, versionNo }),
   /** 從事件日誌重建投影（§5.4.1）。災難復原用，正在錄的會議不允許。 */
   rebuild: (meetingId: number) => invoke<void>('rebuild_projections', { meetingId }),
 };
@@ -259,8 +302,22 @@ export interface ResolvedProvider {
   secret: SecretPresence;
 }
 
+export type BackendKind = 'system' | 'agentCli' | 'api' | 'fixture';
+
+/** 摘要與 Agent Provider 的一個可選後端，含這台機器上的偵測結果。 */
+export interface BackendOption {
+  id: string;
+  label: string;
+  kind: BackendKind;
+  available: boolean;
+  /** 版本字串，或不可用的原因 */
+  detail: string;
+  needsSecret: boolean;
+}
+
 export const settings = {
   get: () => invoke<ResolvedProvider[]>('get_settings'),
+  backends: () => invoke<BackendOption[]>('list_llm_backends'),
   saveProvider: (kind: ProviderKind, provider: string, model: string, baseUrl: string) =>
     invoke<void>('save_provider', { kind, provider, model, baseUrl }),
   saveSecret: (kind: ProviderKind, value: string) =>

@@ -219,17 +219,16 @@ fn secret_env_key(kind: ProviderKind) -> String {
 }
 
 /// 依 §5.6 的優先順序解析出最終設定。
-pub fn resolve(
+/// 沒有任何設定時的預設 Provider 由呼叫端給：llm 的預設要看這台機器上
+/// 有沒有 Agent CLI，那是執行期才知道的事，寫死在這裡就無法決定性地測試。
+pub fn resolve_with_default(
     kind: ProviderKind,
     stored: &StoredProvider,
     env: &dyn Env,
     secrets: &dyn SecretStore,
+    default_provider: &str,
 ) -> ResolvedProvider {
     let p = kind.env_prefix();
-    let default_provider = match kind {
-        ProviderKind::Stt => "fixture",
-        ProviderKind::Llm => "fixture",
-    };
     ResolvedProvider {
         kind,
         provider: field(
@@ -271,6 +270,167 @@ pub fn secret_value(
     }
 }
 
+/* ── 摘要與 Agent 後端目錄（BLUEPRINT.md §5.5.1） ───────────────── */
+
+/// 後端的取得方式。UI 用它決定要不要顯示模型、Base URL 與 API Key 欄位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BackendKind {
+    /// 跟隨這台機器上偵測到的 Agent CLI，不綁定特定一支
+    System,
+    /// 指定某一支本機 Agent CLI
+    AgentCli,
+    /// 直接呼叫 LLM API，需要金鑰
+    Api,
+    /// 不呼叫任何 Provider 的內建規劃器
+    Fixture,
+}
+
+/// 一個可選後端，連同它在這台機器上是否真的能用。
+///
+/// `available` 為 false 的項目仍然回傳，因為「沒安裝」與「不存在這個選項」
+/// 對使用者要做的事不同：前者去安裝，後者改選別的。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendOption {
+    pub id: String,
+    pub label: String,
+    pub kind: BackendKind,
+    pub available: bool,
+    /// 版本字串，或不可用的原因。UI 直接顯示。
+    pub detail: String,
+    pub needs_secret: bool,
+}
+
+/// 本機 Agent CLI 的候選。id 同時是存進 `provider_settings` 的值。
+const AGENT_CLIS: [(&str, &str, &str); 2] = [
+    ("claude-code", "Claude Code", "claude"),
+    ("codex", "Codex CLI", "codex"),
+];
+
+/// 在 PATH 上找可執行檔。
+///
+/// Windows 的 npm 安裝出來的是 `claude.cmd`，直接 `Command::new("claude")`
+/// 找不到它，因此這裡自己走一次 PATH 與 PATHEXT。
+pub fn resolve_exe(name: &str) -> Option<std::path::PathBuf> {
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+
+    std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| {
+        exts.iter().find_map(|ext| {
+            let p = dir.join(format!("{name}{ext}"));
+            p.is_file().then_some(p)
+        })
+    })
+}
+
+/// 跑一次 `--version`。有輸出才算真的可用：檔案存在但跑不起來
+/// （缺 node、權限不足）與沒安裝要分開講。
+fn probe_version(exe: &std::path::Path) -> Result<String, String> {
+    let out = std::process::Command::new(exe)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("無法執行：{e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "回報失敗：{}",
+            err.lines().next().unwrap_or("未提供原因").trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text.lines().next().unwrap_or_default().trim().to_owned())
+}
+
+/// 列出摘要與 Agent Provider 可選的後端。
+///
+/// 登入狀態不在這裡驗證：那需要真的送出一次請求，會產生費用與延遲。
+/// 這一層只回答「這支 CLI 裝了沒、跑不跑得起來」，登入失敗在首次生成時
+/// 以 Provider 錯誤回報。
+pub fn llm_backends() -> Vec<BackendOption> {
+    let cli: Vec<BackendOption> = AGENT_CLIS
+        .iter()
+        .map(|(id, label, exe)| {
+            let (available, detail) = match resolve_exe(exe) {
+                None => (false, format!("PATH 上找不到 {exe}，尚未安裝")),
+                Some(path) => match probe_version(&path) {
+                    Ok(v) if v.is_empty() => (true, path.display().to_string()),
+                    Ok(v) => (true, v),
+                    Err(e) => (false, e),
+                },
+            };
+            BackendOption {
+                id: (*id).to_owned(),
+                label: (*label).to_owned(),
+                kind: BackendKind::AgentCli,
+                available,
+                detail,
+                needs_secret: false,
+            }
+        })
+        .collect();
+
+    let ready: Vec<&str> = cli
+        .iter()
+        .filter(|o| o.available)
+        .map(|o| o.label.as_str())
+        .collect();
+
+    let system = BackendOption {
+        id: "system".to_owned(),
+        label: "系統 LLM 配置".to_owned(),
+        kind: BackendKind::System,
+        available: !ready.is_empty(),
+        detail: if ready.is_empty() {
+            "這台機器沒有偵測到 Claude Code 或 Codex CLI".to_owned()
+        } else {
+            format!("使用已安裝的 {}", ready.join("、"))
+        },
+        needs_secret: false,
+    };
+
+    let mut out = vec![system];
+    out.extend(cli);
+    out.push(BackendOption {
+        id: "api".to_owned(),
+        label: "LLM API（自備金鑰）".to_owned(),
+        kind: BackendKind::Api,
+        available: true,
+        detail: "填入模型、Base URL 與 API Key".to_owned(),
+        needs_secret: true,
+    });
+    out.push(BackendOption {
+        id: "fixture".to_owned(),
+        label: "內建測試規劃器".to_owned(),
+        kind: BackendKind::Fixture,
+        available: true,
+        detail: "不呼叫任何 Provider，用於離線驗證流程".to_owned(),
+        needs_secret: false,
+    });
+    out
+}
+
+/// llm 的預設選項。偵測不到任何 CLI 時退到 fixture，不預設 api：
+/// 預設一個必須填金鑰才會動的選項，等於一開啟就是壞的。
+fn default_llm_provider(backends: &[BackendOption]) -> &'static str {
+    let usable = backends
+        .iter()
+        .any(|o| o.kind == BackendKind::System && o.available);
+    if usable {
+        "system"
+    } else {
+        "fixture"
+    }
+}
+
 /* ── 命令 ─────────────────────────────────────────────────────────── */
 
 use tauri::State;
@@ -299,18 +459,36 @@ pub fn get_settings(
     config: State<ConfigHandle>,
 ) -> Result<Vec<ResolvedProvider>, String> {
     let st = store.exclusive().map_err(|e| e.to_string())?;
+    let backends = llm_backends();
     [ProviderKind::Stt, ProviderKind::Llm]
         .into_iter()
         .map(|kind| {
             let stored = st.provider_settings(kind).map_err(|e| e.to_string())?;
-            Ok(resolve(
+            let fallback = match kind {
+                ProviderKind::Stt => "fixture",
+                ProviderKind::Llm => default_llm_provider(&backends),
+            };
+            Ok(resolve_with_default(
                 kind,
                 &stored,
                 config.env.as_ref(),
                 config.secrets.as_ref(),
+                fallback,
             ))
         })
         .collect()
+}
+
+/// 這台機器上摘要與 Agent Provider 可選的後端。
+///
+/// 每次開啟設定頁重掃，不快取：使用者可能剛裝好 CLI 就切回來看，
+/// 顯示一份過期的清單比多花兩百毫秒更糟。
+#[tauri::command]
+pub async fn list_llm_backends() -> Result<Vec<BackendOption>, String> {
+    // 偵測會啟動子行程，放到 blocking pool，不讓 UI 執行緒等它
+    tauri::async_runtime::spawn_blocking(llm_backends)
+        .await
+        .map_err(|e| format!("偵測失敗：{e}"))
 }
 
 #[tauri::command]
@@ -441,6 +619,17 @@ mod tests {
         }
     }
 
+    /// 這些案例驗證的是三層優先順序，與執行期的 CLI 偵測無關，
+    /// 因此固定用 fixture 當預設。
+    fn resolve(
+        kind: ProviderKind,
+        stored: &StoredProvider,
+        env: &dyn Env,
+        secrets: &dyn SecretStore,
+    ) -> ResolvedProvider {
+        resolve_with_default(kind, stored, env, secrets, "fixture")
+    }
+
     #[test]
     fn environment_wins_over_the_gui_setting() {
         let env = FakeEnv::with(&[("OPENMEETNOTE_LLM_MODEL", "env-model")]);
@@ -525,5 +714,61 @@ mod tests {
     fn debug_formatting_a_secret_does_not_leak_it() {
         let s = Secret::new("sk-should-not-appear".into());
         assert!(!format!("{s:?}").contains("sk-should-not-appear"));
+    }
+
+    /* ── 後端目錄 ────────────────────────────────────────────────── */
+
+    fn backend(id: &str, kind: BackendKind, available: bool) -> BackendOption {
+        BackendOption {
+            id: id.into(),
+            label: id.into(),
+            kind,
+            available,
+            detail: String::new(),
+            needs_secret: kind == BackendKind::Api,
+        }
+    }
+
+    #[test]
+    fn the_default_backend_is_system_when_an_agent_cli_is_present() {
+        let backends = [
+            backend("system", BackendKind::System, true),
+            backend("api", BackendKind::Api, true),
+        ];
+        assert_eq!(default_llm_provider(&backends), "system");
+    }
+
+    #[test]
+    fn the_default_backend_falls_back_to_fixture_not_api() {
+        // 預設成 api 等於一開啟就是壞的：沒有金鑰，第一次生成就失敗
+        let backends = [
+            backend("system", BackendKind::System, false),
+            backend("api", BackendKind::Api, true),
+        ];
+        assert_eq!(default_llm_provider(&backends), "fixture");
+    }
+
+    #[test]
+    fn the_catalogue_always_offers_api_and_both_agent_clis() {
+        // 沒安裝的 CLI 仍要出現在清單裡：「沒安裝」與「沒有這個選項」
+        // 要使用者做的事不一樣
+        let ids: Vec<String> = llm_backends().into_iter().map(|o| o.id).collect();
+        assert_eq!(ids, ["system", "claude-code", "codex", "api", "fixture"]);
+    }
+
+    #[test]
+    fn an_unavailable_backend_still_explains_why() {
+        for o in llm_backends() {
+            assert!(
+                o.available || !o.detail.trim().is_empty(),
+                "{} 不可用卻沒有說明原因",
+                o.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_executable_is_reported_as_absent_not_as_an_error() {
+        assert!(resolve_exe("openmeetnote-no-such-binary").is_none());
     }
 }

@@ -166,6 +166,10 @@ pub enum BlockContent {
     Excerpt {
         speaker: String,
         text: String,
+        /// enum 上的 `rename_all` 只作用於 variant 名稱，欄位不會跟著轉。
+        /// 這是唯一一個多字詞欄位，前端讀的是這份 JSON，因此明寫成 camelCase；
+        /// alias 留給已經以 snake_case 存進資料庫的舊區塊。
+        #[serde(rename = "meetingTimeMs", alias = "meeting_time_ms")]
         meeting_time_ms: u64,
     },
     Link {
@@ -422,6 +426,16 @@ pub fn verify_ref(
     through_event_seq: u64,
     r: &SourceRef,
 ) -> crate::store::Result<RefVerdict> {
+    // 空引文不算引用。
+    //
+    // `contains("")` 永遠為真，於是任何一個 Fact 只要附上空字串引文與正確的
+    // 空字串雜湊，就能拿到 `valid` —— 整套防幻覺機制唯一能被強制執行的那一
+    // 環就此 fail-open。正規化之後才判空：全形空白與 CJK 之間的空白都不帶
+    // 資訊，只有那些字元的引文一樣什麼都沒引到。
+    if normalize_for_match(&r.quoted_text).is_empty() {
+        return Ok(RefVerdict::QuoteNotFound);
+    }
+
     // 條件三的前半：引文與其雜湊必須相符。這一項不需要查資料庫，
     // 先做可以在紀錄被竄改時給出更精確的原因。
     if sha256_hex(&r.quoted_text) != r.quoted_text_sha256 {
@@ -577,30 +591,170 @@ pub struct RenderContext<'a> {
     pub transcript: &'a [crate::store::StoredSegment],
 }
 
+/// 匯出文件的分區。§10 規定匯出至少要有哪幾塊，這個 enum 就是那份清單。
+///
+/// 分區由區塊自己的 `kind` 與 `claim_kind` 決定，不靠模型指定順序。模型
+/// 只要產出正確的區塊種類，文件結構就是對的；它把決議寫在最前面或最後面
+/// 都不影響讀者看到的組織方式。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    /// 決議與行動項目。獨立成區是因為這兩種是會後唯一會被回頭查的東西
+    Decisions,
+    /// 缺口與 AI 建議。與事實分離是 §10 的要求，混排會讓推論看起來像事實
+    Open,
+    Body,
+}
+
+fn section_of(b: &Block) -> Section {
+    match b.kind {
+        BlockKind::Decision | BlockKind::ActionItem => Section::Decisions,
+        _ => match b.claim_kind {
+            ClaimKind::Gap | ClaimKind::Suggestion => Section::Open,
+            ClaimKind::Fact | ClaimKind::Inference => Section::Body,
+        },
+    }
+}
+
+/// 成果摘要用 `tone` 為 `summary` 的 Callout 表達。
+///
+/// 不新增區塊種類，也不由渲染器自己生一段摘要出來：渲染器沒有能力摘要，
+/// 隨手取主文第一段當摘要會產生一段沒人寫過的內容。模型沒給就不出現這一區。
+fn is_summary(b: &Block) -> bool {
+    matches!(&b.content, BlockContent::Callout { tone, .. } if tone == "summary")
+}
+
 pub fn render_html(ctx: &RenderContext<'_>, blocks: &[Block]) -> String {
-    let mut body = String::new();
-    // Fact 與 Inference 混排會讓推論看起來像會議事實（§10），
-    // 因此非事實內容集中到獨立區段。
-    let (facts, others): (Vec<_>, Vec<_>) = blocks
+    let rendered: std::collections::HashMap<String, u32> = ctx
+        .transcript
         .iter()
-        .partition(|b| matches!(b.claim_kind, ClaimKind::Fact | ClaimKind::Inference));
+        .map(|s| (s.segment_id.to_string(), s.revision))
+        .collect();
+    let summary_at = blocks.iter().position(is_summary);
+    let rest: Vec<&Block> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != summary_at)
+        .map(|(_, b)| b)
+        .collect();
 
-    for b in &facts {
-        render_block(&mut body, b);
-    }
-    if !others.is_empty() {
-        body.push_str("<section class=\"aside-claims\"><h2>缺口與建議</h2>");
-        for b in &others {
-            render_block(&mut body, b);
+    let mut summary = String::new();
+    if let Some(i) = summary_at {
+        if let BlockContent::Callout { body, .. } = &blocks[i].content {
+            summary.push_str(&format!(
+                "<section id=\"s-summary\" class=\"tldr\"><h2>成果摘要</h2><p>{}</p>",
+                escape(body)
+            ));
+            render_cites(&mut summary, &blocks[i], &rendered);
+            summary.push_str("</section>");
         }
-        body.push_str("</section>");
     }
 
-    let mut transcript = String::new();
+    // 主文的標題進目錄，因為那是模型依本輪目標規劃出來的結構（§9.2）。
+    // 從 1 開始編號，讓錨點在文件內唯一而不依賴標題文字。
+    let mut headings: Vec<(usize, u8, &str)> = Vec::new();
+    let mut body = String::new();
+    for (i, b) in rest.iter().enumerate() {
+        if section_of(b) != Section::Body {
+            continue;
+        }
+        if let BlockContent::Heading { level, text } = &b.content {
+            if *level <= 2 {
+                headings.push((i, *level, text));
+            }
+        }
+        render_block(&mut body, b, Some(i), &rendered);
+    }
+
+    let mut decisions = String::new();
+    let mut actions = String::new();
+    for b in rest.iter().filter(|b| section_of(b) == Section::Decisions) {
+        render_block(
+            if b.kind == BlockKind::Decision {
+                &mut decisions
+            } else {
+                &mut actions
+            },
+            b,
+            None,
+            &rendered,
+        );
+    }
+
+    let mut open = String::new();
+    for b in rest.iter().filter(|b| section_of(b) == Section::Open) {
+        render_block(&mut open, b, None, &rendered);
+    }
+
+    let has_summary = !summary.is_empty();
+    let has_body = !body.is_empty();
+    let has_decisions = !decisions.is_empty() || !actions.is_empty();
+    let has_open = !open.is_empty();
+
+    let mut main = summary;
+    if !body.is_empty() {
+        main.push_str(&format!("<section id=\"s-body\">{body}</section>"));
+    }
+    if !decisions.is_empty() || !actions.is_empty() {
+        main.push_str("<section id=\"s-decisions\"><h2>決議與行動項目</h2>");
+        if !decisions.is_empty() {
+            main.push_str(&format!("<h3>決議</h3>{decisions}"));
+        }
+        if !actions.is_empty() {
+            main.push_str(&format!("<h3>行動項目</h3>{actions}"));
+        }
+        main.push_str("</section>");
+    }
+    if !open.is_empty() {
+        main.push_str(&format!(
+            "<section id=\"s-open\" class=\"aside-claims\"><h2>缺口與建議</h2>{open}</section>"
+        ));
+    }
+
+    // 目錄只列真的存在的區。列出空區等於告訴讀者這份文件漏了東西，
+    // 但沒有決議的會議本來就不該生出一個空的「決議」段落。
+    let mut toc = String::new();
+    let mut toc_entries = 0usize;
+    let mut item = |href: &str, label: &str, sub: bool| {
+        toc_entries += 1;
+        toc.push_str(&format!(
+            "<li{}><a href=\"#{href}\">{}</a></li>",
+            if sub { " class=\"sub\"" } else { "" },
+            escape(label)
+        ));
+    };
+    if has_summary {
+        item("s-summary", "成果摘要", false);
+    }
+    if has_body {
+        item("s-body", "主文", false);
+        for (i, _, text) in &headings {
+            item(&format!("h-{i}"), text, true);
+        }
+    }
+    if has_decisions {
+        item("s-decisions", "決議與行動項目", false);
+    }
+    if has_open {
+        item("s-open", "缺口與建議", false);
+    }
+    if !ctx.transcript.is_empty() {
+        item("s-transcript", "逐字稿", false);
+    }
+    // 只有一個入口的目錄不是目錄，那只是把標題再寫一次。畫面端同一條規則。
+    let nav = if toc_entries > 1 {
+        format!("<nav class=\"toc\" aria-label=\"目錄\"><ul>{toc}</ul></nav>")
+    } else {
+        String::new()
+    };
+    let body = main;
+
+    // 沒有逐字稿就不要留一個空的段落標題。目錄也不會列它，
+    // 兩邊不一致的話讀者會以為逐字稿掉了。
+    let mut rows = String::new();
     for s in ctx.transcript {
-        transcript.push_str(&format!(
-            "<div class=\"t-row\" id=\"seg-{id}-r{rev}\"><span class=\"t-time\">{time}</span>\
-             <span class=\"t-who\">{who}</span><p>{text}</p></div>",
+        rows.push_str(&format!(
+            "<div class=\"t-row\" id=\"seg-{id}\"><span class=\"t-time\">{time}</span>\
+             <span class=\"t-who\" id=\"seg-{id}-r{rev}\">{who}</span><p>{text}</p></div>",
             id = s.segment_id,
             rev = s.revision,
             time = escape(&mmss(s.meeting_start_ms)),
@@ -608,6 +762,11 @@ pub fn render_html(ctx: &RenderContext<'_>, blocks: &[Block]) -> String {
             text = escape(&s.text),
         ));
     }
+    let transcript = if rows.is_empty() {
+        String::new()
+    } else {
+        format!("<section id=\"s-transcript\" class=\"transcript\"><h2>逐字稿</h2>{rows}</section>")
+    };
 
     format!(
         "<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\">\
@@ -615,14 +774,14 @@ pub fn render_html(ctx: &RenderContext<'_>, blocks: &[Block]) -> String {
          <title>{title}</title><style>{css}</style></head><body>\
          <header><h1>{title}</h1><p class=\"meta\">版本 v{ver}・涵蓋至事件 {seq}・生成於 {at}</p>\
          <p class=\"disclaimer\">引用標記代表來源可回溯，不代表該陳述已被驗證為真。</p></header>\
-         <main>{body}</main>\
-         <section class=\"transcript\"><h2>逐字稿</h2>{transcript}</section>\
+         {nav}<main>{body}</main>{transcript}\
          </body></html>",
         title = escape(ctx.title),
         ver = ctx.version_no,
         seq = ctx.through_event_seq,
         at = escape(ctx.created_at),
         css = EXPORT_CSS,
+        nav = nav,
         body = body,
         transcript = transcript,
     )
@@ -633,7 +792,9 @@ fn mmss(ms: u64) -> String {
     format!("{:02}:{:02}", s / 60, s % 60)
 }
 
-fn render_block(out: &mut String, b: &Block) {
+/// `anchor` 只在主文區給，讓目錄裡的標題連得過去。其他區的標題由分區
+/// 標題負責導覽，不需要再多一組錨點。
+fn render_block(out: &mut String, b: &Block, anchor: Option<usize>, rendered: Rendered<'_>) {
     let claim = b.claim_kind.as_str();
     out.push_str(&format!(
         "<div class=\"blk\" data-kind=\"{}\" data-claim=\"{claim}\">",
@@ -643,7 +804,11 @@ fn render_block(out: &mut String, b: &Block) {
         BlockContent::Heading { level, text } => {
             // 層級只允許 1..=4，validate 已擋掉其他值
             let h = (*level).clamp(1, 4) + 1;
-            out.push_str(&format!("<h{h}>{}</h{h}>", escape(text)));
+            let id = match anchor {
+                Some(i) if *level <= 2 => format!(" id=\"h-{i}\""),
+                _ => String::new(),
+            };
+            out.push_str(&format!("<h{h}{id}>{}</h{h}>", escape(text)));
         }
         BlockContent::Text { text } => {
             out.push_str(&format!("<p>{}</p>", escape(text)));
@@ -684,12 +849,18 @@ fn render_block(out: &mut String, b: &Block) {
             ));
         }
         BlockContent::ActionItem { text, owner, due } => {
+            // 負責人與期限缺了就不顯示，不填「未指定」：那是一個沒人說過的值，
+            // 而「這件事沒有人認領」正是會後最需要看見的資訊。
             out.push_str(&format!("<p class=\"action\">{}", escape(text)));
-            if let Some(o) = owner {
-                out.push_str(&format!(" <span class=\"owner\">{}</span>", escape(o)));
-            }
-            if let Some(d) = due {
-                out.push_str(&format!(" <span class=\"due\">{}</span>", escape(d)));
+            if owner.is_some() || due.is_some() {
+                out.push_str("<span class=\"action-meta\">");
+                if let Some(o) = owner {
+                    out.push_str(&format!("<span class=\"owner\">{}</span>", escape(o)));
+                }
+                if let Some(d) = due {
+                    out.push_str(&format!("<span class=\"due\">{}</span>", escape(d)));
+                }
+                out.push_str("</span>");
             }
             out.push_str("</p>");
         }
@@ -714,20 +885,51 @@ fn render_block(out: &mut String, b: &Block) {
         }
     }
 
-    if !b.source_refs.is_empty() {
-        out.push_str("<span class=\"cites\">");
-        for r in &b.source_refs {
+    render_cites(out, b, rendered);
+    out.push_str("</div>");
+}
+
+/// 匯出裡逐字稿實際渲染的版本，`segment_id` → `revision`。
+type Rendered<'a> = &'a std::collections::HashMap<String, u32>;
+
+fn render_cites(out: &mut String, b: &Block, rendered: Rendered<'_>) {
+    if b.source_refs.is_empty() {
+        return;
+    }
+    out.push_str("<span class=\"cites\">");
+    for r in &b.source_refs {
+        // 錨點指向片段而不是「片段的某一版」。引用可以合法地指向舊版本
+        // （§9.6 只要求它落在快照範圍內），但匯出的逐字稿只會有一版，
+        // 帶版本的錨點在那種情況下會指向不存在的位置，點了什麼都不會發生。
+        let stale = rendered
+            .get(&r.source_id)
+            .is_some_and(|now| *now > r.source_revision);
+        let label = format!(
+            "{kind} {id} r{rev}{mark}",
+            id = escape(&r.source_id),
+            rev = r.source_revision,
+            kind = escape(&r.source_kind),
+            // 引用之後那一段又被改過，讀者看到的逐字稿已經不是生成時的內容
+            mark = if stale { "（已修訂）" } else { "" },
+        );
+        // 只有逐字稿引用在這份文件裡有落點。筆記與附件同樣有合法的 id，
+        // 但匯出裡沒有它們的段落 —— `#seg-7` 不是指不到，是會指到「第 7 段
+        // 逐字稿」那個完全無關的位置。指錯比指不到嚴重。
+        if r.source_kind == "transcript_segment" {
             out.push_str(&format!(
-                "<a class=\"cite\" href=\"#seg-{id}-r{rev}\" title=\"{q}\">{kind} {id} r{rev}</a>",
+                "<a class=\"cite\" href=\"#seg-{id}\" data-stale=\"{stale}\" title=\"{q}\">{label}</a>",
                 id = escape(&r.source_id),
-                rev = r.source_revision,
-                kind = escape(&r.source_kind),
+                q = escape(&r.quoted_text),
+                stale = if stale { "1" } else { "0" },
+            ));
+        } else {
+            out.push_str(&format!(
+                "<span class=\"cite\" title=\"{q}\">{label}</span>",
                 q = escape(&r.quoted_text),
             ));
         }
-        out.push_str("</span>");
     }
-    out.push_str("</div>");
+    out.push_str("</span>");
 }
 
 const EXPORT_CSS: &str = "\
@@ -737,6 +939,17 @@ const EXPORT_CSS: &str = "\
 font:15px/1.7 system-ui,'Noto Sans TC',sans-serif}\
 h1{font-size:26px;margin:0 0 6px}h2{font-size:18px;margin:28px 0 10px}h3{font-size:16px}\
 .meta,.disclaimer{color:var(--muted);font-size:13px;margin:2px 0}\
+.toc{margin:24px 0;padding:12px 16px;background:var(--soft);border-radius:8px}\
+.toc ul{margin:0;padding:0;list-style:none}\
+.toc li{margin:2px 0}.toc li.sub{padding-left:16px;font-size:13px}\
+.toc a{color:inherit;text-decoration:none}.toc a:hover{text-decoration:underline}\
+.tldr{margin:24px 0;padding:16px 18px;border-left:3px solid var(--violet,#6b5bd2);background:var(--soft);border-radius:0 8px 8px 0}\
+.tldr h2{margin:0 0 6px;font-size:15px;color:var(--muted);letter-spacing:.04em}\
+.tldr p{margin:0;font-size:16px}\
+#s-decisions h3{margin:18px 0 6px;font-size:14px;color:var(--muted)}\
+.action{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin:0}\
+.action-meta{display:inline-flex;gap:6px}\
+.owner,.due{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:1px 8px;color:var(--muted)}\
 .blk{margin:14px 0}\
 .blk[data-claim='inference']{border-left:3px solid var(--line);padding-left:12px}\
 .blk[data-claim='inference']::before{content:'推論';font-size:11px;color:var(--muted);display:block}\
@@ -749,6 +962,7 @@ blockquote{margin:0;padding:10px 14px;background:var(--soft);border-radius:8px}\
 .cites{display:inline-flex;gap:6px;flex-wrap:wrap;margin-left:6px}\
 .cite{font-size:11px;color:var(--muted);text-decoration:none;border:1px solid var(--line);\
 border-radius:999px;padding:1px 7px}\
+.cite[data-stale='1']{border-style:dashed;border-color:var(--muted)}\
 .transcript{margin-top:40px;border-top:1px solid var(--line);padding-top:16px}\
 .t-row{display:grid;grid-template-columns:56px 96px 1fr;gap:10px;padding:4px 0}\
 .t-time,.t-who{color:var(--muted);font-size:12px}\
@@ -757,6 +971,463 @@ border-radius:999px;padding:1px 7px}\
 
 #[cfg(test)]
 mod tests {
+    /* ── 渲染的注入防線（§9.4） ──────────────────────────────────── */
+    //
+    // 逐字稿與筆記是不受信任的內容：任何人在會議裡念出一段 HTML，
+    // 它就會走完整條管線進到匯出檔。這幾個測試守的是那條邊界。
+
+    fn ctx() -> RenderContext<'static> {
+        RenderContext {
+            title: "測試會議",
+            version_no: 1,
+            through_event_seq: 10,
+            created_at: "2026-08-05T00:00:00Z",
+            transcript: &[],
+        }
+    }
+
+    fn block(kind: BlockKind, content: BlockContent) -> Block {
+        Block {
+            kind,
+            claim_kind: ClaimKind::Inference,
+            content,
+            source_refs: vec![],
+        }
+    }
+
+    #[test]
+    fn test_script_tags_in_content_cannot_escape_into_markup() {
+        let html = render_html(
+            &ctx(),
+            &[block(
+                BlockKind::Paragraph,
+                BlockContent::Text {
+                    text: "<script>alert(1)</script>".into(),
+                },
+            )],
+        );
+        assert!(!html.contains("<script>"), "腳本標籤原樣進了輸出");
+        assert!(html.contains("&lt;script&gt;"), "沒有被轉義成文字");
+    }
+
+    #[test]
+    fn test_javascript_urls_are_blocked_but_still_visible() {
+        let html = render_html(
+            &ctx(),
+            &[block(
+                BlockKind::SourceLink,
+                BlockContent::Link {
+                    label: "看起來正常的連結".into(),
+                    target: "javascript:alert(1)".into(),
+                },
+            )],
+        );
+        assert!(!html.contains("javascript:"), "危險協定進了 href");
+        assert!(html.contains("#blocked"), "擋下來的連結沒有改成安全目標");
+        // 標籤文字仍要顯示：靜默移除會讓使用者不知道文件裡本來有個連結
+        assert!(html.contains("看起來正常的連結"));
+    }
+
+    #[test]
+    fn test_a_link_target_cannot_break_out_of_the_href_attribute() {
+        let html = render_html(
+            &ctx(),
+            &[block(
+                BlockKind::SourceLink,
+                BlockContent::Link {
+                    label: "x".into(),
+                    target: "https://example.com\" onclick=\"alert(1)".into(),
+                },
+            )],
+        );
+        // 轉義之後 onclick= 這幾個字元還在，但前面的引號已經是 &quot;，
+        // 構不成屬性。要檢查的是「有沒有形成屬性」而不是「字串在不在」。
+        assert!(!html.contains("\" onclick="), "屬性被跳脫出來了");
+        assert!(html.contains("&quot;"), "引號沒有被轉義");
+    }
+
+    #[test]
+    fn test_mermaid_source_is_escaped_so_it_cannot_close_its_container() {
+        let html = render_html(
+            &ctx(),
+            &[block(
+                BlockKind::MermaidDiagram,
+                BlockContent::Mermaid {
+                    source: "graph TD</pre><script>alert(1)</script><pre>".into(),
+                },
+            )],
+        );
+        assert!(!html.contains("<script>"), "從 mermaid 容器跳出去了");
+        assert!(html.contains("&lt;/pre&gt;"), "結束標籤沒有被轉義");
+    }
+
+    #[test]
+    fn test_a_callout_tone_cannot_inject_an_attribute() {
+        let html = render_html(
+            &ctx(),
+            &[block(
+                BlockKind::Callout,
+                BlockContent::Callout {
+                    tone: "warn\" onload=\"alert(1)".into(),
+                    title: "標題".into(),
+                    body: "內容".into(),
+                },
+            )],
+        );
+        assert!(!html.contains("\" onload="), "屬性值被跳脫出來了");
+        assert!(html.contains("&quot;"), "引號沒有被轉義");
+    }
+
+    #[test]
+    fn test_transcript_text_is_escaped_in_the_export() {
+        // 逐字稿是最容易被塞東西的地方：講出來就會進來
+        let seg = crate::store::StoredSegment {
+            segment_id: 1,
+            revision: 1,
+            origin: crate::model::Origin::Provider,
+            speaker_id: Some("<img src=x onerror=alert(1)>".into()),
+            text: "<b>粗體</b>".into(),
+            track: crate::model::Track::Mic,
+            meeting_start_ms: 0,
+            meeting_end_ms: 1000,
+            user_edited: false,
+        };
+        let c = RenderContext {
+            transcript: std::slice::from_ref(&seg),
+            ..ctx()
+        };
+        let html = render_html(&c, &[]);
+        assert!(!html.contains("<img "), "語者名稱可以注入元素");
+        assert!(!html.contains("<b>粗體</b>"), "逐字稿內容沒有被轉義");
+        assert!(html.contains("&lt;b&gt;"), "轉義後的內容不見了");
+    }
+
+    #[test]
+    fn test_the_title_is_escaped_too() {
+        // 會議標題可以改名，那也是使用者輸入
+        let c = RenderContext {
+            title: "</title><script>alert(1)</script>",
+            ..ctx()
+        };
+        let html = render_html(&c, &[]);
+        assert!(!html.contains("<script>"), "標題可以跳出 title 元素");
+    }
+
+    #[test]
+    fn test_inferences_are_separated_from_facts_in_the_export() {
+        // 推論混在事實裡排版，讀的人會把它當成會議事實（§10）
+        let html = render_html(
+            &ctx(),
+            &[
+                Block {
+                    kind: BlockKind::Paragraph,
+                    claim_kind: ClaimKind::Fact,
+                    content: BlockContent::Text {
+                        text: "這是事實".into(),
+                    },
+                    source_refs: vec![],
+                },
+                Block {
+                    kind: BlockKind::Gap,
+                    claim_kind: ClaimKind::Gap,
+                    content: BlockContent::Text {
+                        text: "這是缺口".into(),
+                    },
+                    source_refs: vec![],
+                },
+            ],
+        );
+        let fact_at = html.find("這是事實").expect("事實應該出現");
+        // 找 section 標籤本身，不是樣式表裡同名的選擇器
+        let aside_at = html
+            .find("<section id=\"s-open\"")
+            .expect("缺口區段應該存在");
+        let gap_at = html.find("這是缺口").expect("缺口應該出現");
+        assert!(
+            fact_at < aside_at,
+            "事實排在缺口區段之後了 fact={fact_at} aside={aside_at}"
+        );
+        assert!(
+            aside_at < gap_at,
+            "缺口沒有落在獨立區段裡 aside={aside_at} gap={gap_at}"
+        );
+    }
+
+    /* ── §10 的分區（成果摘要、主文、決議與行動項目） ─────────────── */
+
+    fn doc() -> Vec<Block> {
+        vec![
+            // 刻意把摘要放在中間、決議放在最前面：分區由渲染器決定，
+            // 不該依賴模型剛好照順序輸出
+            Block {
+                kind: BlockKind::Decision,
+                claim_kind: ClaimKind::Fact,
+                content: BlockContent::Text {
+                    text: "決議凍結兩百萬元".into(),
+                },
+                source_refs: vec![],
+            },
+            Block {
+                kind: BlockKind::Callout,
+                claim_kind: ClaimKind::Inference,
+                content: BlockContent::Callout {
+                    tone: "summary".into(),
+                    title: "成果摘要".into(),
+                    body: "本次會議審查預算案。".into(),
+                },
+                source_refs: vec![],
+            },
+            Block {
+                kind: BlockKind::Heading,
+                claim_kind: ClaimKind::Inference,
+                content: BlockContent::Heading {
+                    level: 1,
+                    text: "預算審查".into(),
+                },
+                source_refs: vec![],
+            },
+            Block {
+                kind: BlockKind::Paragraph,
+                claim_kind: ClaimKind::Inference,
+                content: BlockContent::Text {
+                    text: "主文內容".into(),
+                },
+                source_refs: vec![],
+            },
+            Block {
+                kind: BlockKind::ActionItem,
+                claim_kind: ClaimKind::Fact,
+                content: BlockContent::ActionItem {
+                    text: "函請文化部表達意見".into(),
+                    owner: Some("文化部".into()),
+                    due: None,
+                },
+                source_refs: vec![],
+            },
+        ]
+    }
+
+    #[test]
+    fn test_the_summary_callout_leads_the_document_wherever_the_model_put_it() {
+        let html = render_html(&ctx(), &doc());
+        let summary = html
+            .find("<section id=\"s-summary\"")
+            .expect("沒有成果摘要區");
+        let body = html.find("<section id=\"s-body\"").expect("沒有主文區");
+        assert!(summary < body, "成果摘要沒有排在主文之前");
+        // 摘要那一塊不該又在主文裡出現一次
+        assert_eq!(
+            html.matches("本次會議審查預算案。").count(),
+            1,
+            "摘要被渲染了兩次"
+        );
+    }
+
+    #[test]
+    fn test_decisions_and_action_items_get_their_own_section() {
+        let html = render_html(&ctx(), &doc());
+        let at = html
+            .find("<section id=\"s-decisions\"")
+            .expect("沒有決議區");
+        let tail = &html[at..];
+        assert!(tail.contains("決議凍結兩百萬元"), "決議沒有進決議區");
+        assert!(tail.contains("函請文化部表達意見"), "行動項目沒有進決議區");
+        assert!(tail.contains("<h3>決議</h3>") && tail.contains("<h3>行動項目</h3>"));
+        // 負責人要看得見，否則沒人知道這件事歸誰
+        assert!(tail.contains("文化部"), "行動項目的負責人不見了");
+        // 決議不該同時留在主文裡
+        assert!(!html[..at].contains("決議凍結兩百萬元"), "決議被渲染了兩次");
+    }
+
+    #[test]
+    fn test_the_table_of_contents_only_lists_sections_that_exist() {
+        let html = render_html(&ctx(), &doc());
+        assert!(html.contains("<nav class=\"toc\""), "沒有目錄");
+        for anchor in ["#s-summary", "#s-body", "#s-decisions"] {
+            assert!(html.contains(anchor), "目錄少了 {anchor}");
+        }
+        // 這份文件沒有缺口，也沒有逐字稿
+        assert!(!html.contains("#s-open"), "目錄列了不存在的缺口區");
+        assert!(!html.contains("#s-transcript"), "目錄列了不存在的逐字稿");
+        // 主文的標題要能被目錄連到
+        assert!(html.contains("id=\"h-"), "主文標題沒有錨點");
+    }
+
+    #[test]
+    fn test_a_citation_to_an_older_revision_still_has_somewhere_to_land() {
+        // §9.6 允許引用快照範圍內的舊版本，但匯出的逐字稿只會有最新那一版。
+        // 錨點若帶著版本號，這種引用就會指向文件裡不存在的位置，點了什麼
+        // 都不會發生，而讀者無從得知自己點了一個死連結。
+        let (mut s, m, _) = store_with_evidence();
+        let seq = s
+            .append(
+                m,
+                &[(
+                    DomainEvent::TranscriptSegmentRevised {
+                        segment: SegmentRevision {
+                            segment_id: 1,
+                            revision: 2,
+                            text: "報價要拆成設計、開發、維運三項，這點下次再確認".into(),
+                            speaker_id: Some("s1".into()),
+                            track: Track::System,
+                            meeting_start_ms: 0,
+                            meeting_end_ms: 4000,
+                            captured_start_ms: 0,
+                            captured_end_ms: 4000,
+                            echo_likelihood: None,
+                            overlap_group_id: None,
+                            provider_stream_id: None,
+                            provider_result_id: None,
+                            rollover_generation: 0,
+                            origin: Origin::User,
+                            speaker_spans: Vec::new(),
+                        },
+                    },
+                    Timeline::new(4000, 4000),
+                )],
+            )
+            .unwrap()
+            .last()
+            .copied()
+            .unwrap();
+
+        let quote = "報價要拆成";
+        let block = Block {
+            kind: BlockKind::Paragraph,
+            claim_kind: ClaimKind::Fact,
+            content: BlockContent::Text {
+                text: "報價分三項".into(),
+            },
+            source_refs: vec![SourceRef {
+                source_kind: "transcript_segment".into(),
+                source_id: "1".into(),
+                source_revision: 1,
+                locator: "0-5".into(),
+                quoted_text: quote.into(),
+                quoted_text_sha256: sha256_hex(quote),
+                validation_status: "unverified".into(),
+            }],
+        };
+        let (ok, _) = verify_blocks(&s, m, seq, &[block]).unwrap();
+        assert_eq!(ok.len(), 1, "引用舊版本本身應該是合法的");
+
+        let transcript = s.segments_through(m, seq).unwrap();
+        let html = render_html(
+            &RenderContext {
+                title: "修訂",
+                version_no: 1,
+                through_event_seq: seq,
+                created_at: "2026-08-05T00:00:00Z",
+                transcript: &transcript,
+            },
+            &ok,
+        );
+        assert!(html.contains("href=\"#seg-1\""), "引用沒有指向片段本身");
+        assert!(html.contains("id=\"seg-1\""), "逐字稿沒有可落地的錨點");
+        // 讀者看到的是 r2 的文字，引用寫的是 r1，這個落差要講出來
+        assert!(
+            html.contains("data-stale=\"1\""),
+            "沒有標示引用依據的版本已被修訂"
+        );
+        assert!(html.contains("（已修訂）"));
+    }
+
+    #[test]
+    fn a_note_citation_does_not_pretend_to_point_at_the_transcript() {
+        // 筆記與附件同樣有合法的 id，但匯出裡沒有它們的段落。`#seg-7` 不是
+        // 指不到，是會指到「第 7 段逐字稿」那個完全無關的位置 —— 指錯比
+        // 指不到嚴重。獨立審查找到的。
+        let html = render_html(
+            &ctx(),
+            &[Block {
+                kind: BlockKind::Paragraph,
+                claim_kind: ClaimKind::Fact,
+                content: BlockContent::Text {
+                    text: "筆記裡寫的事".into(),
+                },
+                source_refs: vec![SourceRef {
+                    source_kind: "note".into(),
+                    source_id: "7".into(),
+                    source_revision: 3,
+                    locator: "0-4".into(),
+                    quoted_text: "追維運報價".into(),
+                    quoted_text_sha256: sha256_hex("追維運報價"),
+                    validation_status: "valid".into(),
+                }],
+            }],
+        );
+        assert!(!html.contains("href=\"#seg-7\""), "筆記引用指到了逐字稿");
+        // 但它仍要看得見，而且看得出來源是什麼
+        assert!(html.contains("note 7"), "筆記引用整個不見了");
+    }
+
+    #[test]
+    fn test_the_front_end_sections_the_document_the_same_way_this_module_does() {
+        // 分區規則有兩份實作：這裡產匯出的 HTML，DocumentView.tsx 產畫面。
+        // 兩邊分歧的話，使用者在畫面上看到的文件與他匯出的那份會是不同的組織
+        // 方式，而那種落差不會有任何一邊報錯。這個測試盯的就是那件事。
+        let tsx = std::fs::read_to_string("../src/components/DocumentView.tsx")
+            .expect("找不到前端的文件渲染元件");
+        let rule = tsx
+            .split_once("export function sectionOf")
+            .expect("前端沒有 sectionOf")
+            .1;
+        let rule = &rule[..rule.find('}').unwrap_or(rule.len())];
+        for kind in ALL_BLOCK_KINDS {
+            let routed = matches!(kind, BlockKind::Decision | BlockKind::ActionItem);
+            assert_eq!(
+                rule.contains(&format!("kind === '{}'", kind.as_str())),
+                routed,
+                "{} 在兩邊的分區規則裡不一致",
+                kind.as_str()
+            );
+        }
+        for claim in ["gap", "suggestion"] {
+            assert!(
+                rule.contains(&format!("claimKind === '{claim}'")),
+                "前端沒有把 {claim} 分到缺口與建議"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_document_without_a_summary_simply_has_no_summary_section() {
+        // 渲染器不會自己生一段摘要出來充數
+        let html = render_html(
+            &ctx(),
+            &[Block {
+                kind: BlockKind::Paragraph,
+                claim_kind: ClaimKind::Inference,
+                content: BlockContent::Text {
+                    text: "只有主文".into(),
+                },
+                source_refs: vec![],
+            }],
+        );
+        assert!(!html.contains("s-summary"), "無中生有了一個成果摘要區");
+        assert!(html.contains("只有主文"));
+    }
+
+    #[test]
+    fn test_a_summary_callout_cannot_inject_markup_from_its_lead_position() {
+        // 摘要走的是與其他區塊不同的渲染路徑，轉義必須各自守住
+        let html = render_html(
+            &ctx(),
+            &[Block {
+                kind: BlockKind::Callout,
+                claim_kind: ClaimKind::Inference,
+                content: BlockContent::Callout {
+                    tone: "summary".into(),
+                    title: "x".into(),
+                    body: "<img src=x onerror=alert(1)>".into(),
+                },
+                source_refs: vec![],
+            }],
+        );
+        assert!(!html.contains("<img"), "摘要區沒有轉義");
+        assert!(html.contains("&lt;img"));
+    }
+
     use super::*;
     use crate::db;
     use crate::model::{Origin, Timeline, Track};
@@ -828,6 +1499,38 @@ mod tests {
     }
 
     /* ── 引用驗證 ─────────────────────────────────────────────── */
+
+    #[test]
+    fn an_empty_quote_is_not_a_citation() {
+        // `contains("")` 永遠為真。附上空引文與它正確的雜湊，任何一個 Fact
+        // 都能拿到 valid —— 整套防幻覺機制唯一能被強制執行的那一環就此
+        // fail-open。獨立審查找到的。
+        let (s, m, cursor) = store_with_evidence();
+        for empty in ["", "   ", "　", "\n\t"] {
+            let r = cite("transcript_segment", "1", 1, "0-0", empty);
+            assert_eq!(
+                verify_ref(&s, m, cursor, &r).unwrap(),
+                RefVerdict::QuoteNotFound,
+                "空引文 {empty:?} 通過了驗證"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_whose_only_citation_is_empty_is_not_admitted() {
+        let (s, m, cursor) = store_with_evidence();
+        let block = Block {
+            kind: BlockKind::Paragraph,
+            claim_kind: ClaimKind::Fact,
+            content: BlockContent::Text {
+                text: "客戶已同意八折".into(),
+            },
+            source_refs: vec![cite("transcript_segment", "1", 1, "0-0", "")],
+        };
+        let (ok, verdicts) = verify_blocks(&s, m, cursor, &[block]).unwrap();
+        assert!(ok.is_empty(), "空引用的 Fact 進到成果了");
+        assert!(!verdicts[0].admitted);
+    }
 
     #[test]
     fn a_quote_that_exists_in_the_cited_revision_passes() {
@@ -1100,7 +1803,7 @@ mod tests {
         );
         // 找 class 屬性本身，不是 <style> 裡的同名選擇器
         let facts_end = html
-            .find("<section class=\"aside-claims\"")
+            .find("<section id=\"s-open\"")
             .expect("缺口沒有獨立區段");
         assert!(html[..facts_end].contains("報價拆成三項"));
         assert!(html[facts_end..].contains("SLA 尚未談定"));

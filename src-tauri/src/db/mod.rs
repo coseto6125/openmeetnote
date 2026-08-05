@@ -50,7 +50,9 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 /// 記憶體資料庫，供測試使用。走的是同一條 migration 路徑。
-#[cfg(test)]
+///
+/// 不加 `#[cfg(test)]`：整合測試是另一個 crate，看不到只在單元測試存在的
+/// 東西，而端到端測試正需要一個乾淨的資料庫來驗證整條鏈。
 pub fn open_in_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     prepare(&conn)?;

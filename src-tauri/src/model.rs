@@ -14,12 +14,29 @@ pub enum MeetingState {
     Stopping,
     Finalizing,
     Completed,
+    /// 沒有正常走完的會議：崩潰、被強制關閉，或啟動時發現狀態還停在錄音。
+    ///
+    /// 與 `Completed` 分開，因為它的逐字稿可能斷在半句話。混進正常結束的
+    /// 會議裡，使用者就沒有機會知道哪一場的內容是不完整的（§13）。
+    Failed,
 }
 
 impl MeetingState {
-    /// 會議正在進行，允許筆記、語者確認、修訂與快照。
+    /// 會議正在進行，允許筆記、語者確認與修訂。
     pub fn accepts_document_work(self) -> bool {
         matches!(self, MeetingState::Recording | MeetingState::Paused)
+    }
+
+    /// 可以建立摘要快照。
+    ///
+    /// 比 [`accepts_document_work`] 多一個 `Completed`：使用者最常見的流程
+    /// 就是開完會才要摘要，那時內容才完整。藍圖 §6 規定快照是
+    /// `Recording → Recording`，約束的是「不得為了生成而停止錄音」，
+    /// 不是「只能在錄音時生成」。
+    ///
+    /// [`accepts_document_work`]: MeetingState::accepts_document_work
+    pub fn accepts_snapshot(self) -> bool {
+        self.accepts_document_work() || matches!(self, MeetingState::Completed)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -30,6 +47,7 @@ impl MeetingState {
             MeetingState::Stopping => "stopping",
             MeetingState::Finalizing => "finalizing",
             MeetingState::Completed => "completed",
+            MeetingState::Failed => "failed",
         }
     }
 
@@ -41,6 +59,7 @@ impl MeetingState {
             "stopping" => Some(MeetingState::Stopping),
             "finalizing" => Some(MeetingState::Finalizing),
             "completed" => Some(MeetingState::Completed),
+            "failed" => Some(MeetingState::Failed),
             _ => None,
         }
     }

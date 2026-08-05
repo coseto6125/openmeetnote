@@ -49,6 +49,34 @@ const edited = (seq: number, id: number, text: string, revision: number): Sessio
   text,
 });
 
+
+const snapshot = (
+  seq: number,
+  version: number,
+  throughEventSeq = 10,
+  prompt = '',
+): SessionEvent => ({
+  kind: 'snapshotCreated',
+  seq,
+  version,
+  prompt,
+  throughEventSeq,
+  meetingTimeMs: 900,
+});
+
+const completed = (seq: number, version: number): SessionEvent => ({
+  kind: 'generationCompleted',
+  seq,
+  version,
+});
+
+const failed = (seq: number, version: number, reason: string): SessionEvent => ({
+  kind: 'generationFailed',
+  seq,
+  version,
+  reason,
+});
+
 const note = (seq: number, noteId: number, text: string): SessionEvent => ({
   kind: 'noteAdded',
   seq,
@@ -136,7 +164,7 @@ describe('sequence gap detection', () => {
       ],
       notes: [{ noteId: 1, text: '筆記', meetingTimeMs: 800, capturedAudioMs: 800 }],
       snapshots: [
-        { version: 1, throughEventSeq: 4, meetingTimeMs: 3000, state: 'completed' },
+        { version: 1, throughEventSeq: 4, meetingTimeMs: 3000, state: 'completed', prompt: '' },
       ],
       pauses: [{ fromMs: 1000, toMs: 2000 }],
     };
@@ -267,5 +295,65 @@ describe('precedence is identical across all three layers', () => {
     m = applyBatch(m, batchOf([edited(2, 10, '使用者改過', 2)], 1));
     m = applyBatch(m, batchOf([finalized(3, 10, 'Provider 的同版本', 2)], 2));
     expect(m.segments[0].text).toBe('使用者改過');
+  });
+});
+
+describe('生成失敗', () => {
+  // 使用者最常遇到的錯誤路徑：CLI 沒登入、額度用盡、模型回了解不開的東西。
+  // 這些都必須在畫面上看得見並且可以重試，靜默失敗會讓人以為摘要還在跑。
+
+  test('a_snapshot_remembers_what_this_round_asked_for', () => {
+    // 沒有這個欄位，多個版本在畫面上看起來一模一樣，
+    // 使用者無從知道哪一版問的是什麼，也無從沿用它重試
+    const m = applyBatch(
+      emptyMeeting,
+      batchOf([snapshot(1, 1, 10, '整理成決議清單')], 0),
+    );
+    expect(m.snapshots[0].prompt).toBe('整理成決議清單');
+  });
+
+  test('a_failed_generation_keeps_the_snapshot_and_shows_why', () => {
+    let m = applyBatch(emptyMeeting, batchOf([snapshot(1, 1)], 0));
+    m = applyBatch(m, batchOf([failed(2, 1, 'CLI 尚未登入')], 1));
+
+    expect(m.snapshots).toHaveLength(1);
+    expect(m.snapshots[0].state).toBe('failed');
+    expect(m.snapshots[0].reason).toBe('CLI 尚未登入');
+    // 快照本身不該消失：使用者要能重試同一個涵蓋範圍
+    expect(m.snapshots[0].version).toBe(1);
+  });
+
+  test('a_failure_without_a_prior_snapshot_still_surfaces', () => {
+    // 生成可能在快照事件送達 UI 之前就失敗（背景工作比事件泵快）
+    const m = applyBatch(emptyMeeting, batchOf([failed(1, 3, '生成逾時')], 0));
+    expect(m.snapshots).toHaveLength(1);
+    expect(m.snapshots[0].state).toBe('failed');
+    expect(m.snapshots[0].reason).toBe('生成逾時');
+  });
+
+  test('a_failed_version_never_becomes_the_active_one', () => {
+    // 失敗的版本被設成 active 的話，畫面會顯示一份不存在的成果
+    let m = applyBatch(emptyMeeting, batchOf([snapshot(1, 1), completed(2, 1)], 0));
+    expect(m.activeVersion).toBe(1);
+
+    m = applyBatch(m, batchOf([snapshot(3, 2), failed(4, 2, '模型回了散文')], 2));
+    expect(m.activeVersion).toBe(1);
+    expect(m.snapshots.find((s) => s.version === 2)?.state).toBe('failed');
+  });
+
+  test('a_replayed_failure_does_not_duplicate_the_snapshot', () => {
+    // 重連之後同一個事件會再送一次，重播必須是冪等的
+    let m = applyBatch(emptyMeeting, batchOf([snapshot(1, 1), failed(2, 1, '逾時')], 0));
+    m = applyBatch(m, batchOf([snapshot(1, 1), failed(2, 1, '逾時')], 0));
+    expect(m.snapshots).toHaveLength(1);
+  });
+
+  test('a_retry_after_failure_can_reach_completed', () => {
+    // 失敗不是終局：重試成功之後狀態要能翻回來
+    let m = applyBatch(emptyMeeting, batchOf([snapshot(1, 1), failed(2, 1, '逾時')], 0));
+    m = applyBatch(m, batchOf([completed(3, 1)], 2));
+
+    expect(m.snapshots[0].state).toBe('completed');
+    expect(m.activeVersion).toBe(1);
   });
 });

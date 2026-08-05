@@ -40,6 +40,7 @@ const STATE_LABEL: Record<MeetingState, string> = {
   stopping: '收尾中',
   finalizing: '結算中',
   completed: '已結束',
+  failed: '異常結束',
 };
 
 export default function App() {

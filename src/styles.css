@@ -704,39 +704,227 @@ svg { display: block; }
   animation: breathe 1.4s ease-in-out infinite;
 }
 
-.claims { margin-top: 12px; }
-
-/* claim_kind 四種語意在視覺上必須分離 */
-.claim {
-  padding: 8px 0 8px 11px;
-  font-size: 13px;
-  border-left: 2px solid var(--line-2);
-}
-.claim + .claim { margin-top: 4px; }
-
-.claim[data-kind="fact"] { border-left-color: var(--live); }
-.claim[data-kind="inference"] { border-left-color: var(--slate-300); border-left-style: dashed; }
-.claim[data-kind="suggestion"] { border-left-color: var(--violet); border-left-style: dotted; }
-.claim[data-kind="gap"] {
-  border-left-color: var(--amber);
-  background: var(--amber-soft);
-  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-  padding-right: 9px;
+/*
+  成果文件（§10）。錄音中的主欄是儀表，成果文件是文件：
+  換成襯線、放寬行距、限制行寬，讓它讀起來像一份會議記錄而不是一份日誌。
+  匯出的 HTML 走同一套分區，樣式各自寫在各自的地方。
+*/
+.doc-pane {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 22px 22px 40px;
+  background: var(--panel);
 }
 
-.claim-kind {
-  display: block;
-  font-size: 10px;
+.doc {
+  max-width: 46rem;
+  font-family: var(--serif);
+  font-size: 15px;
+  line-height: 1.75;
+  color: var(--ink);
+}
+
+.doc-meta {
+  max-width: 46rem;
+  font-size: 11.5px;
+  color: var(--muted);
+  margin: 0 0 14px;
+}
+
+/* 成果摘要：沒讀完整份文件的人只會讀這一段，因此它要一眼看得出是它 */
+/* 目錄。長文件在畫面上要捲很久，而匯出的那份有目錄、畫面上沒有 */
+.doc-toc {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.doc-toc button {
+  font: inherit;
+  font-family: var(--sans);
+  font-size: 11.5px;
+  padding: 2px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.doc-toc button:hover { border-color: var(--line-2); color: var(--ink); }
+.doc-toc button[data-sub="1"] { border-style: dashed; }
+
+.doc-tldr {
+  border-left: 3px solid var(--violet);
+  background: var(--violet-soft);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  padding: 14px 16px;
+  margin-bottom: 24px;
+}
+
+.doc-tldr h3 {
+  margin: 0 0 4px;
+  font-family: var(--sans);
+  font-size: 10.5px;
   letter-spacing: .08em;
   text-transform: uppercase;
-  font-weight: 700;
-  margin-bottom: 2px;
+  color: var(--violet);
+}
+
+.doc-tldr p { margin: 0; font-size: 15.5px; }
+
+.doc-sec + .doc-sec {
+  margin-top: 26px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.doc-sec-head {
+  margin: 0 0 10px;
+  font-family: var(--sans);
+  font-size: 10.5px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
   color: var(--muted);
 }
 
-.claim[data-kind="fact"] .claim-kind { color: var(--live); }
-.claim[data-kind="suggestion"] .claim-kind { color: var(--violet); }
-.claim[data-kind="gap"] .claim-kind { color: var(--amber); }
+.doc-group + .doc-group { margin-top: 14px; }
+
+.doc-group-head {
+  display: block;
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.doc-blk { margin: 10px 0; }
+.doc-h { margin: 20px 0 6px; font-size: 16px; font-weight: 600; }
+.doc-p { margin: 0; }
+.doc-ul { margin: 4px 0; padding-left: 1.3em; }
+.doc-ul li { margin: 2px 0; }
+
+.doc-table-wrap { overflow-x: auto; }
+
+.doc-table {
+  border-collapse: collapse;
+  font-family: var(--sans);
+  font-size: 13px;
+  min-width: 100%;
+}
+
+.doc-table th, .doc-table td {
+  border: 1px solid var(--line);
+  padding: 5px 9px;
+  text-align: left;
+}
+
+.doc-table th { background: var(--panel-2); font-weight: 600; }
+
+.doc-callout {
+  background: var(--panel-2);
+  border-radius: var(--radius-sm);
+  padding: 10px 13px;
+}
+
+.doc-callout b { display: block; font-size: 13px; }
+.doc-callout p { margin: 2px 0 0; }
+.doc-callout[data-tone="warn"] { background: var(--amber-soft); }
+
+/* 行動項目：誰、什麼時候，是會後唯一會被回頭查的東西 */
+.doc-action {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0;
+}
+
+.doc-chip {
+  font-family: var(--sans);
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.doc-quote {
+  margin: 0;
+  padding: 8px 13px;
+  background: var(--panel-2);
+  border-radius: var(--radius-sm);
+}
+
+.doc-quote span, .doc-quote b { font-family: var(--sans); font-size: 11.5px; color: var(--muted); }
+.doc-quote b { margin-left: 8px; }
+.doc-quote p { margin: 2px 0 0; }
+
+.doc-mermaid summary { font-family: var(--sans); font-size: 12px; color: var(--muted); cursor: pointer; }
+.doc-mermaid pre {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  overflow-x: auto;
+  background: var(--panel-2);
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+}
+
+.doc-link { color: var(--violet); }
+
+/* 缺口與建議與事實分開呈現（§10），不能只靠位置區分 */
+.doc-open .doc-blk {
+  border-left: 2px solid var(--line-2);
+  padding-left: 11px;
+}
+
+.doc-open .doc-blk[data-claim="gap"] { border-left-color: var(--amber); }
+.doc-open .doc-blk[data-claim="suggestion"] { border-left-color: var(--violet); border-left-style: dotted; }
+
+.doc-claim {
+  display: inline-block;
+  font-family: var(--sans);
+  font-size: 10px;
+  letter-spacing: .08em;
+  font-weight: 700;
+  color: var(--muted);
+  margin-right: 6px;
+  vertical-align: 2px;
+}
+
+.doc-blk[data-claim="gap"] .doc-claim { color: var(--amber); }
+.doc-blk[data-claim="suggestion"] .doc-claim { color: var(--violet); }
+
+/* 主欄的逐字稿與摘要二選一 */
+.pane-switch { display: inline-flex; gap: 2px; }
+
+.pane-switch button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 11px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.pane-switch button[aria-selected="true"] {
+  background: var(--panel-2);
+  border-color: var(--line);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.pane-switch button:disabled { opacity: .45; cursor: default; }
 
 /* 引用標記只表示來源可回溯，不表示已驗證為真 */
 .cite {
@@ -963,6 +1151,9 @@ svg { display: block; }
 .mrow {
   display: flex;
   align-items: center;
+  /* 命中摘錄要自己佔一行。mrow-main 有 min-width:0 與 flex:1，
+     其餘都是固定寬度的小按鈕，所以只有 mhits 會換行。 */
+  flex-wrap: wrap;
   gap: 6px;
   padding: 7px 8px;
   border-radius: 9px;
@@ -1104,7 +1295,31 @@ svg { display: block; }
   cursor: not-allowed;
 }
 
-.setting-field input:focus-visible { outline: 2px solid var(--live); outline-offset: 1px; }
+.setting-field input:focus-visible,
+.setting-field select:focus-visible { outline: 2px solid var(--live); outline-offset: 1px; }
+
+/* 後端選單佔滿整列：選項文字比一般欄位長，被擠成一欄會截斷 */
+.setting-wide { grid-column: 1 / -1; }
+
+.setting-field select {
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: inherit;
+  font-size: 13px;
+}
+
+.setting-field select:disabled {
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+/* 偵測結果貼在選單下方。不可用的後端用警示色，
+   讓「選得到但用不了」在視覺上就與可用的分開 */
+.setting-field .hint { font-size: 12px; }
+.setting-field .hint[data-ok="false"] { color: var(--amber); }
 
 .setting-actions { display: flex; gap: 8px; }
 
@@ -1140,3 +1355,92 @@ svg { display: block; }
   font: inherit;
   font-size: 12px;
 }
+
+/* 本輪 Prompt：與筆記輸入框同一列，但不搶走它的寬度 —— 記筆記是錄音期間
+   高頻的動作，指定生成方向是低頻的。 */
+.prompt-field { flex: 0 1 min(320px, 40%); }
+
+/* 會議搜尋（§2.1）。命中原因要看得到，否則使用者不知道為什麼是這幾場 */
+.search-field {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+
+.search-field input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  outline: none;
+}
+
+.search-field input::-webkit-search-cancel-button { display: none; }
+
+.mhits {
+  width: 100%;
+  margin: 2px 0 0;
+  padding-left: 11px;
+  border-left: 2px solid var(--line);
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.mhits p {
+  margin: 2px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mhits .num { color: var(--muted); margin-right: 7px; }
+
+.mhit-kind {
+  font-size: 10px;
+  color: var(--violet);
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  padding: 0 6px;
+  margin-right: 6px;
+}
+
+.mhits mark {
+  background: var(--amber-soft);
+  color: var(--amber);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.snap-prompt {
+  grid-column: 1 / -1;
+  font-size: 11.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.snap-reason {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--red);
+}
+
+.snap[data-s="failed"] { cursor: pointer; }
+
+.summarize-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 10px 0 4px;
+}
+
+.summarize-row .note-field { flex: 1; min-width: 0; }

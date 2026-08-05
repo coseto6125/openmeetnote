@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   settings,
+  type BackendOption,
   type FieldSource,
   type ProviderKind,
   type ResolvedProvider,
@@ -73,6 +74,51 @@ function Field({
   );
 }
 
+/** 摘要與 Agent Provider 的後端選單。不可用的項目仍然列出但選不動。 */
+function BackendPicker({
+  value,
+  source,
+  options,
+  onChange,
+}: {
+  value: string;
+  source: FieldSource;
+  options: BackendOption[];
+  onChange: (v: string) => void;
+}) {
+  const locked = source === 'environment';
+  // 環境變數可以指定一個不在偵測清單裡的值，那也要顯示出來，
+  // 否則畫面上的選項與實際生效的設定不一致
+  const known = options.some((o) => o.id === value);
+  const chosen = options.find((o) => o.id === value);
+  return (
+    <label className="setting-field setting-wide">
+      <span className="setting-label">
+        後端
+        <em data-src={source}>{SOURCE_LABEL[source]}</em>
+      </span>
+      <select
+        value={value}
+        disabled={locked}
+        aria-disabled={locked}
+        title={locked ? '這個欄位由環境變數決定，在這裡修改不會生效' : undefined}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        {!known && <option value={value}>{value}（環境變數指定）</option>}
+        {options.map((o) => (
+          <option key={o.id} value={o.id} disabled={!o.available}>
+            {o.label}
+            {o.available ? '' : '（無法使用）'}
+          </option>
+        ))}
+      </select>
+      <span className="hint" data-ok={chosen ? chosen.available : undefined}>
+        {chosen?.detail ?? '偵測中。'}
+      </span>
+    </label>
+  );
+}
+
 interface Draft {
   provider: string;
   model: string;
@@ -82,12 +128,16 @@ interface Draft {
 
 export function SettingsView() {
   const [rows, setRows] = useState<ResolvedProvider[] | null>(null);
+  const [backends, setBackends] = useState<BackendOption[]>([]);
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [status, setStatus] = useState<{ tone: 'ok' | 'bad'; text: string } | null>(null);
 
   const reload = useCallback(async () => {
     try {
-      const r = await settings.get();
+      // 偵測要啟動子行程，比讀設定慢，但兩者一起等：先畫出一個
+      // 還不知道能不能用的選單，只會讓使用者選到一半又被換掉
+      const [r, b] = await Promise.all([settings.get(), settings.backends()]);
+      setBackends(b);
       setRows(r);
       // 草稿從已解析的值起始，包含環境變數提供的值：
       // 使用者看到的就是實際生效的內容
@@ -158,6 +208,13 @@ export function SettingsView() {
       {rows?.map((p) => {
         const d = drafts[p.kind];
         if (!d) return null;
+        // llm 走偵測出來的後端選單；stt 目前只有 fixture 與未來的 Adapter，
+        // 還沒有可偵測的對象，維持自由輸入
+        const picker = p.kind === 'llm';
+        const chosen = picker ? backends.find((o) => o.id === d.provider) : undefined;
+        // 只有 API 後端要金鑰與端點。Agent CLI 用的是使用者在該 CLI 上
+        // 已經完成的登入，這裡再要一次金鑰是多問的
+        const needsKey = picker ? (chosen?.needsSecret ?? false) : true;
         return (
           <section className="panel" key={p.kind}>
             <div className="panel-head">
@@ -170,53 +227,74 @@ export function SettingsView() {
             <p className="hint">{KIND_HINT[p.kind]}</p>
 
             <div className="setting-grid">
-              <Field
-                label="Provider"
-                value={d.provider}
-                source={p.provider.source}
-                placeholder="fixture"
-                onChange={(v) => patch(p.kind, { provider: v })}
-              />
-              <Field
-                label="模型"
-                value={d.model}
-                source={p.model.source}
-                placeholder="留空使用 Provider 預設"
-                onChange={(v) => patch(p.kind, { model: v })}
-              />
-              <Field
-                label="Base URL"
-                value={d.baseUrl}
-                source={p.baseUrl.source}
-                placeholder="OpenAI-compatible 端點，留空使用官方"
-                onChange={(v) => patch(p.kind, { baseUrl: v })}
-              />
-
-              <label className="setting-field">
-                <span className="setting-label">
-                  API Key
-                  <em data-src={p.secret === 'environment' ? 'environment' : 'settings'}>
-                    {SECRET_LABEL[p.secret]}
-                  </em>
-                </span>
-                <input
-                  type="password"
-                  value={d.secret}
-                  autoComplete="off"
-                  placeholder={
-                    p.secret === 'environment'
-                      ? '環境變數已提供，這裡填的值不會被使用'
-                      : p.secret === 'keychain'
-                        ? '已設定。要更換請輸入新的值'
-                        : '輸入後存入系統憑證庫'
-                  }
-                  readOnly={p.secret === 'environment'}
-                  onChange={(e) => patch(p.kind, { secret: e.target.value })}
+              {picker ? (
+                <BackendPicker
+                  value={d.provider}
+                  source={p.provider.source}
+                  options={backends}
+                  onChange={(v) => patch(p.kind, { provider: v })}
                 />
-              </label>
+              ) : (
+                <Field
+                  label="Provider"
+                  value={d.provider}
+                  source={p.provider.source}
+                  placeholder="fixture"
+                  onChange={(v) => patch(p.kind, { provider: v })}
+                />
+              )}
+
+              {needsKey && (
+                <>
+                  <Field
+                    label="模型"
+                    value={d.model}
+                    source={p.model.source}
+                    placeholder="留空使用 Provider 預設"
+                    onChange={(v) => patch(p.kind, { model: v })}
+                  />
+                  <Field
+                    label="Base URL"
+                    value={d.baseUrl}
+                    source={p.baseUrl.source}
+                    placeholder="OpenAI-compatible 端點，留空使用官方"
+                    onChange={(v) => patch(p.kind, { baseUrl: v })}
+                  />
+
+                  <label className="setting-field">
+                    <span className="setting-label">
+                      API Key
+                      <em data-src={p.secret === 'environment' ? 'environment' : 'settings'}>
+                        {SECRET_LABEL[p.secret]}
+                      </em>
+                    </span>
+                    <input
+                      type="password"
+                      value={d.secret}
+                      autoComplete="off"
+                      placeholder={
+                        p.secret === 'environment'
+                          ? '環境變數已提供，這裡填的值不會被使用'
+                          : p.secret === 'keychain'
+                            ? '已設定。要更換請輸入新的值'
+                            : '輸入後存入系統憑證庫'
+                      }
+                      readOnly={p.secret === 'environment'}
+                      onChange={(e) => patch(p.kind, { secret: e.target.value })}
+                    />
+                  </label>
+                </>
+              )}
             </div>
 
-            {p.secret === 'unavailable' && (
+            {picker && !needsKey && (
+              <p className="hint">
+                這個後端用你在該 CLI 上已完成的登入，不需要在這裡填金鑰。生成失敗時
+                （未登入、額度用盡）會回報為 Provider 錯誤，錄音與逐字稿不受影響。
+              </p>
+            )}
+
+            {needsKey && p.secret === 'unavailable' && (
               <div className="banner" data-tone="warn" role="status">
                 <span>
                   <b>這台機器沒有可用的系統憑證庫</b>
@@ -232,13 +310,15 @@ export function SettingsView() {
               <button className="btn btn-primary" onClick={() => void save(p.kind)}>
                 儲存
               </button>
-              <button
-                className="btn"
-                disabled={p.secret !== 'keychain'}
-                onClick={() => void clearSecret(p.kind)}
-              >
-                移除密鑰
-              </button>
+              {(needsKey || p.secret === 'keychain') && (
+                <button
+                  className="btn"
+                  disabled={p.secret !== 'keychain'}
+                  onClick={() => void clearSecret(p.kind)}
+                >
+                  移除密鑰
+                </button>
+              )}
             </div>
           </section>
         );

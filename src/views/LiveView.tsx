@@ -15,6 +15,7 @@ import {
 } from '../session';
 import type { Degrade, MeetingModel, Snapshot, Speaker } from '../meeting';
 import { Spine, type SpinePause } from '../components/Spine';
+import { DocumentView, type CitedSegment } from '../components/DocumentView';
 
 /**
  * 語者的顯示樣式。
@@ -49,24 +50,16 @@ export interface LiveViewProps {
   setLocalDegrade: (d: Degrade | null) => void;
 }
 
-/** 從已存的區塊取出可顯示的文字。content 是該 kind 的 JSON（§10）。 */
-function plainText(b: DocumentBlock): string {
-  try {
-    const c = JSON.parse(b.content) as Record<string, unknown>;
-    if (typeof c.text === 'string') return c.text;
-    if (Array.isArray(c.items)) return (c.items as string[]).join('；');
-    if (typeof c.title === 'string') return c.title;
-    return b.content;
-  } catch {
-    // 解不開就顯示原文，總比顯示空白讓人以為沒東西好
-    return b.content;
-  }
-}
-
 export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: LiveViewProps) {
   const [rejectedSpeakers, setRejectedSpeakers] = useState<string[]>([]);
   const [noteDraft, setNoteDraft] = useState('');
+  // 本輪 Prompt 決定這一版文件的方向（§17.6）。送出後清掉：下一版通常
+  // 要問的是別的事，留著上一輪的要求會讓人以為它還在生效。
+  const [promptDraft, setPromptDraft] = useState('');
   const [blocks, setBlocks] = useState<DocumentBlock[]>([]);
+  // 逐字稿與摘要共用主欄。摘要值得整個欄寬，而兩者同時看得到並沒有用處：
+  // 讀摘要的時候要的是引用能跳回去，那由引用自己負責切換。
+  const [pane, setPane] = useState<'transcript' | 'document'>('transcript');
   const [naming, setNaming] = useState<string | null>(null);
   // 受控輸入。非受控的話 blur 讀到的值取決於瀏覽器何時同步 DOM，
   // 而 HistoryView 的改名本來就是受控的，兩處不該有兩種寫法。
@@ -77,9 +70,12 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
   /* ── 捲動只在使用者已在底部時跟隨 ───────────────────────── */
 
   useEffect(() => {
+    // 逐字稿被 hidden 起來時 scrollHeight 是 0，這時候貼底等於捲到最上面。
+    // 把 pane 放進相依項，切回來的那一次繪製會重新貼底。
+    if (pane !== 'transcript') return;
     const el = streamRef.current;
     if (el && stickRef.current) el.scrollTop = el.scrollHeight;
-  }, [model.segments]);
+  }, [model.segments, pane]);
 
   const onStreamScroll = () => {
     const el = streamRef.current;
@@ -107,8 +103,13 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
   const active = model.snapshots.find(
     (s) => s.version === model.activeVersion && s.state === 'completed',
   );
+  // 新版本以最後一個成功的版本為基礎（§5.5）。使用者要知道自己是在改哪一版，
+  // 否則「補上行動項目」這種要求看起來像是要重新生一份。
+  const baseVersion = [...model.snapshots].reverse().find((s) => s.state === 'completed');
   const degrade = localDegrade ?? model.degrade;
   const live = model.state === 'recording' || model.state === 'paused';
+  /// 結束之後仍可建立摘要：最常見的流程就是開完會才要，那時內容才完整。
+  const canSnapshot = live || model.state === 'completed';
 
   // 暫定名稱來自 §8.3 的自我介紹推定，目前沒有生產者，因此這個清單通常是空的。
   // 保留這條路徑是為了讓 M3 接上時不必重寫確認流程。
@@ -180,6 +181,20 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
     };
   }, [model.activeVersion]);
 
+  const submitSnapshot = () => {
+    void commands.createSnapshot(promptDraft);
+    setPromptDraft('');
+  };
+
+  /** 失敗的版本用同一段要求再跑一次。
+   *
+   * 這是新的一版而不是把那一版救回來：版本是一條線性歷史，重跑一次改寫
+   * 舊版本會讓「v2 是什麼」有兩個答案。使用者要的其實是不必重打要求。
+   */
+  const retry = (prompt: string) => {
+    void commands.createSnapshot(prompt);
+  };
+
   const submitNote = async () => {
     const text = noteDraft.trim();
     if (!text) return;
@@ -198,14 +213,38 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
     }
   };
 
+  const scrollToSegment = (id: string) => {
+    stickRef.current = false;
+    // 切換分頁之後 DOM 還沒換，捲動要等這一輪繪製完
+    requestAnimationFrame(() =>
+      document.getElementById(`seg-${id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }),
+    );
+  };
+
   const seek = (ms: number) => {
     const target =
       model.segments.find((s) => s.meetingTimeMs >= ms) ??
       model.segments[model.segments.length - 1];
     if (!target) return;
-    stickRef.current = false;
-    document.getElementById(`seg-${target.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    setPane('transcript');
+    scrollToSegment(String(target.id));
   };
+
+  /** 點引用就跳回被引用的那一段逐字稿，這是引用唯一的用途。 */
+  const followCite = (sourceId: string) => {
+    setPane('transcript');
+    scrollToSegment(sourceId);
+  };
+
+  const citedSegments: CitedSegment[] = useMemo(
+    () =>
+      model.segments.map((s) => ({
+        id: String(s.id),
+        meetingTimeMs: s.meetingTimeMs,
+        revision: s.revision,
+      })),
+    [model.segments],
+  );
 
   return (
     <>
@@ -229,8 +268,26 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
 
         <main className="stream-wrap">
           <div className="stream-head">
-            <span className="seg-label">逐字稿</span>
-            <span className="count num">{finalCount} 段已定稿</span>
+            <div className="pane-switch" role="tablist" aria-label="主欄內容">
+              <button
+                role="tab"
+                aria-selected={pane === 'transcript'}
+                onClick={() => setPane('transcript')}
+              >
+                逐字稿
+                <span className="count num">{finalCount}</span>
+              </button>
+              <button
+                role="tab"
+                aria-selected={pane === 'document'}
+                onClick={() => setPane('document')}
+                disabled={!active}
+                title={active ? undefined : '還沒有完成的摘要版本'}
+              >
+                摘要
+                {active && <span className="count num">v{active.version}</span>}
+              </button>
+            </div>
             <span className="spacer" />
             <span className="lag">
               錄音 <span className="num">{mmss(model.capturedAudioMs)}</span>
@@ -240,7 +297,30 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
             </span>
           </div>
 
-          <div className="stream" ref={streamRef} onScroll={onStreamScroll} tabIndex={0}>
+          {pane === 'document' && (
+            <div className="stream doc-pane" tabIndex={0}>
+              {active && (
+                <p className="doc-meta num">
+                  v{active.version}・涵蓋至 seq {active.throughEventSeq}・
+                  {mmss(active.meetingTimeMs)}
+                  {lagMs > 1500 && <>・之後還有 {mmss(lagMs)} 未涵蓋</>}
+                </p>
+              )}
+              {blocks.length === 0 ? (
+                <p className="empty">這個版本沒有通過驗證的區塊。</p>
+              ) : (
+                <DocumentView blocks={blocks} segments={citedSegments} onCite={followCite} />
+              )}
+            </div>
+          )}
+
+          <div
+            className="stream"
+            ref={streamRef}
+            onScroll={onStreamScroll}
+            tabIndex={0}
+            hidden={pane !== 'transcript'}
+          >
             {streamRows.map((row, i) => {
               if (row.type === 'coverage') {
                 return (
@@ -309,8 +389,27 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
             <button className="btn" onClick={submitNote} disabled={!live || !noteDraft.trim()}>
               記下
             </button>
-            <button className="btn btn-primary" onClick={() => commands.createSnapshot()} disabled={!live}>
-              建立摘要快照
+            <label className="note-field prompt-field">
+              {/* placeholder 不是名稱：螢幕閱讀器唸不到它，而這個欄位在
+                  accessibility tree 上會變成一個沒有標籤的「編輯」。 */}
+              <span className="sr-only">本輪要求</span>
+              <input
+                aria-label="本輪要求"
+                value={promptDraft}
+                onChange={(e) => setPromptDraft(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && submitSnapshot()}
+                placeholder={
+                  baseVersion
+                    ? `要改什麼？會在 v${baseVersion.version} 的基礎上修訂`
+                    : '這一版想要什麼？留空由 AI 自行規劃'
+                }
+                autoComplete="off"
+                disabled={!canSnapshot}
+              />
+            </label>
+            {/* 結束之後仍可建立：最常見的流程就是開完會才要摘要 */}
+            <button className="btn btn-primary" onClick={submitSnapshot} disabled={!canSnapshot}>
+              {baseVersion ? `修訂為 v${baseVersion.version + 1}` : '建立摘要快照'}
             </button>
           </div>
         </main>
@@ -450,10 +549,22 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
             {model.snapshots.map((s) => (
               <button
                 className="snap"
+                data-s={s.state}
                 key={s.version}
                 aria-current={s.version === model.activeVersion}
-                onClick={() =>
-                  s.state === 'completed' && setModel((m) => ({ ...m, activeVersion: s.version }))
+                onClick={() => {
+                  // 失敗的版本沒有內容可看，點它是想再跑一次
+                  if (s.state === 'failed' && canSnapshot) {
+                    retry(s.prompt);
+                    return;
+                  }
+                  if (s.state !== 'completed') return;
+                  setModel((m) => ({ ...m, activeVersion: s.version }));
+                  // 點版本就是想看那一版，不必再點一次分頁
+                  setPane('document');
+                }}
+                title={
+                  s.state === 'failed' ? '再跑一次，沿用這一版的要求' : undefined
                 }
               >
                 <span className="snap-v num">v{s.version}</span>
@@ -463,43 +574,19 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                 <span className="snap-state" data-s={s.state}>
                   {{ completed: '已完成', running: '生成中', queued: '排隊中', failed: '失敗' }[s.state]}
                 </span>
+                {/* 本輪要求。沒有它，多個版本在畫面上看起來一模一樣，
+                    使用者無從知道哪一版問的是什麼 */}
+                {s.prompt && <span className="snap-prompt">「{s.prompt}」</span>}
+                {s.state === 'failed' && s.reason && (
+                  <span className="snap-reason">{s.reason}</span>
+                )}
               </button>
             ))}
 
+            {/* 沒有「開啟」按鈕：點版本就會切到主欄，主欄上方的分頁也隨時
+                回得去，再放一顆做同一件事的按鈕只是多一個要讀的東西。 */}
             {active && blocks.length === 0 && (
               <p className="hint">這個版本沒有通過驗證的區塊。</p>
-            )}
-{active && blocks.length > 0 && (
-              <div className="claims">
-                {blocks.map((b) => (
-                  <div className="claim" key={b.position} data-kind={b.claimKind}>
-                    <span className="claim-kind">{b.claimKind}</span>
-                    {plainText(b)}
-                    {b.sourceRefs.map((r, i) => {
-                      // 這個片段在生成之後又被改過，引用指向的內容已不是當時看到的
-                      const stale =
-                        r.sourceKind === 'transcript_segment' &&
-                        model.segments.some(
-                          (seg) => String(seg.id) === r.sourceId && seg.revision > r.sourceRevision,
-                        );
-                      return (
-                        <span
-                          className="cite num"
-                          key={i}
-                          data-stale={stale ? '1' : '0'}
-                          title={
-                            stale
-                              ? '此引用依據的片段已被修訂，內容可能與生成當時不同'
-                              : '來源可回溯，不代表此陳述已被驗證為真'
-                          }
-                        >
-                          seg {r.sourceId} r{r.sourceRevision}
-                        </span>
-                      );
-                    })}
-                  </div>
-                ))}
-              </div>
             )}
           </section>
 

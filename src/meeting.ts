@@ -51,6 +51,8 @@ export interface Snapshot {
   meetingTimeMs: number;
   state: 'queued' | 'running' | 'completed' | 'failed';
   reason?: string;
+  /** 本輪要求。空字串代表使用者沒填，交給 AI 自行規劃。 */
+  prompt: string;
 }
 
 export interface Pause {
@@ -237,6 +239,7 @@ function applyEvent(m: MeetingModel, ev: SessionEvent, batch: SessionEventBatch)
                 throughEventSeq: ev.throughEventSeq,
                 meetingTimeMs: ev.meetingTimeMs,
                 state: 'running',
+                prompt: ev.prompt,
               },
             ],
           };
@@ -262,6 +265,9 @@ function applyEvent(m: MeetingModel, ev: SessionEvent, batch: SessionEventBatch)
               ...m.snapshots,
               {
                 version: ev.version,
+                // 沒收到 snapshotCreated 就先收到失敗，這是重新同步時可能
+                // 出現的順序。要求與游標都補不出來，留白比編一個好
+                prompt: '',
                 throughEventSeq: 0,
                 meetingTimeMs: batch.meetingTimeMs,
                 state: 'failed',
@@ -359,6 +365,7 @@ export function fromProjection(m: MeetingModel, p: SessionProjection): MeetingMo
       throughEventSeq: s.throughEventSeq,
       meetingTimeMs: s.meetingTimeMs,
       state: s.state,
+      prompt: s.prompt,
     })),
     pauses: p.pauses.map((x) => ({ fromMs: x.fromMs, toMs: x.toMs })),
     activeVersion:

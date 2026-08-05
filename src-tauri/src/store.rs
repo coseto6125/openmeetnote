@@ -133,7 +133,13 @@ pub struct SourceRef {
     pub source_revision: u32,
     pub locator: String,
     pub quoted_text: String,
+    /// 引文的雜湊。Planner 不必提供：要模型算 SHA256 只會拿到瞎編的值，
+    /// 系統收到區塊後自己算才有意義（§9.6）。
+    #[serde(default)]
     pub quoted_text_sha256: String,
+    /// 驗證結果。同樣由系統填，模型提供的值一律被覆蓋 —— 讓被驗證者
+    /// 自己宣告驗證通過，那個驗證就不存在。
+    #[serde(default)]
     pub validation_status: String,
 }
 
@@ -340,6 +346,27 @@ pub struct MeetingSummary {
     pub document_count: u64,
 }
 
+/// 一場命中搜尋的會議，連同它為什麼命中。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingHit {
+    pub summary: MeetingSummary,
+    /// 命中的上下文，最多 `max_excerpts` 筆
+    pub excerpts: Vec<SearchExcerpt>,
+    /// 這場會議一共命中幾處。摘錄被截斷時使用者仍要知道還有多少
+    pub total_hits: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchExcerpt {
+    /// `transcript` 或 `note`
+    pub kind: String,
+    pub segment_id: Option<u64>,
+    pub meeting_time_ms: u64,
+    pub text: String,
+}
+
 /// 重開會議所需的全部投影內容。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -372,6 +399,12 @@ pub struct StoredNote {
     pub text: String,
     pub meeting_time_ms: u64,
     pub captured_audio_ms: u64,
+    /// 建立這筆筆記的事件序號。
+    ///
+    /// 引用驗證要求 `source_revision` 等於它（筆記沒有 revision 的概念，
+    /// event_seq 就是它的版本）。不把這個值送給模型，模型就永遠組不出一筆
+    /// 通得過驗證的筆記引用 —— 而 §17 完成定義第 5 點要求筆記可被引用。
+    pub event_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -624,6 +657,68 @@ impl Store {
         Ok(())
     }
 
+    /// 把上次沒有正常結束的會議收尾（BLUEPRINT.md §13）。
+    ///
+    /// app 被強制關閉或崩潰時，會議的狀態會停在 `recording` 或 `paused`。
+    /// 不處理的話歷史頁會永遠顯示一場「進行中」的會議，而使用者按不到任何
+    /// 可以結束它的按鈕 —— 那是「畫面說有、磁碟說沒有」的另一種形狀。
+    ///
+    /// 標成 `failed` 而不是 `completed`：那場會議確實沒有正常走完，逐字稿
+    /// 可能停在半句話。混進正常結束的會議裡，使用者就沒有機會知道哪一場
+    /// 的內容是不完整的。已經寫進去的片段、筆記與摘要全部保留。
+    ///
+    /// 回傳被收尾的會議數，供啟動日誌記錄。
+    pub fn close_abandoned_meetings(&mut self) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE meetings
+                SET state = 'failed',
+                    ended_at = COALESCE(ended_at, ?1)
+              WHERE state IN ('recording', 'paused', 'stopping', 'finalizing')",
+            [crate::clock::now_utc()],
+        )?;
+        Ok(n)
+    }
+
+    /// 這場會議的標題。
+    ///
+    /// 匯出檔的 `<title>` 與 `<h1>` 用它，而不是 `documents.title`：後者一律是
+    /// 「會議摘要」，於是每一份匯出檔看起來都一樣，瀏覽器分頁上也分不出誰是誰。
+    /// 會議標題是使用者改得動的那一個，這裡就該用它。
+    pub fn meeting_title(&self, meeting: MeetingId) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT title FROM meetings WHERE id = ?1",
+                params![meeting],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NoSuchMeeting(meeting))
+    }
+
+    /// 快照游標之後又寫入了幾筆**內容**事件。
+    ///
+    /// 這是 §9.2 第五步要回答的問題之一：成果之外還有沒有東西，而那是系統
+    /// 知道、模型不知道的事實。
+    ///
+    /// 只數逐字稿與筆記，不數 `high_seq` 的差。快照本身會記一筆
+    /// `SnapshotCreated`、生成完成再記一筆 `GenerationCompleted`，兩者的 seq
+    /// 都在游標之後，拿事件總數來比的話每一份成果都會被標上一個不存在的缺口。
+    pub fn content_events_after(&self, meeting: MeetingId, seq: u64) -> Result<u64> {
+        const CONTENT: [&str; 4] = [
+            "TranscriptSegmentFinalized",
+            "TranscriptSegmentRevised",
+            "TranscriptSegmentEdited",
+            "NoteAdded",
+        ];
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM meeting_events
+              WHERE meeting_id = ?1 AND seq > ?2
+                AND kind IN (?3, ?4, ?5, ?6)",
+            params![meeting, seq as i64, CONTENT[0], CONTENT[1], CONTENT[2], CONTENT[3]],
+            |r| r.get::<_, i64>(0),
+        )? as u64)
+    }
+
     pub fn list_meetings(&self) -> Result<Vec<MeetingSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.title, m.state, m.started_at, m.ended_at,
@@ -636,6 +731,125 @@ impl Store {
         )?;
         let rows = stmt.query_map([], row_to_summary)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 跨會議搜尋標題、逐字稿與人工筆記（§2.1）。
+    ///
+    /// 走 `LIKE` 掃描而不是 FTS5：全文索引要靠觸發器或事件重播維護，而
+    /// `meeting_events` 是唯一真實來源，多一份得同步的衍生狀態就多一種它
+    /// 與事實不一致的方式。
+    ///
+    /// 規模也不支持那個成本。實測（debug build，13 萬列，相當於 50 場兩小時
+    /// 會議）：一般查詢 40 ms，每一列都命中的最壞情況 174 ms。前端有 200 ms
+    /// 去抖，使用者感覺得到的是輸入停下之後的那一次。`probe_how_long_a_like_scan_takes_at_realistic_scale`
+    /// 守著這個判斷，超過 500 ms 就紅燈，那時才該換索引。
+    ///
+    /// 空字串回空結果而不是全部：呼叫端在沒有查詢字串時該顯示完整清單，
+    /// 那是另一條路徑，不該由搜尋函式假裝自己是它。
+    pub fn search_meetings(&self, query: &str, max_excerpts: usize) -> Result<Vec<MeetingHit>> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        // LIKE 的萬用字元要跳脫，否則使用者搜「100%」會match到任何東西
+        let escaped = q
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+
+        let mut hits: std::collections::HashMap<MeetingId, (Vec<SearchExcerpt>, u32)> =
+            std::collections::HashMap::new();
+        let mut add = |meeting: MeetingId, excerpt: SearchExcerpt| {
+            let e = hits.entry(meeting).or_default();
+            e.1 += 1;
+            if e.0.len() < max_excerpts {
+                e.0.push(excerpt);
+            }
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT r.meeting_id, r.segment_id, r.meeting_start_ms, r.text
+               FROM transcript_segments s
+               JOIN transcript_segment_revisions r
+                 ON r.meeting_id = s.meeting_id
+                AND r.segment_id = s.id
+                AND r.revision   = s.current_revision
+              WHERE r.text LIKE ?1 ESCAPE '\\'
+              ORDER BY r.meeting_id, s.meeting_start_ms",
+        )?;
+        let rows = stmt.query_map(params![pattern], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)? as u64,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (meeting, segment_id, at, text) = row?;
+            add(
+                meeting,
+                SearchExcerpt {
+                    kind: "transcript".into(),
+                    segment_id: Some(segment_id as u64),
+                    meeting_time_ms: at,
+                    text,
+                },
+            );
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT meeting_id, meeting_time_ms, text
+               FROM notes
+              WHERE removed = 0 AND text LIKE ?1 ESCAPE '\\'
+              ORDER BY meeting_id, meeting_time_ms",
+        )?;
+        let rows = stmt.query_map(params![pattern], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (meeting, at, text) = row?;
+            add(
+                meeting,
+                SearchExcerpt {
+                    kind: "note".into(),
+                    segment_id: None,
+                    meeting_time_ms: at,
+                    text,
+                },
+            );
+        }
+
+        // 標題命中不附摘錄：標題本來就顯示在結果列上，再抄一次是雜訊。
+        // 但它必須讓那場會議進入結果，否則「用會議名稱找會議」會找不到。
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM meetings WHERE title LIKE ?1 ESCAPE '\\'")?;
+        let rows = stmt.query_map(params![pattern], |r| r.get::<_, i64>(0))?;
+        for row in rows {
+            hits.entry(row?).or_default();
+        }
+
+        // 排序與清單一致：最近的在前。使用者對「上週那場」的記憶是時間，
+        // 不是相關性分數。
+        let out: Vec<MeetingHit> = self
+            .list_meetings()?
+            .into_iter()
+            .filter_map(|summary| {
+                hits.remove(&summary.id)
+                    .map(|(excerpts, total_hits)| MeetingHit {
+                        summary,
+                        excerpts,
+                        total_hits,
+                    })
+            })
+            .collect();
+        Ok(out)
     }
 
     pub fn meeting(&self, meeting: MeetingId) -> Result<MeetingDetail> {
@@ -684,7 +898,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut stmt = self.conn.prepare(
-            "SELECT id, text, meeting_time_ms, captured_audio_ms
+            "SELECT id, text, meeting_time_ms, captured_audio_ms, event_seq
              FROM notes WHERE meeting_id = ?1 AND removed = 0 ORDER BY meeting_time_ms, id",
         )?;
         let notes = stmt
@@ -694,6 +908,7 @@ impl Store {
                     text: r.get(1)?,
                     meeting_time_ms: r.get::<_, i64>(2)? as u64,
                     captured_audio_ms: r.get::<_, i64>(3)? as u64,
+                    event_seq: r.get::<_, i64>(4)? as u64,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -887,7 +1102,7 @@ impl Store {
         through_event_seq: u64,
     ) -> Result<Vec<StoredNote>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, text, meeting_time_ms, captured_audio_ms
+            "SELECT id, text, meeting_time_ms, captured_audio_ms, event_seq
              FROM notes WHERE meeting_id = ?1 AND removed = 0 AND event_seq <= ?2
              ORDER BY meeting_time_ms, id",
         )?;
@@ -897,6 +1112,7 @@ impl Store {
                 text: r.get(1)?,
                 meeting_time_ms: r.get::<_, i64>(2)? as u64,
                 captured_audio_ms: r.get::<_, i64>(3)? as u64,
+                event_seq: r.get::<_, i64>(4)? as u64,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1054,6 +1270,75 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// 把上次沒跑完的生成收尾。
+    ///
+    /// app 在生成途中被關掉，那筆 run 會永遠停在 `running`：歷史頁顯示
+    /// 「生成中」，沒有重試入口，而它其實早就沒人在等了。Session 那條路徑
+    /// 有 `abandon_running_generations` 處理換會議的情況，但它是記憶體裡的
+    /// 東西，程式關掉就跟著沒了。
+    ///
+    /// 寫成事件而不是直接 UPDATE：`rebuild_projections` 會重播事件，
+    /// 只改投影的話重建一次就又變回「生成中」。
+    ///
+    /// 回傳被收尾的筆數，供啟動日誌記錄。
+    pub fn close_abandoned_runs(&mut self) -> Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.meeting_id, g.id
+               FROM generation_runs g
+               JOIN documents d ON d.id = g.document_id
+              WHERE g.status IN ('queued', 'running')",
+        )?;
+        let orphans: Vec<(MeetingId, i64)> = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+
+        for (meeting, run_id) in &orphans {
+            self.append(
+                *meeting,
+                &[(
+                    DomainEvent::GenerationFailed {
+                        run_id: *run_id,
+                        reason: "上次的生成沒有跑完就結束了，請再試一次。".into(),
+                    },
+                    crate::model::Timeline::default(),
+                )],
+            )?;
+        }
+        Ok(orphans.len())
+    }
+
+    /// 這場會議寫到第幾號事件。
+    ///
+    /// 為已結束的會議建立摘要時，這就是快照游標：不會再有新事件，涵蓋到這裡
+    /// 就是涵蓋整場。判斷「游標之後還有沒有內容」不要用它，用
+    /// `content_events_after` —— 快照自己的紀錄也會推進這個值。
+    pub fn high_seq(&self, meeting: MeetingId) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT high_seq FROM meetings WHERE id = ?1",
+                params![meeting],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NoSuchMeeting(meeting))? as u64)
+    }
+
+    /// 這場會議既有的文件 id。同一場會議只產生一份文件，版本鏈掛在它下面。
+    ///
+    /// 回 `None` 代表這場會議還沒有任何摘要，呼叫端要配一個新的 document_id。
+    pub fn document_of(&self, meeting: MeetingId) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM documents WHERE meeting_id = ?1",
+                params![meeting],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?)
     }
 
     /// 全域 rowid 的目前上限，供 Session 配發新 id。
@@ -1668,6 +1953,82 @@ mod tests {
     use super::*;
     use crate::db;
 
+    /// 狀態變更走事件，這是唯一的路徑
+    fn set_state(s: &mut Store, m: MeetingId, state: MeetingState) {
+        s.append(
+            m,
+            &[(
+                DomainEvent::MeetingStateChanged { state },
+                Timeline::new(0, 0),
+            )],
+        )
+        .unwrap();
+    }
+
+    fn recording(s: &mut Store, m: MeetingId) {
+        set_state(s, m, MeetingState::Recording);
+    }
+
+    #[test]
+    fn test_an_abandoned_recording_is_closed_as_failed_not_completed() {
+        // app 被強制關閉後狀態會停在 recording。標成 completed 會讓一場
+        // 逐字稿可能斷在半句話的會議看起來跟正常結束的一樣。
+        let (mut s, m) = store();
+        recording(&mut s, m);
+
+        assert_eq!(s.close_abandoned_meetings().unwrap(), 1);
+        let listed = s.list_meetings().unwrap();
+        let found = listed.iter().find(|x| x.id == m).unwrap();
+        assert_eq!(found.state, MeetingState::Failed);
+        assert!(found.ended_at.is_some(), "沒有補上結束時間");
+    }
+
+    #[test]
+    fn test_closing_abandoned_meetings_leaves_finished_ones_alone() {
+        let (mut s, m) = store();
+        set_state(&mut s, m, MeetingState::Completed);
+        assert_eq!(
+            s.close_abandoned_meetings().unwrap(),
+            0,
+            "動到了已結束的會議"
+        );
+    }
+
+    #[test]
+    fn test_closing_abandoned_meetings_is_idempotent() {
+        // 每次啟動都會跑一次，第二次不該再動任何東西
+        let (mut s, m) = store();
+        set_state(&mut s, m, MeetingState::Paused);
+        assert_eq!(s.close_abandoned_meetings().unwrap(), 1);
+        assert_eq!(s.close_abandoned_meetings().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_an_abandoned_meeting_keeps_its_transcript() {
+        // 收尾只改狀態。內容全部保留，否則使用者會連殘缺的紀錄都拿不到。
+        let (mut s, m) = store();
+        let seq = *s
+            .append(
+                m,
+                &[(
+                    DomainEvent::TranscriptSegmentFinalized {
+                        segment: seg(1, 1, "會議中斷前說的話", Origin::Provider),
+                    },
+                    Timeline::new(0, 0),
+                )],
+            )
+            .unwrap()
+            .last()
+            .unwrap();
+        recording(&mut s, m);
+        s.close_abandoned_meetings().unwrap();
+
+        // 用實際的序號，不是 u64::MAX —— 那個值進 SQLite 會溢位成 -1
+        let segs = s.segments_through(m, seq).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "會議中斷前說的話");
+    }
+
     fn store() -> (Store, MeetingId) {
         let mut s = Store::new(db::open_in_memory().unwrap());
         let m = s.create_meeting("測試會議").unwrap();
@@ -2140,6 +2501,257 @@ mod tests {
             s.rebuild_projections(m),
             Err(StoreError::Corrupt { seq: 1, .. })
         ));
+    }
+
+    #[test]
+    fn a_generation_killed_mid_flight_does_not_stay_running_forever() {
+        // app 在生成途中被關掉，那筆 run 會停在 running：歷史頁顯示「生成中」，
+        // 沒有重試入口，而它早就沒人在等了
+        let (mut s, m) = store();
+        s.append(
+            m,
+            &[(
+                DomainEvent::SnapshotCreated {
+                    document_id: 1,
+                    run_id: 1,
+                    parent_run_id: None,
+                    version_no: 1,
+                    purpose: "meeting-summary".into(),
+                    title: "會議摘要".into(),
+                    through_event_seq: 0,
+                    prompt: String::new(),
+                },
+                tl(0),
+            )],
+        )
+        .unwrap();
+        assert_eq!(s.runs(m).unwrap()[0].status, "running");
+
+        assert_eq!(s.close_abandoned_runs().unwrap(), 1);
+        let run = s.runs(m).unwrap().into_iter().next().unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run.failure_reason.is_some(), "沒有說明為什麼失敗");
+
+        // 寫成事件而不是只改投影：重建投影之後不該又變回「生成中」
+        s.rebuild_projections(m).unwrap();
+        assert_eq!(s.runs(m).unwrap()[0].status, "failed");
+
+        // 已經收尾過的不會再被收一次
+        assert_eq!(s.close_abandoned_runs().unwrap(), 0);
+    }
+
+    #[test]
+    fn the_export_title_follows_the_name_the_user_gave_the_meeting() {
+        // 匯出檔的 <title> 與 <h1> 用這個值。先前用的是 documents.title，
+        // 而那一律是「會議摘要」，於是每一份匯出檔在瀏覽器分頁上都分不出誰是誰。
+        let (mut s, m) = store();
+        assert_eq!(s.meeting_title(m).unwrap(), "測試會議");
+        s.rename_meeting(m, "八月預算審查").unwrap();
+        assert_eq!(s.meeting_title(m).unwrap(), "八月預算審查");
+    }
+
+    /* ── 跨會議搜尋（§2.1） ───────────────────────────────────── */
+
+    fn searchable() -> Store {
+        let mut s = Store::new(db::open_in_memory().unwrap());
+        let a = s.create_meeting("報價討論").unwrap();
+        s.append(
+            a,
+            &[
+                (
+                    DomainEvent::TranscriptSegmentFinalized {
+                        segment: seg(1, 1, "維運的月費區間下週給你", Origin::Provider),
+                    },
+                    tl(1000),
+                ),
+                (
+                    DomainEvent::NoteAdded {
+                        note_id: 1,
+                        text: "記得追維運報價".into(),
+                    },
+                    tl(2000),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let b = s.create_meeting("預算審查").unwrap();
+        s.append(
+            b,
+            &[(
+                DomainEvent::TranscriptSegmentFinalized {
+                    segment: seg(1, 1, "決議凍結兩百萬元", Origin::Provider),
+                },
+                tl(1000),
+            )],
+        )
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn search_finds_a_meeting_by_what_was_said_in_it() {
+        let s = searchable();
+        let hits = s.search_meetings("月費", 3).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].summary.title, "報價討論");
+        // 命中原因要回得出來，否則使用者不知道為什麼是這一場
+        assert_eq!(hits[0].excerpts[0].kind, "transcript");
+        assert!(hits[0].excerpts[0].text.contains("月費"));
+    }
+
+    #[test]
+    fn search_covers_notes_and_titles_not_just_the_transcript() {
+        let s = searchable();
+        // 只出現在筆記裡
+        let by_note = s.search_meetings("記得追", 3).unwrap();
+        assert_eq!(by_note.len(), 1);
+        assert_eq!(by_note[0].excerpts[0].kind, "note");
+
+        // 只出現在標題裡。標題已經顯示在結果列上，不另外附摘錄
+        let by_title = s.search_meetings("預算審查", 3).unwrap();
+        assert_eq!(by_title.len(), 1);
+        assert!(by_title[0].excerpts.is_empty());
+    }
+
+    #[test]
+    fn search_counts_every_hit_even_when_it_only_returns_a_few() {
+        let mut s = Store::new(db::open_in_memory().unwrap());
+        let m = s.create_meeting("很多次").unwrap();
+        let events: Vec<_> = (1..=5u64)
+            .map(|i| {
+                (
+                    DomainEvent::TranscriptSegmentFinalized {
+                        segment: seg(i, 1, "報價", Origin::Provider),
+                    },
+                    tl(i * 1000),
+                )
+            })
+            .collect();
+        s.append(m, &events).unwrap();
+
+        let hits = s.search_meetings("報價", 2).unwrap();
+        assert_eq!(hits[0].excerpts.len(), 2, "摘錄沒有被截斷");
+        assert_eq!(hits[0].total_hits, 5, "截斷之後就數不出總數了");
+    }
+
+    #[test]
+    fn search_treats_wildcards_as_literal_characters() {
+        // 使用者搜「100%」時，未跳脫的 % 會讓 LIKE 命中所有東西
+        let mut s = Store::new(db::open_in_memory().unwrap());
+        let m = s.create_meeting("百分比").unwrap();
+        s.append(
+            m,
+            &[(
+                DomainEvent::TranscriptSegmentFinalized {
+                    segment: seg(1, 1, "毛利大概三成", Origin::Provider),
+                },
+                tl(1000),
+            )],
+        )
+        .unwrap();
+        assert!(
+            s.search_meetings("%", 3).unwrap().is_empty(),
+            "% 被當成萬用字元"
+        );
+        assert!(
+            s.search_meetings("_", 3).unwrap().is_empty(),
+            "_ 被當成萬用字元"
+        );
+        assert!(
+            s.search_meetings("三成", 3).unwrap().len() == 1,
+            "正常字串搜不到"
+        );
+    }
+
+    #[test]
+    fn search_only_sees_the_current_revision_of_a_segment() {
+        // 修訂過的片段，搜舊內容不該把它挖出來：使用者看到的逐字稿是新版，
+        // 命中一段畫面上不存在的文字只會讓人以為程式壞了
+        let (mut s, m) = store();
+        s.append(
+            m,
+            &[
+                (
+                    DomainEvent::TranscriptSegmentFinalized {
+                        segment: seg(1, 1, "達物族的傳統領域", Origin::Provider),
+                    },
+                    tl(1000),
+                ),
+                (
+                    DomainEvent::TranscriptSegmentRevised {
+                        segment: seg(1, 2, "達悟族的傳統領域", Origin::User),
+                    },
+                    tl(2000),
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(
+            s.search_meetings("達物族", 3).unwrap().is_empty(),
+            "搜到了被改掉的舊版"
+        );
+        assert_eq!(s.search_meetings("達悟族", 3).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_empty_query_returns_nothing_rather_than_everything() {
+        // 呼叫端在沒有查詢字串時該顯示完整清單，那是另一條路徑
+        let s = searchable();
+        assert!(s.search_meetings("", 3).unwrap().is_empty());
+        assert!(s.search_meetings("   ", 3).unwrap().is_empty());
+    }
+
+    /// 搜尋走 LIKE 掃描而不是 FTS5，這個決定只有在實測數字之下才成立。
+    /// 用 `--ignored` 執行，數字記在 `search_meetings` 的註解裡。
+    #[test]
+    #[ignore = "效能量測，跑一次數十秒。用 --ignored 執行"]
+    fn probe_how_long_a_like_scan_takes_at_realistic_scale() {
+        // 兩小時會議約 2600 段。50 場是「用了兩年」的量級
+        const MEETINGS: usize = 50;
+        const SEGMENTS: u64 = 2600;
+        let mut s = Store::new(db::open_in_memory().unwrap());
+        for n in 0..MEETINGS {
+            let m = s.create_meeting(&format!("會議 {n}")).unwrap();
+            let events: Vec<_> = (1..=SEGMENTS)
+                .map(|i| {
+                    (
+                        DomainEvent::TranscriptSegmentFinalized {
+                            segment: seg(
+                                i,
+                                1,
+                                "這是一段長度接近真實逐字稿的內容，講的是報價、範圍與時程",
+                                Origin::Provider,
+                            ),
+                        },
+                        tl(i * 1000),
+                    )
+                })
+                .collect();
+            s.append(m, &events).unwrap();
+        }
+
+        // 兩端都量：全命中是最壞情況（每一列都要搬進 Rust），
+        // 少量命中才是真實查詢的樣子，兩個數字差很多就不能只報一個
+        let timed = |q: &str| {
+            let started = std::time::Instant::now();
+            let hits = s.search_meetings(q, 3).unwrap();
+            let elapsed = started.elapsed();
+            eprintln!(
+                "{} 場 × {SEGMENTS} 段（{} 列）搜「{q}」命中 {} 場，耗時 {:?}",
+                MEETINGS,
+                MEETINGS as u64 * SEGMENTS,
+                hits.len(),
+                elapsed
+            );
+            (hits.len(), elapsed)
+        };
+        let (_, rare) = timed("這個詞不存在於任何一段");
+        let (all, elapsed) = timed("時程");
+        assert_eq!(all, MEETINGS);
+        assert!(rare < elapsed, "沒命中反而比較慢，量測方式有問題");
+        // 使用者一邊打字一邊搜，超過這條線就該換索引了
+        assert!(elapsed.as_millis() < 500, "掃描慢到會擋住輸入：{elapsed:?}");
     }
 
     #[test]
