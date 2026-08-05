@@ -31,3 +31,19 @@ Thumbs.db
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
+
+# 建置產物。二進位檔屬於 release，不屬於版本庫 —— 每次重新編譯都是一份
+# 十幾 MB 的新 blob，而 git 永遠不會把它們忘掉。
+/dist-win/
+*.exe
+*.dll
+*.dylib
+
+# 模型與錄音。合計超過一 GB，而且各自有自己的授權。
+/models/
+*.wav
+*.bin
+*.onnx
+
+# 引擎日誌
+stt.log
