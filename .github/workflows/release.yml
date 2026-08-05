@@ -52,16 +52,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          workspaces: src-tauri
-          # sherpa-rs-sys 把預先編好的 onnxruntime 下載到這裡，而它不在
-          # target/ 底下。只快取 target/ 的話，快取命中時 build script 會
-          # 被跳過、-L 路徑照樣送給連結器，但函式庫已經不在了 —— 冷快取
-          # 會過、熱快取必掛，最難查的那種紅燈
-          cache-directories: ~/.cache/sherpa-rs
-          key: release-${{ matrix.target }}
-
+      # 這裡刻意不掛 rust-cache。CI 每次 push 都跑，值得為速度承擔快取的風險；
+      # release 一個 tag 只跑一次，而它產出的是別人會下載並執行的東西。
+      # 快取過的 build script 會被跳過，它下載到 target/ 以外的函式庫卻不會
+      # 跟著回來，症狀是連結失敗 —— 或者更糟，連結成功但內容是上一次的。
+      # 冷建置每個平台多十幾分鐘，換的是「發出去的東西完全來自這個 commit」。
       - run: pnpm install --frozen-lockfile
 
       - name: Build bundle

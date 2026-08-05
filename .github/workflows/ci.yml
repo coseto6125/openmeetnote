@@ -60,11 +60,14 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
-          # sherpa-rs-sys 把預先編好的 onnxruntime 下載到這裡，而它不在
-          # target/ 底下。只快取 target/ 的話，快取命中時 build script 會
-          # 被跳過、-L 路徑照樣送給連結器，但函式庫已經不在了 —— 冷快取
-          # 會過、熱快取必掛，最難查的那種紅燈
-          cache-directories: ~/.cache/sherpa-rs
+          # sherpa-rs-sys 把預先編好的函式庫下載到 dirs::cache_dir()/sherpa-rs，
+          # 而那不在 target/ 底下。只快取 target/ 的話，快取命中時 build script
+          # 會被跳過、連結旗標照樣送出，但函式庫已經不在了 —— 冷快取會過、
+          # 熱快取必掛。三個平台三個位置，少列一個就等於少修一個平台
+          cache-directories: |
+            ~/.cache/sherpa-rs
+            ~/Library/Caches/sherpa-rs
+            ~/AppData/Local/sherpa-rs
       - name: Install Linux build deps
         run: |
           sudo apt-get update
@@ -86,11 +89,14 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
-          # sherpa-rs-sys 把預先編好的 onnxruntime 下載到這裡，而它不在
-          # target/ 底下。只快取 target/ 的話，快取命中時 build script 會
-          # 被跳過、-L 路徑照樣送給連結器，但函式庫已經不在了 —— 冷快取
-          # 會過、熱快取必掛，最難查的那種紅燈
-          cache-directories: ~/.cache/sherpa-rs
+          # sherpa-rs-sys 把預先編好的函式庫下載到 dirs::cache_dir()/sherpa-rs，
+          # 而那不在 target/ 底下。只快取 target/ 的話，快取命中時 build script
+          # 會被跳過、連結旗標照樣送出，但函式庫已經不在了 —— 冷快取會過、
+          # 熱快取必掛。三個平台三個位置，少列一個就等於少修一個平台
+          cache-directories: |
+            ~/.cache/sherpa-rs
+            ~/Library/Caches/sherpa-rs
+            ~/AppData/Local/sherpa-rs
       - name: Install Linux build deps
         run: |
           sudo apt-get update
@@ -129,11 +135,14 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
-          # sherpa-rs-sys 把預先編好的 onnxruntime 下載到這裡，而它不在
-          # target/ 底下。只快取 target/ 的話，快取命中時 build script 會
-          # 被跳過、-L 路徑照樣送給連結器，但函式庫已經不在了 —— 冷快取
-          # 會過、熱快取必掛，最難查的那種紅燈
-          cache-directories: ~/.cache/sherpa-rs
+          # sherpa-rs-sys 把預先編好的函式庫下載到 dirs::cache_dir()/sherpa-rs，
+          # 而那不在 target/ 底下。只快取 target/ 的話，快取命中時 build script
+          # 會被跳過、連結旗標照樣送出，但函式庫已經不在了 —— 冷快取會過、
+          # 熱快取必掛。三個平台三個位置，少列一個就等於少修一個平台
+          cache-directories: |
+            ~/.cache/sherpa-rs
+            ~/Library/Caches/sherpa-rs
+            ~/AppData/Local/sherpa-rs
           key: ${{ matrix.target }}
       - name: Check
         run: >
