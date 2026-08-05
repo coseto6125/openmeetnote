@@ -97,8 +97,11 @@ jobs:
           # find -exec 找不到東西也回傳 0，不擋的話會發出一包只有 vocabulary.txt
           # 的壓縮檔，而那要等到有人下載才會發現
           test -d "$out"/*.app || { echo "::error::bundle 裡沒有 .app"; ls -R "$base/bundle"; exit 1; }
-          # .app 是目錄，裡面有 symlink 與執行權限，用 tar 而不是 zip
-          tar -czf "$out.tar.gz" "$out"
+          # .app 是目錄，裡面有 symlink 與執行權限，用 tar 而不是 zip。
+          # COPYFILE_DISABLE 擋掉 macOS 的 tar 為每個帶 xattr 的檔案多塞一個
+          # `._` AppleDouble 檔：0.1.0 的壓縮檔裡就有一個，解開來是使用者
+          # 看得到但看不懂的東西。
+          COPYFILE_DISABLE=1 tar -czf "$out.tar.gz" "$out"
           echo "ASSET=$out.tar.gz" >> "$GITHUB_ENV"
 
       - name: Attest provenance
