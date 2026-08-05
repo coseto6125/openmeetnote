@@ -26,11 +26,19 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 thiserror = "2.0.19"
 sha2 = "0.11.0"
 whisper-rs = "0.16.0"
-sherpa-rs = "0.6.8"
 hound = "3.5.1"
 strsim = "0.11.1"
 zhconv = "0.4.1"
 tempdir = "0.3.7"
+
+# sherpa-rs 兩個平台的連結方式不同，所以不放在 [dependencies]：同一個 package
+# 在兩處宣告時 feature 會被聯集，static 與 tts 併在一起會撞上上游的
+# 「預編的 static 包不含 TTS」。
+#
+# Windows 沿用預設的動態連結：DLL 就放在 exe 旁邊，那是 Windows 的搜尋路徑，
+# 而且這個組合已經實機驗證過，發布前不動它。
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+sherpa-rs = "0.6.8"
 
 # 密鑰只放 OS 憑證庫（§5.6、§14）。目標平台是 Windows 與 macOS，
 # 兩者的原生後端不需要額外服務。Linux 只是開發環境，不掛 secret-service：
@@ -43,6 +51,18 @@ wasapi = "0.23"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "4", features = ["apple-native-keyring-store"] }
+# macOS 走靜態連結。動態版連的是 `@rpath/libonnxruntime.dylib` 與
+# `@rpath/libsherpa-onnx-c-api.dylib`，但 Tauri 產出的 .app 裡沒有這兩個檔案、
+# 執行檔也沒有任何 LC_RPATH（解析 dry run 產物的 Mach-O 載入指令確認過），
+# 於是 app 會在 dyld 階段就死掉，連 main 都進不去。把函式庫塞進
+# Contents/Frameworks 再補 rpath 只是把問題搬到打包步驟，靜態連結是把這
+# 一整類失敗消掉。
+#
+# 不含 tts：預編的 static 包沒有那些符號，而這個產品也不做語音合成。
+sherpa-rs = { version = "0.6.8", default-features = false, features = [
+    "static",
+    "download-binaries",
+] }
 # 系統音訊走 ScreenCaptureKit（macOS 13+），它可以直接指定 16 kHz 單聲道，
 # 錄下來就是轉錄要的格式。
 screencapturekit = "8"
