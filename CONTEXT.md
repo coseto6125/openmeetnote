@@ -107,12 +107,23 @@ whisper 因此慢九倍（RTF 3.96 對 0.55）。驗證方式是反組譯數 AVX
 
 ## CI 的失敗形狀
 
-**建置產物快取與下載快取不同步。** `sherpa-rs-sys` 的 build script 把預編的
-onnxruntime 下載到 `~/.cache/sherpa-rs`，那個路徑不在 `target/` 底下。只快取
-`target/` 的話，快取命中時 build script 被判定為不需重跑，它的 `-L` 旗標照樣
-送給連結器，但指向的目錄已經不存在，於是 `unable to find library -lonnxruntime`。
-症狀是冷快取全綠、熱快取必掛，看起來像隨機失敗。凡是 build script 會往
-`target/` 以外的地方寫東西，那個位置就必須跟 `target/` 用同一把快取鑰匙。
+**建置產物快取與 build script 的產出不同步。** `sherpa-rs-sys` 的 build script
+把預編的函式庫下載到 `dirs::cache_dir()/sherpa-rs`（Linux 是 `~/.cache`、
+macOS 是 `~/Library/Caches`、Windows 是 `%LOCALAPPDATA%`），那不在 `target/`
+底下。快取命中時 build script 被判定為不需重跑，它的連結旗標照樣送出，但東西
+不在了。
+
+這件事以三種面貌出現過，一次比一次晚才炸：
+
+1. Linux 連結失敗 `unable to find library -lonnxruntime`。
+2. Windows 連結失敗 `LNK1181: cannot open input file cargs.lib` —— 同一件事，
+   只是快取目錄在另一個位置，第一次只補了 Linux 那個。
+3. Linux 連結成功但執行時 `libsherpa-onnx-c-api.so: cannot open shared object
+   file`。三個目錄都列進快取之後仍然發生，這時已經不值得再猜第四種形狀。
+
+結論不是「把快取路徑列完」，而是**會執行程式碼的那一格不要掛快取**。綠燈的
+意義不該取決於快取剛好是對的。只做編譯檢查的格子（clippy 不執行任何二進位）
+留著快取沒問題，代價與風險在那裡是相稱的。
 
 **跨平台程式碼的唯一驗證是 CI 那一格。** 開發機是 Linux，`src/audio/macos.rs`
 在本機連 type check 都跑不到。這代表兩件事：那一格不能設成選配，而且光有
