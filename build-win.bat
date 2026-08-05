@@ -22,7 +22,10 @@ if not defined VSINSTALLDIR (
 if defined CARGO_HOME set "PATH=%CARGO_HOME%\bin;%PATH%"
 set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 
-where cargo >/dev/null 2>&1 || (
+REM NUL is the null device in cmd. `>/dev/null` makes cmd try to create the
+REM file \dev\null, which fails when \dev does not exist -- so the check below
+REM reported "cargo not on PATH" on every machine, cargo installed or not.
+where cargo >nul 2>&1 || (
   echo [build-win] cargo not on PATH. Set CARGO_HOME or install rustup.
   exit /b 1
 )
