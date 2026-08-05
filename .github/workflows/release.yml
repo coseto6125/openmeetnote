@@ -1,0 +1,152 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build only, do not publish a release'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: read
+
+# 同一個 tag 不重複跑，但已經在發布的不取消 —— release 要嘛完整要嘛不存在
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+          key: release-${{ matrix.target }}
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build bundle
+        run: pnpm exec tauri build --target ${{ matrix.target }}
+
+      # 打包成單一壓縮檔再上傳：Tauri 依平台產出不同副檔名，
+      # 收斂成一個名字才不會讓下載頁看起來像三個不同的產品
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "openmeetnote-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $out | Out-Null
+          $base = "src-tauri/target/${{ matrix.target }}/release"
+          Copy-Item "$base/openmeetnote.exe" $out
+          Get-ChildItem "$base/*.dll" | Copy-Item -Destination $out
+          Copy-Item "vocabulary.txt" $out -ErrorAction SilentlyContinue
+          Get-ChildItem -Recurse "$base/bundle" -Include *.msi,*.exe |
+            Copy-Item -Destination $out -ErrorAction SilentlyContinue
+          Compress-Archive -Path $out -DestinationPath "$out.zip"
+          "ASSET=$out.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          out="openmeetnote-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$out"
+          base="src-tauri/target/${{ matrix.target }}/release"
+          find "$base/bundle" \( -name '*.dmg' -o -name '*.app' \) -maxdepth 2 \
+            -exec cp -R {} "$out/" \; 2>/dev/null || true
+          cp vocabulary.txt "$out/" 2>/dev/null || true
+          tar -czf "$out.tar.gz" "$out"
+          echo "ASSET=$out.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: ${{ env.ASSET }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: dist/*
+          draft: false
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            Download the archive for your platform, unpack it, and put the
+            speech models next to the executable. **Models are not bundled** —
+            together they are over a gigabyte, and you should know where that
+            gigabyte lives on your disk. See
+            [Running](https://github.com/${{ github.repository }}#running) for
+            the layout and download links.
+
+            ## Platform status
+
+            | Platform | Audio capture | Notes |
+            |---|---|---|
+            | Windows 10/11 x64 | WASAPI loopback + microphone | Verified on real hardware |
+            | macOS 13+ (Apple Silicon / Intel) | ScreenCaptureKit + CoreAudio | **Beta** — compiles and ships, but has not been run on real Mac hardware by the author |
+
+            macOS needs Screen Recording permission for system audio and
+            Microphone permission for your own voice. Both are requested on
+            first record; if you deny them, recording stops with an
+            explanation rather than silently producing an empty transcript.
+
+            The macOS build is not notarized yet, so Gatekeeper will refuse it
+            on first launch. Right-click the app and choose Open, or run
+            `xattr -dr com.apple.quarantine /Applications/OpenMeetNote.app`.

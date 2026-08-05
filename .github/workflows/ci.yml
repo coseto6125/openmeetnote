@@ -1,0 +1,134 @@
+name: CI
+
+# 這個專案的 CI 有一個與眾不同的限制：開發機是 Linux，而產品只跑在 Windows
+# 與 macOS。macOS 的音訊擷取因此**只有這裡編得到** —— 它是那份程式碼唯一的
+# 編譯驗證，不是額外的保險。所以 macOS 的 check 是必要檢查，不是選配。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # cold cache 更快、target/ cache 更小
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  # ── 前端：型別、測試、建置 ───────────────────────────────────
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+      - name: Test
+        run: pnpm test
+      - name: Build
+        run: pnpm exec vite build
+
+  # ── Rust：格式與 lint。跑在 Linux，因為它最快 ────────────────
+  lint:
+    name: Format & clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libsoup-3.0-dev cmake ninja-build clang
+      - name: Format
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml -p openmeetnote --all-targets -- -D warnings
+
+  # ── Rust：測試。模型與音訊素材不在版本庫，需要它們的測試會自己跳過 ──
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libsoup-3.0-dev cmake ninja-build clang
+      - name: Test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # ── 平台編譯檢查 ─────────────────────────────────────────────
+  #
+  # macOS 那一格是 src/audio/macos.rs 唯一的編譯驗證：開發機沒有 macOS，
+  # 那份程式碼在本機連 type check 都跑不到。
+  platform:
+    name: Check ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+      - name: Check
+        run: >
+          cargo clippy --manifest-path src-tauri/Cargo.toml -p openmeetnote
+          --target ${{ matrix.target }} --all-targets -- -D warnings
+
+  # ── workflow YAML 本身 ───────────────────────────────────────
+  actionlint:
+    name: Actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: reviewdog/action-actionlint@50842263c20a7c46bd0065b9e624d3c569db061e # v1.73.0
+        with:
+          reporter: github-check
+          fail_level: error
