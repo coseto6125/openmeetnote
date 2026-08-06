@@ -365,6 +365,7 @@ fn test_a_real_generation_fills_every_section_of_the_export() {
             through_event_seq: seq,
             created_at: "2026-08-05T00:00:00Z",
             transcript: &transcript,
+            speakers: &store.speakers_through(meeting, seq).unwrap(),
         },
         &result.blocks,
     );

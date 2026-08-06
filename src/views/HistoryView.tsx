@@ -5,7 +5,7 @@
  * 也會出現在列表上，但打開它看到的是「已經落地的部分」，不是即時畫面。
  * 這個區別必須在畫面上講出來，否則使用者會以為歷史頁沒有更新。
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   history,
   hhmmss,
@@ -16,7 +16,30 @@ import {
   type MeetingHit,
   type MeetingSummary,
 } from '../session';
+import { speakerDisplayName, type NamedSpeaker } from '../meeting';
 import { DocumentView, type CitedSegment } from '../components/DocumentView';
+
+/**
+ * 語者 id 對顯示名稱。
+ *
+ * 軌道不在 speakers 投影裡（`speakers` 表沒有這一欄），但每一段逐字稿都帶著
+ * 自己的 track，所以從段落回推。沒有任何段落的語者不會出現在逐字稿上，
+ * 推不出軌道也就沒有影響。
+ */
+function speakerNames(detail: MeetingDetail): Map<string, string> {
+  const trackOf = new Map<string, 'mic' | 'system'>();
+  for (const s of detail.segments) {
+    if (s.speakerId && !trackOf.has(s.speakerId)) trackOf.set(s.speakerId, s.track);
+  }
+  const named: (NamedSpeaker & { speakerId: string })[] = detail.speakers.map((s) => ({
+    speakerId: s.speakerId,
+    ordinal: s.ordinal,
+    track: trackOf.get(s.speakerId) ?? 'system',
+    proposedName: s.proposedName,
+    confirmedName: s.confirmedName,
+  }));
+  return new Map(named.map((s) => [s.speakerId, speakerDisplayName(s, named)]));
+}
 
 const STATE_LABEL: Record<string, string> = {
   idle: '未開始',
@@ -70,6 +93,7 @@ export function HistoryView({ activeMeetingId }: HistoryViewProps) {
   const [list, setList] = useState<MeetingSummary[] | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
+  const names = useMemo(() => (detail ? speakerNames(detail) : new Map()), [detail]);
   const [error, setError] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<number | null>(null);
   const [draft, setDraft] = useState('');
@@ -530,7 +554,7 @@ export function HistoryView({ activeMeetingId }: HistoryViewProps) {
                     <span className="utt-time num">{mmss(s.meetingStartMs)}</span>
                     <div className="utt-body">
                       <span className="utt-who">
-                        {s.speakerId ?? '未指派'}
+                        {(s.speakerId && names.get(s.speakerId)) ?? '未指派'}
                         <em>{s.track === 'mic' ? '麥克風軌' : '系統音訊軌'}</em>
                       </span>
                       <span className="utt-text">{s.text}</span>

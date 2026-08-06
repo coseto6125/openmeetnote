@@ -15,14 +15,17 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
 
 /// 目前的 schema 版本。新增 migration 時同步 +1。
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// 等鎖的時限。生成與錄音在不同連線上競爭，瞬間撞上時預設行為是立刻回
 /// SQLITE_BUSY，而等一下就好的事不該變成錯誤。讀寫兩條連線用同一個值。
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 
 /// migration 以 `(version, sql)` 排序套用。版本必須連續。
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("migrations/001_initial.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("migrations/001_initial.sql")),
+    (2, include_str!("migrations/002_id_sequences.sql")),
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -110,11 +113,14 @@ fn migrate(conn: &Connection) -> Result<()> {
         });
     }
 
-    // v1 尚未發布，開發期間被就地改過兩次。版本號相同但欄位不同的資料庫
-    // 不會重跑 migration，之後只會在某個查詢上炸出看不懂的錯誤。這個檢查
-    // 把它變成一句看得懂的話。v1 發布之後這段連同註解一起刪掉，
-    // 屆時任何 schema 變更都必須是新的 migration。
-    if current == SCHEMA_VERSION && !has_column(conn, "speakers", "created_event_seq")? {
+    // v1 在發布前的開發期間被就地改過兩次。那些資料庫標的是 v1，欄位卻不是
+    // v1，migration 不會重跑，之後只會在某個查詢上炸出看不懂的錯誤。這個檢查
+    // 把它變成一句看得懂的話。
+    //
+    // 判準是欄位不是版本號：`created_event_seq` 從 001 起就該存在，缺了它就
+    // 代表這個資料庫不是任何一版 migration 產生的。綁在版本號上的話，每加一
+    // 個 migration 就會讓這道檢查失效一次 —— 002 加進來時就發生過。
+    if current >= 1 && !has_column(conn, "speakers", "created_event_seq")? {
         return Err(DbError::StaleDevSchema);
     }
 

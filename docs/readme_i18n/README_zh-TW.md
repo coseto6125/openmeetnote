@@ -35,20 +35,43 @@ OpenMeetNote 的前提是模型一定會這樣，而唯一撐得住的防線是�
 
 ---
 
+## 畫面
+
+成果文件裡的每一句主張都帶著它的出處時間戳。點下去會跳到逐字稿的那一行，
+而那是引用唯一的用途。
+
+![成果文件，每一句主張下面掛著引用](../images/document.png)
+
+左邊即時逐字稿，右邊語者與摘要版本。中間那條軸標出目前的摘要涵蓋到哪裡，
+所以「摘要落後三分鐘」是看得到的，不是推出來的。
+
+![錄音中的畫面，含即時逐字稿與涵蓋軸](../images/live.png)
+
+歷史頁的搜尋掃標題、逐字稿與人工筆記，已經結束的會議也可以事後才做摘要，
+而那才是多數人真正想做摘要的時候。
+
+![歷史頁，重新打開一場已結束的會議](../images/history.png)
+
+<sub>截圖由 [`scripts/screenshots.mjs`](../../scripts/screenshots.mjs) 對真正的前端渲染產生，
+裡面那場會議是編出來的。公開的 README 不是放別人真實會議紀錄的地方。</sub>
+
+---
+
 ## 目前狀態
 
 **Windows** 實機驗證過整條鏈：雙軌擷取、即時稿與定稿、AI 摘要、引用驗證、匯出、搜尋。
 
-**macOS 是 beta。** ScreenCaptureKit + CoreAudio 那條路徑在 CI 上對 Apple Silicon 與 Intel 都編得過，它上面每一層都與平台無關而且都有測試 — 但作者沒有 Mac，這份程式碼從來沒有在真機上跑過。你如果試了，[開一個 issue 說發生什麼事](https://github.com/coseto6125/openmeetnote/issues)會很有用。
+**macOS 是 beta。** ScreenCaptureKit + CoreAudio 那條路徑在 CI 上對 Apple Silicon 與 Intel 都編得過，它的單元測試在 arm64 runner 上原生跑起來，它上面每一層都與平台無關而且都有測試。但作者沒有 Mac，所以單元測試以上的東西都沒有碰過真的音訊硬體，兩個權限對話框也從來沒有實際彈出過。你如果試了，[開一個 issue 說發生什麼事](https://github.com/coseto6125/openmeetnote/issues)會很有用。
 
 Windows 上跑過兩小時 soak：393 個定稿批次、2586 個片段、25594 字，記憶體在 2.13 到 2.21 GB 之間有界震盪沒有上升趨勢，行程存活，會議正常收尾。
 
 ## 執行
 
-模型**不隨安裝包發布**。合計超過一 GB，而你應該知道這一 GB 放在磁碟的哪裡。放在執行檔旁邊：
+模型**不隨安裝包發布**。合計超過一 GB，而你應該知道這一 GB 放在磁碟的哪裡。放在程式旁邊：
 
 ```text
-openmeetnote(.exe)
+openmeetnote.exe                    # Windows：放在 exe 旁邊
+OpenMeetNote.app                    # macOS：放在 .app 旁邊，不是放進去裡面
 vocabulary.txt                      # 專有名詞校正表，可自行編輯
 models/
   ggml-large-v3-turbo-q5_0.bin      # 定稿引擎
@@ -57,6 +80,8 @@ models/
   silero_vad.onnx                   # 語音活動偵測
   speaker-embedding.onnx            # 語者辨識（可選）
 ```
+
+程式裝在你寫不進去的地方（`/Applications`、`C:\Program Files`）時，把 `models/` 與 `vocabulary.txt` 放到使用者資料目錄：Windows 是 `%APPDATA%\OpenMeetNote`，macOS 是 `~/Library/Application Support/OpenMeetNote`。程式旁邊會先被搜尋。
 
 缺少必要模型時錄音會被拒絕並說明缺哪一個檔案，不會靜默降級成一場沒有逐字稿的錄音 — 那種失敗只有事後才會發現，而那時會議已經沒了。
 
@@ -70,7 +95,7 @@ models/
 | `OMN_VAD_MODEL` | 語音偵測模型 |
 | `OMN_PUNCT_MODEL` | 標點模型 |
 
-引擎載入與逐段結果寫在執行檔旁的 `stt.log`。Windows 的 GUI 子系統不接 stderr，沒有這個檔案的話，模型載入失敗會完全無聲無息。
+引擎載入與逐段結果寫在使用者資料目錄的 `stt.log`（`%APPDATA%\OpenMeetNote`、`~/Library/Application Support/OpenMeetNote`）。Windows 的 GUI 子系統不接 stderr，沒有這個檔案的話，模型載入失敗會完全無聲無息 — 這也是它不放在程式旁邊的理由：安裝位置經常是唯讀的。
 
 ### macOS 權限
 

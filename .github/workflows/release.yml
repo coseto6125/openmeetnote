@@ -3,12 +3,9 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # 手動觸發只建置不發布（publish 那個 job 要求 ref 是 v* tag）。
+  # 拿來在打 tag 前確認打包步驟本身沒問題 —— tag 只能發一次。
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Build only, do not publish a release'
-        required: false
-        default: 'true'
 
 permissions:
   contents: read
@@ -23,6 +20,9 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
+  # playwright 只有 scripts/screenshots.mjs 用得到。少了這一行，每次
+  # pnpm install 都會去抓上百 MB 的瀏覽器，而這裡從來不跑那支腳本
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
 
 jobs:
   build:
@@ -36,12 +36,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 這份 bundle 設定刻意不叫 tauri.windows.conf.json。那個檔名是 Tauri
+          # 的平台慣例名,每一次 cargo 呼叫都會自動載入它 —— 包括 CI 那句
+          # `cargo clippy --target x86_64-pc-windows-msvc`(debug)。它的 glob
+          # 指向 target/*/release/,debug 底下沒有 DLL,build script 就 exit 1,
+          # 於是 Windows 的 Check 與開發者的 `tauri dev` 一起掛掉。改成只有
+          # 真正要打包的這一步明確傳進去。
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            bundle_config: --config src-tauri/bundle-dlls.windows.json
           - target: aarch64-apple-darwin
             os: macos-latest
+            bundle_config: ''
           - target: x86_64-apple-darwin
             os: macos-latest
+            bundle_config: ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -55,18 +64,67 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          workspaces: src-tauri
-          key: release-${{ matrix.target }}
-
+      # 這裡刻意不掛 rust-cache。CI 每次 push 都跑，值得為速度承擔快取的風險；
+      # release 一個 tag 只跑一次，而它產出的是別人會下載並執行的東西。
+      # 快取過的 build script 會被跳過，它下載到 target/ 以外的函式庫卻不會
+      # 跟著回來，症狀是連結失敗 —— 或者更糟，連結成功但內容是上一次的。
+      # 冷建置每個平台多十幾分鐘，換的是「發出去的東西完全來自這個 commit」。
       - run: pnpm install --frozen-lockfile
 
       - name: Build bundle
-        run: pnpm exec tauri build --target ${{ matrix.target }}
+        run: pnpm exec tauri build --target ${{ matrix.target }} ${{ matrix.bundle_config }}
 
       # 打包成單一壓縮檔再上傳：Tauri 依平台產出不同副檔名，
       # 收斂成一個名字才不會讓下載頁看起來像三個不同的產品
+      # 安裝檔裡必須真的有 DLL。sherpa 與 onnxruntime 在 Windows 是動態連結，
+      # 而 0.1.0 的 MSI 與 NSIS 沒有帶到它們 —— DLL 是 tauri build 跑完之後才
+      # 被複製到外層 portable 目錄的，安裝檔內部什麼都沒有，裝完的程式在進
+      # main 之前就被 loader 終止。現在由 bundle-dlls.windows.json 宣告成
+      # bundle resources，這一步是確認那個宣告真的生效。
+      #
+      # 只驗一次就好的事不值得只靠設定檔：那個 glob 依賴 --target，而漏掉
+      # --target 的建置會安靜地產出一模一樣、但缺 DLL 的安裝檔。自從設定檔
+      # 改名、不再被自動載入之後，漏掉 matrix.bundle_config 也是同一種結局。
+      #
+      # 驗法是把安裝檔攤開來看真實佈局。第一版是 `7z l` 抓字串，而那對 MSI
+      # 一律回報「什麼都沒有」—— 那個綠燈或紅燈都不代表安裝檔的內容。
+      - name: Assert the installers carry the DLLs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $base = "src-tauri/target/${{ matrix.target }}/release"
+          $installers = Get-ChildItem -Recurse "$base/bundle" -Include *.msi,*.exe
+          if (-not $installers) { throw "bundle 裡沒有任何安裝檔" }
+          $dlls = Get-ChildItem "$base/*.dll" | ForEach-Object { $_.Name }
+          if (-not $dlls) { throw "$base 裡沒有 DLL，連 portable 版都會壞" }
+          $stage = Join-Path $env:RUNNER_TEMP "installer-check"
+          foreach ($i in $installers) {
+            $dir = Join-Path $stage ([IO.Path]::GetFileNameWithoutExtension($i.Name))
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            # 真的把安裝檔解開，不是在它的位元組裡找檔名字串。MSI 把檔案放進
+            # cab，而 cab 裡的名字是 WiX 產生的 File Id，不是 `cargs.dll`——
+            # 用 `7z l` 比對原檔名，任何一個 MSI 都會被判定成空的。
+            if ($i.Extension -eq ".msi") {
+              # /a 是 administrative install：把安裝檔攤成它會安裝出來的樣子，
+              # 不需要提權，也不會動到這台機器
+              $p = Start-Process msiexec -Wait -PassThru -ArgumentList @(
+                "/a", "`"$($i.FullName)`"", "/qn", "TARGETDIR=`"$dir`""
+              )
+              if ($p.ExitCode -ne 0) { throw "$($i.Name) 展開失敗（msiexec $($p.ExitCode)）" }
+            } else {
+              & 7z x -y -o"$dir" $i.FullName | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "$($i.Name) 展開失敗（7z $LASTEXITCODE）" }
+            }
+            $inside = Get-ChildItem -Recurse -File $dir | ForEach-Object { $_.Name }
+            $missing = $dlls | Where-Object { $inside -notcontains $_ }
+            if ($missing) {
+              Write-Host "$($i.Name) 展開後的內容："
+              Get-ChildItem -Recurse -File $dir | ForEach-Object { Write-Host "  $($_.FullName)" }
+              throw "$($i.Name) 裡找不到：$($missing -join '、')"
+            }
+            Write-Host "$($i.Name) 帶了 $($dlls.Count) 個 DLL"
+          }
+
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -76,9 +134,11 @@ jobs:
           $base = "src-tauri/target/${{ matrix.target }}/release"
           Copy-Item "$base/openmeetnote.exe" $out
           Get-ChildItem "$base/*.dll" | Copy-Item -Destination $out
-          Copy-Item "vocabulary.txt" $out -ErrorAction SilentlyContinue
+          Copy-Item "vocabulary.txt" $out
+          # 安裝檔是額外的，可執行檔才是必要的：模型要放在 exe 旁邊，
+          # 走安裝流程反而多一層目錄要找
           Get-ChildItem -Recurse "$base/bundle" -Include *.msi,*.exe |
-            Copy-Item -Destination $out -ErrorAction SilentlyContinue
+            Copy-Item -Destination $out
           Compress-Archive -Path $out -DestinationPath "$out.zip"
           "ASSET=$out.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -88,10 +148,18 @@ jobs:
           out="openmeetnote-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$out"
           base="src-tauri/target/${{ matrix.target }}/release"
-          find "$base/bundle" \( -name '*.dmg' -o -name '*.app' \) -maxdepth 2 \
-            -exec cp -R {} "$out/" \; 2>/dev/null || true
-          cp vocabulary.txt "$out/" 2>/dev/null || true
-          tar -czf "$out.tar.gz" "$out"
+          # -maxdepth 要放在其他 expression 之前，BSD find 才不會抱怨
+          find "$base/bundle" -maxdepth 2 \( -name '*.dmg' -o -name '*.app' \) \
+            -exec cp -R {} "$out/" \;
+          cp vocabulary.txt "$out/"
+          # find -exec 找不到東西也回傳 0，不擋的話會發出一包只有 vocabulary.txt
+          # 的壓縮檔，而那要等到有人下載才會發現
+          test -d "$out"/*.app || { echo "::error::bundle 裡沒有 .app"; ls -R "$base/bundle"; exit 1; }
+          # .app 是目錄，裡面有 symlink 與執行權限，用 tar 而不是 zip。
+          # COPYFILE_DISABLE 擋掉 macOS 的 tar 為每個帶 xattr 的檔案多塞一個
+          # `._` AppleDouble 檔：0.1.0 的壓縮檔裡就有一個，解開來是使用者
+          # 看得到但看不懂的東西。
+          COPYFILE_DISABLE=1 tar -czf "$out.tar.gz" "$out"
           echo "ASSET=$out.tar.gz" >> "$GITHUB_ENV"
 
       - name: Attest provenance
@@ -129,9 +197,13 @@ jobs:
             ## Install
 
             Download the archive for your platform, unpack it, and put the
-            speech models next to the executable. **Models are not bundled** —
-            together they are over a gigabyte, and you should know where that
-            gigabyte lives on your disk. See
+            speech models next to the application — beside `openmeetnote.exe`
+            on Windows, beside `OpenMeetNote.app` on macOS (not inside it).
+            If the application lives somewhere you cannot write, put them in
+            `%APPDATA%\OpenMeetNote` or
+            `~/Library/Application Support/OpenMeetNote` instead.
+            **Models are not bundled** — together they are over a gigabyte,
+            and you should know where that gigabyte lives on your disk. See
             [Running](https://github.com/${{ github.repository }}#running) for
             the layout and download links.
 

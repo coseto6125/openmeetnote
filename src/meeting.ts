@@ -332,6 +332,33 @@ export function applyBatch(m: MeetingModel, batch: SessionEventBatch): MeetingMo
 }
 
 /** 用完整投影取代目前狀態，清掉 desynced 旗標。 */
+/** `speakerDisplayName` 需要的欄位。錄音分頁與歷史分頁的語者形狀不同，取交集。 */
+export interface NamedSpeaker {
+  ordinal: number;
+  track: 'mic' | 'system';
+  proposedName: string | null;
+  confirmedName: string | null;
+}
+
+/**
+ * §8.2 的名稱優先順序：確認名 > 暫定名 > 依軌道與出現序的預設稱呼。
+ *
+ * 預設稱呼裡的編號只數遠端語者。ordinal 是全域的出現序，麥克風軌會佔掉一格，
+ * 直接拿來顯示的話「我」之後的第一位遠端語者會叫「語者 3」，看起來像少了一個人。
+ *
+ * 放在這裡而不是各分頁自己一份：錄音分頁與歷史分頁顯示的是同一場會議的同一個
+ * 人，兩份實作之間沒有邊界可以正當化差異。實際發生過的後果是歷史分頁顯示
+ * 內部 id（`s2`），而同一句話在錄音分頁顯示「沈立群」。
+ */
+export function speakerDisplayName(s: NamedSpeaker, all: NamedSpeaker[]): string {
+  if (s.confirmedName) return s.confirmedName;
+  if (s.proposedName) return s.proposedName;
+  // 軌道先驗只到「本機 vs 遠端」，不能再往「遠端只有一人」推（§8.1）
+  if (s.track === 'mic') return '我';
+  const nth = all.filter((x) => x.track === 'system' && x.ordinal <= s.ordinal).length;
+  return `語者 ${nth}`;
+}
+
 export function fromProjection(m: MeetingModel, p: SessionProjection): MeetingModel {
   return {
     ...m,

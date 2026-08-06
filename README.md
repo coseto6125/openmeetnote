@@ -40,15 +40,43 @@ makes on its own.
 
 ---
 
+## What it looks like
+
+Every claim in the generated document carries the timestamps it came from.
+Clicking one jumps to that line in the transcript, which is the only thing a
+citation is for.
+
+![The generated document, with a citation chip under every claim](./docs/images/document.png)
+
+Live transcript on the left, speakers and summary versions on the right. The
+gutter shows which part of the meeting the current summary covers, so "the
+summary is 3 minutes behind" is visible rather than inferred.
+
+![Recording, with the live transcript and the coverage gutter](./docs/images/live.png)
+
+History searches titles, transcripts and notes, and a finished meeting can be
+summarized later — which is when most people actually want it.
+
+![History, with a finished meeting reopened](./docs/images/history.png)
+
+<sub>Screenshots are rendered from the real front end by
+[`scripts/screenshots.mjs`](./scripts/screenshots.mjs); the meeting in them is
+invented. A public README is not a good place for someone's actual meeting
+minutes.</sub>
+
+---
+
 ## Status
 
 **Windows** is verified on real hardware end to end: dual-track capture, live
 and final transcripts, AI summary, citation verification, export, search.
 
 **macOS is beta.** The ScreenCaptureKit + CoreAudio capture path compiles in
-CI for both Apple Silicon and Intel, and every layer above it is
-platform-independent and tested — but the author has no Mac, so it has never
-been run on real hardware. If you try it, [an issue saying what
+CI for both Apple Silicon and Intel, its unit tests run natively on the
+arm64 runner, and every layer above it is platform-independent and tested —
+but the author has no Mac, so nothing above the unit tests has met real
+audio hardware, and the two permission dialogs have never actually appeared.
+If you try it, [an issue saying what
 happened](https://github.com/coseto6125/openmeetnote/issues) is genuinely
 useful.
 
@@ -59,10 +87,11 @@ trend, process alive, meeting closed cleanly.
 ## Running
 
 Models are **not** bundled. Together they exceed a gigabyte, and you should
-know where that gigabyte lives on your disk. Put them next to the executable:
+know where that gigabyte lives on your disk. Put them next to the application:
 
 ```text
-openmeetnote(.exe)
+openmeetnote.exe                    # Windows: next to the .exe
+OpenMeetNote.app                    # macOS: next to the .app, not inside it
 vocabulary.txt                      # proper-noun corrections, edit freely
 models/
   ggml-large-v3-turbo-q5_0.bin      # final transcript
@@ -71,6 +100,12 @@ models/
   silero_vad.onnx                   # voice activity detection
   speaker-embedding.onnx            # speaker identification (optional)
 ```
+
+If the application lives somewhere you cannot write — `/Applications`,
+`C:\Program Files` — put `models/` and `vocabulary.txt` in the user data
+directory instead: `%APPDATA%\OpenMeetNote` on Windows,
+`~/Library/Application Support/OpenMeetNote` on macOS. Next to the
+application is searched first.
 
 A missing required model refuses the recording and says which file is absent.
 It never degrades silently into a recording with no transcript — that failure
@@ -87,9 +122,12 @@ priority over the GUI settings:
 | `OMN_VAD_MODEL` | Voice activity model |
 | `OMN_PUNCT_MODEL` | Punctuation model |
 
-Engine loading and per-batch decisions are written to `stt.log` next to the
-executable. On Windows the GUI subsystem has no stderr; without that file a
-failed model load is completely silent.
+Engine loading and per-batch decisions are written to `stt.log` in the user
+data directory (`%APPDATA%\OpenMeetNote`,
+`~/Library/Application Support/OpenMeetNote`). On Windows the GUI subsystem
+has no stderr; without that file a failed model load is completely silent —
+which is why the log goes somewhere always writable rather than next to the
+application.
 
 ### macOS permissions
 

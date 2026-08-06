@@ -355,8 +355,8 @@ impl RefVerdict {
             RefVerdict::Valid => "來源可回溯",
             RefVerdict::UnknownSource => "找不到這個來源或版本",
             RefVerdict::OutsideSnapshot => "這個版本不在本輪快照的涵蓋範圍內",
-            RefVerdict::LocatorOutOfRange => "位置超出該版本的內容長度",
-            RefVerdict::QuoteNotFound => "引文不存在於該版本的內容中",
+            RefVerdict::LocatorOutOfRange => "位置是空區間或超出該版本的內容長度",
+            RefVerdict::QuoteNotFound => "引文沒有實質內容，或不在位置指到的那一段裡",
             RefVerdict::HashMismatch => "引文與其雜湊不符",
         }
     }
@@ -370,11 +370,30 @@ pub struct CharSpan {
 }
 
 /// 解析 locator。無法解析視為超出範圍，而不是略過檢查。
+///
+/// 零寬區間（`start == end`）不算合法位置。`"0-0"` 指不到任何字元，卻曾經
+/// 通過所有檢查 —— 見 [`verify_ref`] 的條件二。
 pub fn parse_locator(locator: &str) -> Option<CharSpan> {
     let span = locator.rsplit('/').next()?;
     let (a, b) = span.split_once('-')?;
     let (start, end) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
-    (start <= end).then_some(CharSpan { start, end })
+    (start < end).then_some(CharSpan { start, end })
+}
+
+/// 引文至少要有這麼多個「有內容」的字元才算引用。
+///
+/// 標點與空白不計。單一個句號在任何一段中文逐字稿裡都找得到，它證明的
+/// 是「這段話有標點」，不是「這件事有人說過」。
+const MIN_QUOTE_CHARS: usize = 2;
+
+/// 這段文字是否引得動。正規化後帶有資訊的字元要夠多，CJK 與拉丁字母
+/// 都被 `is_alphanumeric` 涵蓋。
+pub fn is_quotable(quote: &str) -> bool {
+    normalize_for_match(quote)
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .count()
+        >= MIN_QUOTE_CHARS
 }
 
 /// 引用比對用的正規化：只處理空白與全形半形，不做語意比對（§9.6）。
@@ -426,13 +445,14 @@ pub fn verify_ref(
     through_event_seq: u64,
     r: &SourceRef,
 ) -> crate::store::Result<RefVerdict> {
-    // 空引文不算引用。
+    // 引文必須有實質內容。
     //
-    // `contains("")` 永遠為真，於是任何一個 Fact 只要附上空字串引文與正確的
-    // 空字串雜湊，就能拿到 `valid` —— 整套防幻覺機制唯一能被強制執行的那一
-    // 環就此 fail-open。正規化之後才判空：全形空白與 CJK 之間的空白都不帶
-    // 資訊，只有那些字元的引文一樣什麼都沒引到。
-    if normalize_for_match(&r.quoted_text).is_empty() {
+    // 起點是空引文：`contains("")` 永遠為真，於是任何一個 Fact 只要附上空字串
+    // 引文與正確的空字串雜湊就能拿到 `valid`。但把門檻設在「非空」只擋掉了那
+    // 個極端 —— `"。"` 一樣什麼都沒引到，而它在任何一段中文逐字稿裡都找得到。
+    // 判準因此是正規化後的實質字元數，不是長度：全形空白與 CJK 之間的空白都
+    // 不帶資訊，純標點也不帶。
+    if !is_quotable(&r.quoted_text) {
         return Ok(RefVerdict::QuoteNotFound);
     }
 
@@ -455,17 +475,23 @@ pub fn verify_ref(
 
     // 條件二：locator 落在該版本的有效範圍內。
     // 以字元計算而不是位元組：中文一個字三個位元組，用位元組會全錯。
-    let len = ev.text.chars().count();
+    let chars: Vec<char> = ev.text.chars().collect();
     let Some(span) = parse_locator(&r.locator) else {
         return Ok(RefVerdict::LocatorOutOfRange);
     };
-    if span.end > len {
+    if span.end > chars.len() {
         return Ok(RefVerdict::LocatorOutOfRange);
     }
 
-    // 條件三的後半：正規化之後必須是子字串。
-    // 這只證明引用存在於證據中，不證明區塊的論述被它支持。
-    if !normalize_for_match(&ev.text).contains(&normalize_for_match(&r.quoted_text)) {
+    // 條件三的後半：正規化之後必須是 **locator 指到那一段** 的子字串。
+    //
+    // 比對整段 `ev.text` 的話，locator 就只是一個沒有人查的數字：引文可以
+    // 落在片段的任何位置，位置與引文互相矛盾也照樣通過。要求引文出現在
+    // locator 之內，才讓「這句話在這裡」這個宣稱本身可被機械檢查。
+    //
+    // 這仍然只證明引用存在於證據的那個位置，不證明區塊的論述被它支持。
+    let cited: String = chars[span.start..span.end].iter().collect();
+    if !normalize_for_match(&cited).contains(&normalize_for_match(&r.quoted_text)) {
         return Ok(RefVerdict::QuoteNotFound);
     }
     Ok(RefVerdict::Valid)
@@ -589,6 +615,52 @@ pub struct RenderContext<'a> {
     pub created_at: &'a str,
     /// 逐字稿附件。§10 要求匯出至少包含完整逐字稿或可選附件。
     pub transcript: &'a [crate::store::StoredSegment],
+    /// 快照當下的語者。匯出要顯示使用者確認過的名字，不是 `s1`。
+    pub speakers: &'a [crate::store::StoredSpeaker],
+}
+
+/// 語者識別碼到顯示名稱的對照（§8.4）。
+///
+/// 規則與畫面端的 `speakerDisplayName`（src/meeting.ts）逐條相同：
+/// 確認名 > 暫定名 > 麥克風軌是「我」、其餘是「語者 N」。兩個渲染器是刻意
+/// 分開的，但顯示同一位語者時必須說出同一個名字 —— 畫面上是 Alice、匯出檔
+/// 裡是 `s1`，使用者會以為那是兩個人。
+///
+/// 「語者 N」只數遠端語者：麥克風軌會佔掉一個 ordinal，跟著數的話遠端第一位
+/// 就變成「語者 2」。
+fn speaker_names(
+    speakers: &[crate::store::StoredSpeaker],
+    transcript: &[crate::store::StoredSegment],
+) -> std::collections::HashMap<String, String> {
+    use crate::model::Track;
+    let mut track_of: std::collections::HashMap<&str, Track> = std::collections::HashMap::new();
+    for s in transcript {
+        if let Some(id) = s.speaker_id.as_deref() {
+            track_of.entry(id).or_insert(s.track);
+        }
+    }
+    let mut remote = 0u32;
+    speakers
+        .iter()
+        .map(|s| {
+            let track = track_of
+                .get(s.speaker_id.as_str())
+                .copied()
+                .unwrap_or(Track::System);
+            if track == Track::System {
+                remote += 1;
+            }
+            let name = s
+                .confirmed_name
+                .clone()
+                .or_else(|| s.proposed_name.clone())
+                .unwrap_or_else(|| match track {
+                    Track::Mic => "我".to_owned(),
+                    Track::System => format!("語者 {remote}"),
+                });
+            (s.speaker_id.clone(), name)
+        })
+        .collect()
 }
 
 /// 匯出文件的分區。§10 規定匯出至少要有哪幾塊，這個 enum 就是那份清單。
@@ -750,6 +822,7 @@ pub fn render_html(ctx: &RenderContext<'_>, blocks: &[Block]) -> String {
 
     // 沒有逐字稿就不要留一個空的段落標題。目錄也不會列它，
     // 兩邊不一致的話讀者會以為逐字稿掉了。
+    let names = speaker_names(ctx.speakers, ctx.transcript);
     let mut rows = String::new();
     for s in ctx.transcript {
         rows.push_str(&format!(
@@ -758,7 +831,12 @@ pub fn render_html(ctx: &RenderContext<'_>, blocks: &[Block]) -> String {
             id = s.segment_id,
             rev = s.revision,
             time = escape(&mmss(s.meeting_start_ms)),
-            who = escape(s.speaker_id.as_deref().unwrap_or("未指派")),
+            who = escape(
+                s.speaker_id
+                    .as_deref()
+                    .and_then(|id| names.get(id))
+                    .map_or("未指派", String::as_str)
+            ),
             text = escape(&s.text),
         ));
     }
@@ -983,6 +1061,7 @@ mod tests {
             through_event_seq: 10,
             created_at: "2026-08-05T00:00:00Z",
             transcript: &[],
+            speakers: &[],
         }
     }
 
@@ -1092,14 +1171,75 @@ mod tests {
             meeting_end_ms: 1000,
             user_edited: false,
         };
+        // 名字現在來自語者表，注入點跟著移到那裡
+        let speakers = vec![crate::store::StoredSpeaker {
+            speaker_id: "<img src=x onerror=alert(1)>".into(),
+            ordinal: 1,
+            proposed_name: None,
+            confirmed_name: Some("<script>alert(1)</script>".into()),
+            status: "confirmed".into(),
+        }];
         let c = RenderContext {
             transcript: std::slice::from_ref(&seg),
+            speakers: &speakers,
             ..ctx()
         };
         let html = render_html(&c, &[]);
-        assert!(!html.contains("<img "), "語者名稱可以注入元素");
+        assert!(!html.contains("<img "), "語者識別碼可以注入元素");
+        assert!(!html.contains("<script>alert"), "語者名稱可以注入元素");
         assert!(!html.contains("<b>粗體</b>"), "逐字稿內容沒有被轉義");
         assert!(html.contains("&lt;b&gt;"), "轉義後的內容不見了");
+    }
+
+    /// 匯出檔要顯示使用者確認過的名字，不是內部識別碼。
+    ///
+    /// 畫面上寫 Alice、匯出檔裡寫 `s1`，使用者會以為那是兩個人。名稱規則
+    /// 與 src/meeting.ts 的 `speakerDisplayName` 是同一條。
+    #[test]
+    fn the_export_calls_a_speaker_what_the_screen_calls_them() {
+        let seg = |id: &str, track| crate::store::StoredSegment {
+            segment_id: 1,
+            revision: 1,
+            origin: crate::model::Origin::Provider,
+            speaker_id: Some(id.into()),
+            text: "說了一句話".into(),
+            track,
+            meeting_start_ms: 0,
+            meeting_end_ms: 1000,
+            user_edited: false,
+        };
+        let speaker = |id: &str, ordinal, confirmed: Option<&str>| crate::store::StoredSpeaker {
+            speaker_id: id.into(),
+            ordinal,
+            proposed_name: None,
+            confirmed_name: confirmed.map(str::to_owned),
+            status: "confirmed".into(),
+        };
+        let transcript = vec![
+            seg("me", crate::model::Track::Mic),
+            seg("s1", crate::model::Track::System),
+            seg("s2", crate::model::Track::System),
+        ];
+        let speakers = vec![
+            speaker("me", 1, None),
+            speaker("s1", 2, Some("Alice")),
+            speaker("s2", 3, None),
+        ];
+        let c = RenderContext {
+            transcript: &transcript,
+            speakers: &speakers,
+            ..ctx()
+        };
+        let html = render_html(&c, &[]);
+        assert!(html.contains("Alice"), "確認過的名字沒有進匯出檔");
+        assert!(!html.contains(">s1<"), "還在顯示內部識別碼");
+        assert!(html.contains("我"), "麥克風軌沒有顯示成「我」");
+        // 「語者 N」只數遠端語者：麥克風軌佔掉一個 ordinal，跟著數的話
+        // 未命名的遠端語者會從「語者 2」開始
+        assert!(
+            html.contains("語者 2"),
+            "遠端語者的編號跟著麥克風軌一起數了"
+        );
     }
 
     #[test]
@@ -1319,6 +1459,7 @@ mod tests {
                 through_event_seq: seq,
                 created_at: "2026-08-05T00:00:00Z",
                 transcript: &transcript,
+                speakers: &[],
             },
             &ok,
         );
@@ -1572,6 +1713,38 @@ mod tests {
         );
     }
 
+    /// 零寬 locator 加一個標點，曾經是任意 Fact 的通行證。
+    ///
+    /// `"0-0"` 通過了 `span.end > len` 那道檢查（0 不大於任何長度），而引文
+    /// 當時是拿去跟整段內容比對的，於是只要片段裡有一個頓號，捏造的決議就
+    /// 拿到 `valid`。雜湊擋不住：那是系統自己補上去的。
+    #[test]
+    fn a_zero_width_locator_with_a_lone_punctuation_mark_no_longer_passes() {
+        let (s, m, cursor) = store_with_evidence();
+        let r = cite("transcript_segment", "1", 1, "0-0", "、");
+        assert_ne!(verify_ref(&s, m, cursor, &r).unwrap(), RefVerdict::Valid);
+        // 換成非零寬的 locator 也一樣：單一個標點什麼都沒引到
+        let r = cite("transcript_segment", "1", 1, "5-6", "、");
+        assert_eq!(
+            verify_ref(&s, m, cursor, &r).unwrap(),
+            RefVerdict::QuoteNotFound
+        );
+    }
+
+    /// locator 必須框住引文，否則它就只是一個沒有人查的數字。
+    #[test]
+    fn a_quote_outside_the_locator_is_rejected_even_though_it_is_in_the_source() {
+        let (s, m, cursor) = store_with_evidence();
+        // 「維運三項」確實在片段裡，但它落在第 11 到 15 個字元
+        let r = cite("transcript_segment", "1", 1, "0-5", "維運三項");
+        assert_eq!(
+            verify_ref(&s, m, cursor, &r).unwrap(),
+            RefVerdict::QuoteNotFound
+        );
+        let r = cite("transcript_segment", "1", 1, "11-15", "維運三項");
+        assert_eq!(verify_ref(&s, m, cursor, &r).unwrap(), RefVerdict::Valid);
+    }
+
     #[test]
     fn a_locator_past_the_end_of_the_revision_is_rejected() {
         let (s, m, cursor) = store_with_evidence();
@@ -1606,10 +1779,10 @@ mod tests {
     #[test]
     fn a_note_citation_must_match_the_event_seq_that_created_it() {
         let (s, m, cursor) = store_with_evidence();
-        let ok = cite("note", "1", 2, "0-6", "客戶要求維運月費區間");
+        let ok = cite("note", "1", 2, "0-10", "客戶要求維運月費區間");
         assert_eq!(verify_ref(&s, m, cursor, &ok).unwrap(), RefVerdict::Valid);
         // 版本對不上就不是同一份內容
-        let wrong = cite("note", "1", 99, "0-6", "客戶要求維運月費區間");
+        let wrong = cite("note", "1", 99, "0-10", "客戶要求維運月費區間");
         assert_eq!(
             verify_ref(&s, m, cursor, &wrong).unwrap(),
             RefVerdict::UnknownSource
@@ -1730,6 +1903,7 @@ mod tests {
                 through_event_seq: 10,
                 created_at: "2026-08-01T00:00:00.000Z",
                 transcript: &[],
+                speakers: &[],
             },
             &[b],
         )
@@ -1798,6 +1972,7 @@ mod tests {
                 through_event_seq: cursor,
                 created_at: "2026-08-01T00:00:00.000Z",
                 transcript: &s.segments_through(m, cursor).unwrap(),
+                speakers: &s.speakers_through(m, cursor).unwrap(),
             },
             &ok,
         );
