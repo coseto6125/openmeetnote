@@ -302,7 +302,7 @@ fn system_audio(
         })),
     };
 
-    let mut stream = match open_system_stream(&sink) {
+    let stream = match open_system_stream(&sink) {
         Ok(s) => {
             let _ = ready.send(Ok(()));
             s
@@ -551,7 +551,7 @@ impl Downmix {
         // 而 SizeError 只在 buf.len() < channels * frames 時發生
         let out_frames = self.out.len();
         let input =
-            SequentialSlice::new(&block, 1, block.len()).expect("frames 取自 block 自身的長度");
+            SequentialSlice::new(block, 1, block.len()).expect("frames 取自 block 自身的長度");
         let mut output = SequentialSlice::new_mut(&mut self.out, 1, out_frames)
             .expect("out 的長度就是 output_frames_max()");
         match resampler.process_into_buffer(&input, &mut output, None) {

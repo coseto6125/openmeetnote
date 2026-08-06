@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, TrySendError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -37,23 +37,73 @@ const PARTIAL_EVERY_MS: u64 = 800;
 /// 到後來畫面就停住了。超過這個長度就丟掉最舊的部分。
 const PARTIAL_WINDOW_MS: u64 = 15_000;
 
-/// 把訊息寫到執行檔旁的 stt.log。
+/// 使用者眼中「這個程式在哪裡」的那個目錄。
+///
+/// Windows 與 Linux 上是執行檔所在目錄。macOS 上執行檔在
+/// `OpenMeetNote.app/Contents/MacOS/`，而使用者看到的是 `OpenMeetNote.app`
+/// 本身 —— 他會把 `models/` 放在 `.app` 旁邊，因為 README 說「放在程式旁邊」，
+/// 而在 Finder 裡 `.app` 就是程式。直接用 `current_exe().parent()` 的話，
+/// 找的是 bundle 內部，那裡永遠不會有東西。
+pub fn app_dir() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let dir = exe.parent().unwrap_or(&exe);
+    // …/Foo.app/Contents/MacOS/foo → …
+    if dir.file_name().is_some_and(|n| n == "MacOS") {
+        if let Some(bundle) = dir.parent().and_then(|p| p.parent()) {
+            if bundle.extension().is_some_and(|e| e == "app") {
+                if let Some(outside) = bundle.parent() {
+                    return outside.to_path_buf();
+                }
+            }
+        }
+    }
+    dir.to_path_buf()
+}
+
+/// 一定寫得進去的目錄，放日誌與其他執行期產物。
+///
+/// 不能用 [`app_dir`]：安裝到 `/Applications` 或 `C:\Program Files` 之後那裡
+/// 是唯讀的，而日誌存在的唯一理由就是診斷那種「什麼都沒發生」的失敗。寫不
+/// 進去的日誌等於沒有日誌。
+pub fn data_dir() -> std::path::PathBuf {
+    let dir = dirs::data_dir()
+        .map(|d| d.join("OpenMeetNote"))
+        .unwrap_or_else(app_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// 找資源（模型、詞表）的順序：程式旁邊優先，其次是使用者資料目錄。
+///
+/// 程式旁邊優先是因為模型有一 GB 以上，使用者需要知道那一 GB 在哪裡
+/// （§5.3.1）；藏進 app data 只會讓「為什麼要一 GB」變成無解的問題。
+/// 但安裝版的程式目錄不可寫，所以資料目錄要是一條真的走得通的退路。
+fn resource_dirs() -> [std::path::PathBuf; 2] {
+    [app_dir(), data_dir()]
+}
+
+/// 在資源目錄裡找一個相對路徑，回傳第一個存在的。都不存在時回第一個候選，
+/// 讓錯誤訊息指向使用者最可能想放的位置。
+fn find_resource(rel: &str) -> std::path::PathBuf {
+    let dirs = resource_dirs();
+    dirs.iter()
+        .map(|d| d.join(rel))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| dirs[0].join(rel))
+}
+
+/// 把訊息寫到使用者資料目錄的 stt.log。
 ///
 /// Windows 的 GUI 子系統不接 stderr，`eprintln!` 在打包後的 app 裡等於什麼都
 /// 沒做 —— 引擎載入失敗會變成「錄了半小時發現一個字都沒有」而且無從查起。
 pub fn log(msg: &str) {
-    let path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("stt.log")));
     let line = format!("[{}] {msg}\n", crate::clock::now_utc());
-    if let Some(path) = path {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = f.write_all(line.as_bytes());
-        }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir().join("stt.log"))
+    {
+        let _ = f.write_all(line.as_bytes());
     }
     eprint!("{line}");
 }
@@ -77,6 +127,18 @@ impl Progress {
 /// 兩軌的 segment_id 不能互相碰撞。mic 從 1 起算，system 從這個值起算。
 const SYSTEM_SEGMENT_BASE: u64 = 1 << 32;
 
+/// 即時稿佇列的長度上限（每批 100 ms）。
+///
+/// 即時稿每 800 ms 重算整個 15 秒視窗，落後超過視窗長度的音訊對它已經
+/// 沒有意義了，囤著只是佔記憶體。
+const FAST_BACKLOG_CHUNKS: usize = 150;
+
+/// 定稿佇列的長度上限（每批 100 ms），約十分鐘。
+///
+/// 定稿的內容會進逐字稿，丟掉就是真的少一段，所以給得比即時稿寬得多。
+/// 但仍然有界：whisper 卡住時無界佇列會一路長到會議結束。
+const SLOW_BACKLOG_CHUNKS: usize = 6_000;
+
 #[derive(Debug, Clone)]
 pub struct ModelPaths {
     pub whisper: String,
@@ -89,28 +151,18 @@ pub struct ModelPaths {
 }
 
 impl ModelPaths {
-    /// 找模型檔。環境變數優先，其次是執行檔旁的 `models/`。
+    /// 找模型檔。環境變數優先，其次是 [`resource_dirs`] 裡的 `models/`。
     ///
-    /// 模型有數百 MB，不放進安裝包也不下載到 app data：使用者需要知道這些
-    /// 檔案在哪、佔多少空間，藏起來只會讓「為什麼要一 GB」變成無解的問題。
+    /// 模型有數百 MB，不放進安裝包也不自動下載：使用者需要知道這些檔案在哪、
+    /// 佔多少空間，藏起來只會讓「為什麼要一 GB」變成無解的問題。
     pub fn discover() -> Result<Self> {
-        let beside_exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("models")))
-            .unwrap_or_default();
+        let model = |name: &str| find_resource(&format!("models/{name}"));
+        let from_env = |var: &str, name: &str| {
+            std::env::var(var).unwrap_or_else(|_| model(name).to_string_lossy().into_owned())
+        };
 
-        let whisper = std::env::var("OMN_WHISPER_MODEL").unwrap_or_else(|_| {
-            beside_exe
-                .join("ggml-large-v3-turbo-q5_0.bin")
-                .to_string_lossy()
-                .into_owned()
-        });
-        let paraformer_dir = std::env::var("OMN_PARAFORMER_DIR").unwrap_or_else(|_| {
-            beside_exe
-                .join("sherpa-onnx-paraformer-zh-2023-09-14")
-                .to_string_lossy()
-                .into_owned()
-        });
+        let whisper = from_env("OMN_WHISPER_MODEL", "ggml-large-v3-turbo-q5_0.bin");
+        let paraformer_dir = from_env("OMN_PARAFORMER_DIR", "sherpa-onnx-paraformer-zh-2023-09-14");
 
         if !std::path::Path::new(&whisper).exists() {
             return Err(SttError::Load(format!("找不到定稿模型：{whisper}")));
@@ -120,27 +172,22 @@ impl ModelPaths {
                 "找不到即時稿模型：{paraformer_dir}"
             )));
         }
-        let vad = std::env::var("OMN_VAD_MODEL").unwrap_or_else(|_| {
-            beside_exe
-                .join("silero_vad.onnx")
-                .to_string_lossy()
-                .into_owned()
-        });
+        let vad = from_env("OMN_VAD_MODEL", "silero_vad.onnx");
         if !std::path::Path::new(&vad).exists() {
             return Err(SttError::Load(format!("找不到語音偵測模型：{vad}")));
         }
         let punct = std::env::var("OMN_PUNCT_MODEL")
             .ok()
             .or_else(|| {
-                let p = beside_exe.join("sherpa-onnx-punct-ct-transformer/model.onnx");
+                let p = model("sherpa-onnx-punct-ct-transformer/model.onnx");
                 p.exists().then(|| p.to_string_lossy().into_owned())
             })
             .filter(|p| std::path::Path::new(p).exists());
 
         // 兩個模型缺一不可：只有聲紋沒有 segmentation 就找不出語者切換點，
         // 一段裡混了好幾個人的聲紋比對出來只會是亂數。
-        let seg_model = beside_exe.join("speaker-segmentation.onnx");
-        let emb_model = beside_exe.join("speaker-embedding.onnx");
+        let seg_model = model("speaker-segmentation.onnx");
+        let emb_model = model("speaker-embedding.onnx");
         let speaker = (seg_model.exists() && emb_model.exists()).then(|| {
             (
                 seg_model.to_string_lossy().into_owned(),
@@ -220,8 +267,16 @@ impl LocalSttSource {
         log("音訊擷取已啟動");
 
         let (result_tx, rx) = channel();
-        let (fast_tx, fast_rx) = channel();
-        let (slow_tx, slow_rx) = channel();
+        // 兩條引擎佇列都有界。定稿慢於即時速度時，無界佇列會一路長到會議
+        // 結束；長會議因此是一次 OOM，而且停止之後還要等整個積壓跑完，畫面
+        // 停在「收尾中」十幾分鐘。滿了就丟並記錄，見 audio::Chunk 那一層。
+        let (fast_tx, fast_rx) = sync_channel(FAST_BACKLOG_CHUNKS);
+        let (slow_tx, slow_rx) = sync_channel(SLOW_BACKLOG_CHUNKS);
+        // 引擎在這裡載入完才算開始。載入失敗原本是工作執行緒裡的一行 log
+        // 加上 `return`：Session 仍然停在 Recording、健康狀態顯示 ok，而
+        // 定稿執行緒死掉還會讓分流停止讀音訊 —— 使用者錄完整場才發現一個字
+        // 都沒有。
+        let (ready_tx, ready_rx) = channel::<std::result::Result<(), String>>();
 
         // 兩條執行緒共用定稿進度。即時稿要掛在「下一個還沒定稿的片段」上，
         // 而那個編號只有定稿那邊知道。各自記一份的話即時稿會永遠停在第一個
@@ -232,8 +287,9 @@ impl LocalSttSource {
         // 共用會讓快的那個把音訊吃光，慢的那個永遠拿不到完整片段。
         let levels = Arc::new(Levels::default());
         let paused = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicU64::new(0));
         let dispatcher = {
-            let (levels, paused) = (levels.clone(), paused.clone());
+            let (levels, paused, dropped) = (levels.clone(), paused.clone(), dropped.clone());
             std::thread::spawn(move || {
                 for chunk in audio_rx {
                     // 暫停期間直接丟掉，連引擎都不進。擷取執行緒繼續跑是
@@ -245,52 +301,76 @@ impl LocalSttSource {
                     // 音量在這裡取：每個 chunk 都會經過，而且還沒被任何
                     // 閘門篩掉，畫面上的音量條反映的是真的收到什麼
                     levels.observe(chunk.track, rms(&chunk.samples));
-                    let _ = fast_tx.send(chunk.clone());
-                    if slow_tx.send(chunk).is_err() {
-                        break;
+                    // 即時稿是拋棄式的，滿了就丟那一批：它每 800 ms 重算
+                    // 整個視窗，少一批不會留下痕跡
+                    let _ = fast_tx.try_send(chunk.clone());
+                    match slow_tx.try_send(chunk) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_power_of_two() {
+                                log(&format!("定稿佇列已滿，累計丟棄 {n} 批音訊"));
+                            }
+                        }
+                        Err(TrySendError::Disconnected(_)) => break,
                     }
                 }
             })
         };
 
         let fast = {
-            let (dir, vad, tx, progress) = (
+            let (dir, vad, tx, progress, ready) = (
                 models.paraformer_dir.clone(),
                 models.vad.clone(),
                 result_tx.clone(),
                 progress.clone(),
+                ready_tx.clone(),
             );
-            std::thread::spawn(move || partial_loop(fast_rx, tx, &dir, &vad, progress))
+            std::thread::spawn(move || partial_loop(fast_rx, tx, &dir, &vad, progress, &ready))
         };
         let slow = {
-            let (model, vad, punct, spk, tx) = (
-                models.whisper.clone(),
-                models.vad.clone(),
-                models.punct.clone(),
-                models.speaker.clone(),
-                result_tx,
-            );
-            std::thread::spawn(move || {
-                final_loop(
-                    slow_rx,
-                    tx,
-                    &model,
-                    &vad,
-                    punct.as_deref(),
-                    spk.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
-                    progress,
-                )
-            })
+            let (models, tx) = (models.clone(), result_tx);
+            std::thread::spawn(move || final_loop(slow_rx, tx, &models, progress, &ready_tx))
         };
 
-        Ok(Self {
+        let source = Self {
             rx,
             capture,
             workers: vec![dispatcher, fast, slow],
             levels,
             paused,
-        })
+        };
+        // 兩個引擎都回報載入結果才回傳。失敗時 `source` 在這裡被 drop，
+        // 它的 Drop 會停掉擷取並 join 三條執行緒 —— 開了一半的狀態不留下。
+        if let Err(e) = await_engines(&ready_rx) {
+            drop(source);
+            return Err(SttError::Load(e));
+        }
+        log("音訊擷取與轉錄引擎都已就緒");
+        Ok(source)
     }
+}
+
+/// 等兩個引擎回報載入結果。
+///
+/// 沒有時限：載入是純本機的檔案讀取與記憶體配置，慢是因為模型有一 GB，
+/// 不是因為在等誰回答。設一個時限只會在慢一點的磁碟上把成功變成失敗。
+fn await_engines(
+    ready: &Receiver<std::result::Result<(), String>>,
+) -> std::result::Result<(), String> {
+    let mut failures = Vec::new();
+    for _ in 0..2 {
+        match ready.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => failures.push(e),
+            // 執行緒還沒回報就消失了，那本身就是失敗
+            Err(_) => failures.push("轉錄執行緒沒有回報就結束了".to_owned()),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(failures.join("；"))
 }
 
 impl Drop for LocalSttSource {
@@ -365,14 +445,18 @@ fn partial_loop(
     model_dir: &str,
     vad_model: &str,
     progress: Progress,
+    ready: &Sender<std::result::Result<(), String>>,
 ) {
     let mut engine = match Paraformer::load(model_dir, 2) {
         Ok(e) => {
             log(&format!("即時稿引擎已載入：{model_dir}"));
+            let _ = ready.send(Ok(()));
             e
         }
         Err(e) => {
-            log(&format!("即時稿引擎載入失敗（{model_dir}）：{e}"));
+            let msg = format!("即時稿引擎載入失敗（{model_dir}）：{e}");
+            log(&msg);
+            let _ = ready.send(Err(msg));
             return;
         }
     };
@@ -502,19 +586,26 @@ fn partial_loop(
 fn final_loop(
     rx: Receiver<Chunk>,
     tx: Sender<TranscriptInput>,
-    model: &str,
-    vad_model: &str,
-    punct_model: Option<&str>,
-    speaker_model: Option<(&str, &str)>,
+    models: &ModelPaths,
     progress: Progress,
+    ready: &Sender<std::result::Result<(), String>>,
 ) {
+    let (model, vad_model) = (models.whisper.as_str(), models.vad.as_str());
+    let punct_model = models.punct.as_deref();
+    let speaker_model = models
+        .speaker
+        .as_ref()
+        .map(|(a, b)| (a.as_str(), b.as_str()));
     let engine = match Whisper::load(model, 4) {
         Ok(e) => {
             log(&format!("定稿引擎已載入：{model}"));
+            let _ = ready.send(Ok(()));
             e
         }
         Err(e) => {
-            log(&format!("定稿引擎載入失敗（{model}）：{e}"));
+            let msg = format!("定稿引擎載入失敗（{model}）：{e}");
+            log(&msg);
+            let _ = ready.send(Err(msg));
             return;
         }
     };
@@ -539,17 +630,14 @@ fn final_loop(
         }
     });
 
-    // 詞表放執行檔旁邊，使用者自己維護。找不到就只有內建的簡繁詞彙。
-    let vocab = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("vocabulary.txt")))
-        .map(|p| {
-            if p.exists() {
-                log(&format!("詞表已載入：{}", p.display()));
-            }
-            Corrections::from_file(&p)
-        })
-        .unwrap_or_default();
+    // 詞表跟模型走同一組搜尋路徑，使用者自己維護。找不到就只有內建的簡繁詞彙。
+    let vocab = {
+        let p = find_resource("vocabulary.txt");
+        if p.exists() {
+            log(&format!("詞表已載入：{}", p.display()));
+        }
+        Corrections::from_file(&p)
+    };
 
     // 只有系統音訊軌需要辨識語者：麥克風軌一定是使用者本人，那是不需要
     // 模型就成立的先驗，再去比對聲紋只會製造把自己認成別人的機會。
