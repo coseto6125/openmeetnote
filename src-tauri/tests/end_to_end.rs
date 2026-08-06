@@ -156,6 +156,7 @@ fn test_audio_becomes_a_deliverable_document() {
             through_event_seq: seq,
             created_at: "2026-08-05T00:00:00Z",
             transcript: &stored,
+            speakers: &store.speakers_through(meeting, seq).expect("讀取語者"),
         },
         &result.blocks,
     );
@@ -248,6 +249,7 @@ fn test_the_export_survives_hostile_transcript_content() {
             through_event_seq: seq,
             created_at: "2026-08-05T00:00:00Z",
             transcript: &stored,
+            speakers: &store.speakers_through(meeting, seq).expect("讀取語者"),
         },
         &[] as &[Block],
     );
@@ -416,6 +418,7 @@ fn test_the_whole_chain_holds_on_real_audio() {
             through_event_seq: seq,
             created_at: "2026-08-05T00:00:00Z",
             transcript: &stored,
+            speakers: &store.speakers_through(meeting, seq).expect("讀取語者"),
         },
         &v2.blocks,
     );
