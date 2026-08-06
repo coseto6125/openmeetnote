@@ -197,9 +197,13 @@ jobs:
             ## Install
 
             Download the archive for your platform, unpack it, and put the
-            speech models next to the executable. **Models are not bundled** —
-            together they are over a gigabyte, and you should know where that
-            gigabyte lives on your disk. See
+            speech models next to the application — beside `openmeetnote.exe`
+            on Windows, beside `OpenMeetNote.app` on macOS (not inside it).
+            If the application lives somewhere you cannot write, put them in
+            `%APPDATA%\OpenMeetNote` or
+            `~/Library/Application Support/OpenMeetNote` instead.
+            **Models are not bundled** — together they are over a gigabyte,
+            and you should know where that gigabyte lives on your disk. See
             [Running](https://github.com/${{ github.repository }}#running) for
             the layout and download links.
 
