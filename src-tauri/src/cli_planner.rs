@@ -270,7 +270,10 @@ fn build_prompt(req: &DraftRequest<'_>) -> String {
             {\"sourceKind\":\"transcript_segment\",\"sourceId\":\"逐字稿的 id\",\
              \"sourceRevision\":該片段的 rev,\"locator\":\"0-10\",\
              \"quotedText\":\"逐字取自該片段的原文\",\"quotedTextSha256\":\"\"}。\
-            quotedText 必須逐字出現在該片段裡，改寫過的引用會被拒絕，空字串也會。\
+            locator 是 quotedText 在該片段裡的字元起訖（起點含、終點不含，\
+            從 0 起算），程式會把引文拿去跟那一段比對，框錯位置會被拒絕。\
+            quotedText 必須逐字出現在那個範圍裡，至少兩個非標點字元；\
+            改寫過的引用、空字串與純標點都會被拒絕。\
             引用人工筆記時 sourceKind 改成 \"note\"、sourceId 用筆記的 id、\
             sourceRevision 用筆記的 seq。\n\
          3. 缺少或互相矛盾的資訊要用 gap 區塊標出來，不要略過也不要自己補。\
