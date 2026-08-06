@@ -32,11 +32,13 @@ where cargo >nul 2>&1 || (
 
 cd /d "%~dp0"
 call pnpm.cmd install --frozen-lockfile || exit /b 1
-REM --target is required, not optional. tauri.windows.conf.json declares the
+REM Neither flag is optional. bundle-dlls.windows.json declares the
 REM sherpa/onnxruntime DLLs as bundle resources with the glob
 REM `target/*/release/*.dll`, and that only matches when the build has a target
 REM triple. Without it the installers come out missing the DLLs, and the app
 REM they install dies in the loader before main -- which is exactly what 0.1.0
-REM shipped.
-call pnpm.cmd tauri build --target x86_64-pc-windows-msvc || exit /b 1
+REM shipped. The file is not named tauri.windows.conf.json because that name is
+REM auto-loaded by every cargo invocation, including a debug `cargo clippy`,
+REM where target/*/release/ holds no DLLs and the build script aborts.
+call pnpm.cmd tauri build --target x86_64-pc-windows-msvc --config src-tauri/bundle-dlls.windows.json || exit /b 1
 echo [build-win] bundles are under src-tauri\target\x86_64-pc-windows-msvc\release\bundle
