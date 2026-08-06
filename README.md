@@ -87,10 +87,11 @@ trend, process alive, meeting closed cleanly.
 ## Running
 
 Models are **not** bundled. Together they exceed a gigabyte, and you should
-know where that gigabyte lives on your disk. Put them next to the executable:
+know where that gigabyte lives on your disk. Put them next to the application:
 
 ```text
-openmeetnote(.exe)
+openmeetnote.exe                    # Windows: next to the .exe
+OpenMeetNote.app                    # macOS: next to the .app, not inside it
 vocabulary.txt                      # proper-noun corrections, edit freely
 models/
   ggml-large-v3-turbo-q5_0.bin      # final transcript
@@ -99,6 +100,12 @@ models/
   silero_vad.onnx                   # voice activity detection
   speaker-embedding.onnx            # speaker identification (optional)
 ```
+
+If the application lives somewhere you cannot write — `/Applications`,
+`C:\Program Files` — put `models/` and `vocabulary.txt` in the user data
+directory instead: `%APPDATA%\OpenMeetNote` on Windows,
+`~/Library/Application Support/OpenMeetNote` on macOS. Next to the
+application is searched first.
 
 A missing required model refuses the recording and says which file is absent.
 It never degrades silently into a recording with no transcript — that failure
@@ -115,9 +122,12 @@ priority over the GUI settings:
 | `OMN_VAD_MODEL` | Voice activity model |
 | `OMN_PUNCT_MODEL` | Punctuation model |
 
-Engine loading and per-batch decisions are written to `stt.log` next to the
-executable. On Windows the GUI subsystem has no stderr; without that file a
-failed model load is completely silent.
+Engine loading and per-batch decisions are written to `stt.log` in the user
+data directory (`%APPDATA%\OpenMeetNote`,
+`~/Library/Application Support/OpenMeetNote`). On Windows the GUI subsystem
+has no stderr; without that file a failed model load is completely silent —
+which is why the log goes somewhere always writable rather than next to the
+application.
 
 ### macOS permissions
 

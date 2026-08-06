@@ -281,22 +281,69 @@ export function DocumentView({ blocks, segments, onCite }: DocumentViewProps) {
       ),
     );
 
+  // 目錄與匯出檔用同一條規則（`document.rs` 的 `toc`）：只列真的存在的區，
+  // 只有一個入口就不算目錄。畫面沒有目錄而匯出有，讀者會以為兩份文件的
+  // 組織方式不一樣。
+  const toc: { href: string; label: string; sub?: boolean }[] = [];
+  if (summary?.c?.type === 'callout') toc.push({ href: 'doc-summary', label: '成果摘要' });
+  if (body.length > 0) {
+    toc.push({ href: 'doc-body', label: '主文' });
+    for (const { b, c } of body) {
+      if (c?.type === 'heading' && c.level <= 2) {
+        toc.push({ href: `doc-h-${b.position}`, label: c.text, sub: true });
+      }
+    }
+  }
+  if (decisions.length > 0 || actions.length > 0)
+    toc.push({ href: 'doc-decisions', label: '決議與行動項目' });
+  if (open.length > 0) toc.push({ href: 'doc-open', label: '缺口與建議' });
+
   return (
     <div className="doc">
+      {toc.length > 1 && (
+        <nav className="doc-toc" aria-label="目錄">
+          {/* 用按鈕捲動而不是 <a href="#…">：這是應用程式不是文件，改寫
+              網址列的 hash 沒有人會想要。匯出的那份是靜態 HTML，那邊用錨點 */}
+          {toc.map((t) => (
+            <button
+              key={t.href}
+              type="button"
+              data-sub={t.sub ? '1' : undefined}
+              onClick={() =>
+                document.getElementById(t.href)?.scrollIntoView({ behavior: 'smooth' })
+              }
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
+      )}
+
       {summary?.c?.type === 'callout' && (
-        <section className="doc-tldr">
+        <section className="doc-tldr" id="doc-summary">
           <h3>成果摘要</h3>
           <p>{summary.c.body}</p>
           <Cites block={summary.b} segments={index} onCite={onCite} />
         </section>
       )}
 
-      {body.length > 0 && <section className="doc-sec">{render(body)}</section>}
+      {body.length > 0 && (
+        <section className="doc-sec" id="doc-body">
+          {render(body)}
+        </section>
+      )}
 
       {(decisions.length > 0 || actions.length > 0) && (
-        <section className="doc-sec">
+        <section className="doc-sec" id="doc-decisions">
           <h3 className="doc-sec-head">決議與行動項目</h3>
-          {decisions.length > 0 && <div className="doc-group">{render(decisions)}</div>}
+          {/* 決議也帶自己的小標。匯出檔兩個群組各有一個 h3，畫面上只有
+              行動項目有，於是同樣一份文件在兩邊看起來層級不同 */}
+          {decisions.length > 0 && (
+            <div className="doc-group">
+              <span className="doc-group-head">決議</span>
+              {render(decisions)}
+            </div>
+          )}
           {actions.length > 0 && (
             <div className="doc-group doc-actions">
               <span className="doc-group-head">行動項目</span>
