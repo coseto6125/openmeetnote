@@ -615,6 +615,52 @@ pub struct RenderContext<'a> {
     pub created_at: &'a str,
     /// 逐字稿附件。§10 要求匯出至少包含完整逐字稿或可選附件。
     pub transcript: &'a [crate::store::StoredSegment],
+    /// 快照當下的語者。匯出要顯示使用者確認過的名字，不是 `s1`。
+    pub speakers: &'a [crate::store::StoredSpeaker],
+}
+
+/// 語者識別碼到顯示名稱的對照（§8.4）。
+///
+/// 規則與畫面端的 `speakerDisplayName`（src/meeting.ts）逐條相同：
+/// 確認名 > 暫定名 > 麥克風軌是「我」、其餘是「語者 N」。兩個渲染器是刻意
+/// 分開的，但顯示同一位語者時必須說出同一個名字 —— 畫面上是 Alice、匯出檔
+/// 裡是 `s1`，使用者會以為那是兩個人。
+///
+/// 「語者 N」只數遠端語者：麥克風軌會佔掉一個 ordinal，跟著數的話遠端第一位
+/// 就變成「語者 2」。
+fn speaker_names(
+    speakers: &[crate::store::StoredSpeaker],
+    transcript: &[crate::store::StoredSegment],
+) -> std::collections::HashMap<String, String> {
+    use crate::model::Track;
+    let mut track_of: std::collections::HashMap<&str, Track> = std::collections::HashMap::new();
+    for s in transcript {
+        if let Some(id) = s.speaker_id.as_deref() {
+            track_of.entry(id).or_insert(s.track);
+        }
+    }
+    let mut remote = 0u32;
+    speakers
+        .iter()
+        .map(|s| {
+            let track = track_of
+                .get(s.speaker_id.as_str())
+                .copied()
+                .unwrap_or(Track::System);
+            if track == Track::System {
+                remote += 1;
+            }
+            let name = s
+                .confirmed_name
+                .clone()
+                .or_else(|| s.proposed_name.clone())
+                .unwrap_or_else(|| match track {
+                    Track::Mic => "我".to_owned(),
+                    Track::System => format!("語者 {remote}"),
+                });
+            (s.speaker_id.clone(), name)
+        })
+        .collect()
 }
 
 /// 匯出文件的分區。§10 規定匯出至少要有哪幾塊，這個 enum 就是那份清單。
@@ -776,6 +822,7 @@ pub fn render_html(ctx: &RenderContext<'_>, blocks: &[Block]) -> String {
 
     // 沒有逐字稿就不要留一個空的段落標題。目錄也不會列它，
     // 兩邊不一致的話讀者會以為逐字稿掉了。
+    let names = speaker_names(ctx.speakers, ctx.transcript);
     let mut rows = String::new();
     for s in ctx.transcript {
         rows.push_str(&format!(
@@ -784,7 +831,12 @@ pub fn render_html(ctx: &RenderContext<'_>, blocks: &[Block]) -> String {
             id = s.segment_id,
             rev = s.revision,
             time = escape(&mmss(s.meeting_start_ms)),
-            who = escape(s.speaker_id.as_deref().unwrap_or("未指派")),
+            who = escape(
+                s.speaker_id
+                    .as_deref()
+                    .and_then(|id| names.get(id))
+                    .map_or("未指派", String::as_str)
+            ),
             text = escape(&s.text),
         ));
     }
@@ -1009,6 +1061,7 @@ mod tests {
             through_event_seq: 10,
             created_at: "2026-08-05T00:00:00Z",
             transcript: &[],
+            speakers: &[],
         }
     }
 
@@ -1118,14 +1171,75 @@ mod tests {
             meeting_end_ms: 1000,
             user_edited: false,
         };
+        // 名字現在來自語者表，注入點跟著移到那裡
+        let speakers = vec![crate::store::StoredSpeaker {
+            speaker_id: "<img src=x onerror=alert(1)>".into(),
+            ordinal: 1,
+            proposed_name: None,
+            confirmed_name: Some("<script>alert(1)</script>".into()),
+            status: "confirmed".into(),
+        }];
         let c = RenderContext {
             transcript: std::slice::from_ref(&seg),
+            speakers: &speakers,
             ..ctx()
         };
         let html = render_html(&c, &[]);
-        assert!(!html.contains("<img "), "語者名稱可以注入元素");
+        assert!(!html.contains("<img "), "語者識別碼可以注入元素");
+        assert!(!html.contains("<script>alert"), "語者名稱可以注入元素");
         assert!(!html.contains("<b>粗體</b>"), "逐字稿內容沒有被轉義");
         assert!(html.contains("&lt;b&gt;"), "轉義後的內容不見了");
+    }
+
+    /// 匯出檔要顯示使用者確認過的名字，不是內部識別碼。
+    ///
+    /// 畫面上寫 Alice、匯出檔裡寫 `s1`，使用者會以為那是兩個人。名稱規則
+    /// 與 src/meeting.ts 的 `speakerDisplayName` 是同一條。
+    #[test]
+    fn the_export_calls_a_speaker_what_the_screen_calls_them() {
+        let seg = |id: &str, track| crate::store::StoredSegment {
+            segment_id: 1,
+            revision: 1,
+            origin: crate::model::Origin::Provider,
+            speaker_id: Some(id.into()),
+            text: "說了一句話".into(),
+            track,
+            meeting_start_ms: 0,
+            meeting_end_ms: 1000,
+            user_edited: false,
+        };
+        let speaker = |id: &str, ordinal, confirmed: Option<&str>| crate::store::StoredSpeaker {
+            speaker_id: id.into(),
+            ordinal,
+            proposed_name: None,
+            confirmed_name: confirmed.map(str::to_owned),
+            status: "confirmed".into(),
+        };
+        let transcript = vec![
+            seg("me", crate::model::Track::Mic),
+            seg("s1", crate::model::Track::System),
+            seg("s2", crate::model::Track::System),
+        ];
+        let speakers = vec![
+            speaker("me", 1, None),
+            speaker("s1", 2, Some("Alice")),
+            speaker("s2", 3, None),
+        ];
+        let c = RenderContext {
+            transcript: &transcript,
+            speakers: &speakers,
+            ..ctx()
+        };
+        let html = render_html(&c, &[]);
+        assert!(html.contains("Alice"), "確認過的名字沒有進匯出檔");
+        assert!(!html.contains(">s1<"), "還在顯示內部識別碼");
+        assert!(html.contains("我"), "麥克風軌沒有顯示成「我」");
+        // 「語者 N」只數遠端語者：麥克風軌佔掉一個 ordinal，跟著數的話
+        // 未命名的遠端語者會從「語者 2」開始
+        assert!(
+            html.contains("語者 2"),
+            "遠端語者的編號跟著麥克風軌一起數了"
+        );
     }
 
     #[test]
@@ -1345,6 +1459,7 @@ mod tests {
                 through_event_seq: seq,
                 created_at: "2026-08-05T00:00:00Z",
                 transcript: &transcript,
+                speakers: &[],
             },
             &ok,
         );
@@ -1788,6 +1903,7 @@ mod tests {
                 through_event_seq: 10,
                 created_at: "2026-08-01T00:00:00.000Z",
                 transcript: &[],
+                speakers: &[],
             },
             &[b],
         )
@@ -1856,6 +1972,7 @@ mod tests {
                 through_event_seq: cursor,
                 created_at: "2026-08-01T00:00:00.000Z",
                 transcript: &s.segments_through(m, cursor).unwrap(),
+                speakers: &s.speakers_through(m, cursor).unwrap(),
             },
             &ok,
         );

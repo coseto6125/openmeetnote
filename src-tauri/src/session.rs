@@ -2210,6 +2210,10 @@ pub fn export_document(
     let transcript = st
         .segments_through(meeting_id, run.through_event_seq)
         .map_err(|e| e.to_string())?;
+    // 語者名稱也讀快照當下的：匯出檔顯示的是那一版看到的名字
+    let speakers = st
+        .speakers_through(meeting_id, run.through_event_seq)
+        .map_err(|e| e.to_string())?;
 
     // 標題用會議名稱，不是 documents.title（那一律是「會議摘要」）
     let title = st.meeting_title(meeting_id).map_err(|e| e.to_string())?;
@@ -2220,6 +2224,7 @@ pub fn export_document(
             through_event_seq: run.through_event_seq,
             created_at: &run.created_at,
             transcript: &transcript,
+            speakers: &speakers,
         },
         &blocks,
     );
