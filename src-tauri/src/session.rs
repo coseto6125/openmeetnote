@@ -1483,6 +1483,17 @@ fn now_ms() -> u64 {
 pub struct SessionHandle {
     inner: Mutex<Session>,
     epoch: Instant,
+    /// 只給 `start_meeting` 用的門。
+    ///
+    /// 開始錄音是「建立會議列、開音訊裝置、載入模型、切狀態」四步，只有最後
+    /// 一步在 Session 的鎖裡面。雙擊或並行呼叫時，第二次會走完前三步才發現
+    /// 已經在錄音了 —— 而第三步已經把正在錄音的來源換掉：舊來源被 drop、
+    /// 停止並 join，新來源的 segment id 從頭開始又被既有的定稿擋住，那一場
+    /// 會議就此不再產生逐字稿，另外留下一列空會議。
+    ///
+    /// 用獨立的鎖而不是把整段包進 `inner`：開裝置與載入模型要好幾秒，
+    /// 期間 Session 的鎖必須是放開的，事件迴圈還在跑。
+    starting: Mutex<()>,
 }
 
 impl Default for SessionHandle {
@@ -1490,6 +1501,7 @@ impl Default for SessionHandle {
         Self {
             inner: Mutex::new(Session::default()),
             epoch: Instant::now(),
+            starting: Mutex::new(()),
         }
     }
 }
@@ -1524,6 +1536,7 @@ impl SessionHandle {
         Self {
             inner: Mutex::new(session),
             epoch: Instant::now(),
+            starting: Mutex::new(()),
         }
     }
 
@@ -1869,6 +1882,24 @@ pub fn spawn_pump(app: AppHandle) {
 
 #[tauri::command]
 pub fn start_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> CommandReceipt {
+    // 一次只有一個開始流程。少了這道門，雙擊的第二次會建立空會議、開音訊
+    // 裝置、把正在錄音的來源換掉，最後才由 `Session::start` 回報「已在進行
+    // 中」—— 拒絕得太晚，傷害已經造成。
+    let _gate = match state.starting.lock() {
+        Ok(g) => g,
+        Err(_) => return CommandReceipt::rejected(POISONED_NOTE),
+    };
+    // 先問狀態再動手。這個檢查在門裡面，所以它看到的是前一次開始流程
+    // 走完之後的狀態，不是它開始之前的。
+    match state.with(|s| s.state) {
+        Ok(MeetingState::Idle) => {}
+        Ok(MeetingState::Completed) => {
+            return CommandReceipt::rejected("會議已結束，請建立新會議")
+        }
+        Ok(_) => return CommandReceipt::rejected("會議已在進行中"),
+        Err(_) => return CommandReceipt::rejected(POISONED_NOTE),
+    }
+
     // 會議列在這裡建立，不在 app 啟動時：否則每開一次程式就多一列空會議
     let created = match store.exclusive() {
         Ok(mut st) => {
