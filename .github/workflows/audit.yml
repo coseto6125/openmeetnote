@@ -25,3 +25,5 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Cargo.lock 在 src-tauri/ 底下，不在 repo 根目錄
+          working-directory: src-tauri
