@@ -830,7 +830,9 @@ impl Planner for FixturePlanner {
         // 每個片段各出一個 Fact，引文逐字取自該版本的開頭
         for s in req.evidence.segments.iter().take(6) {
             let quote: String = s.text.chars().take(12).collect();
-            if quote.trim().is_empty() {
+            // 用與驗證同一條判準，不是「非空白」：fixture 送出一筆註定被
+            // 拒絕的引用，整合測試就分不出是驗證有效還是 fixture 有問題
+            if !document::is_quotable(&quote) {
                 continue;
             }
             blocks.push(Block {

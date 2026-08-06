@@ -502,8 +502,8 @@ pub struct Session {
     /// 日誌寫入失敗。發生後拒絕所有會產生新事件的命令：
     /// 繼續接受命令等於讓使用者以為內容有被保存。
     journal_error: Option<String>,
-    next_document_id: i64,
-    next_run_id: i64,
+    /// 這場會議的文件 id，第一次生成時由 Store 配發後記住。
+    /// 號碼本身不在這裡產生 —— 見 `Store::allocate_run_ids`。
     document_id: Option<i64>,
     /// 版本號到 run_id 的對應。UI 用版本號，日誌用 run_id。
     run_ids: HashMap<u32, i64>,
@@ -543,8 +543,6 @@ impl Session {
             pending: Vec::new(),
             journal: Vec::new(),
             journal_error: None,
-            next_document_id: 1,
-            next_run_id: 1,
             document_id: None,
             run_ids: HashMap::new(),
             source,
@@ -1073,12 +1071,10 @@ impl Session {
     ///
     /// 會議列在 `start` 才建立，不在啟動時建立：每次開 app 就多一列空會議，
     /// 歷史頁會被沒發生過的會議塞滿。
-    pub fn start(&mut self, meeting: MeetingId, seeds: crate::store::IdSeeds) -> CommandReceipt {
+    pub fn start(&mut self, meeting: MeetingId) -> CommandReceipt {
         match self.state {
             MeetingState::Idle => {
                 self.meeting_id = Some(meeting);
-                self.next_document_id = seeds.document_id + 1;
-                self.next_run_id = seeds.run_id + 1;
                 CommandReceipt::ok(self.transition(MeetingState::Recording))
             }
             // 結束後要開新會議必須是全新的 Session，不能沿用舊 seq、片段與快照。
@@ -1235,7 +1231,11 @@ impl Session {
     /// 自己涵蓋到哪裡，而不是在執行當下重新問一次「現在到哪了」。
     /// 建立快照。`prompt` 是本輪要求，會跟著版本一起存 —— 沒有它，
     /// 歷史頁上的多個版本看起來一模一樣，使用者無從知道哪一版問的是什麼。
-    pub fn create_snapshot(&mut self, prompt: &str) -> (CommandReceipt, Option<SnapshotWork>) {
+    pub fn create_snapshot(
+        &mut self,
+        prompt: &str,
+        ids: crate::store::RunIds,
+    ) -> (CommandReceipt, Option<SnapshotWork>) {
         if !self.state.accepts_snapshot() {
             return (CommandReceipt::rejected("目前的會議狀態不接受快照"), None);
         }
@@ -1265,7 +1265,7 @@ impl Session {
             state: "running",
             prompt: prompt.to_owned(),
         });
-        let (document_id, run_id) = self.allocate_run(version);
+        let (document_id, run_id) = self.allocate_run(version, ids);
         let seq = self.record(
             DomainEvent::SnapshotCreated {
                 document_id,
@@ -1317,19 +1317,16 @@ impl Session {
         }
     }
 
-    /// 一個文件加一輪生成的 id。事件必須自帶 id，重播才不會因插入順序而變。
-    fn allocate_run(&mut self, version: u32) -> (i64, i64) {
-        // 同一場會議目前只產生一份文件，版本鏈掛在它下面
-        let document_id = self.document_id.get_or_insert_with(|| {
-            let id = self.next_document_id;
-            self.next_document_id += 1;
-            id
-        });
-        let document_id = *document_id;
-        let run_id = self.next_run_id;
-        self.next_run_id += 1;
-        self.run_ids.insert(version, run_id);
-        (document_id, run_id)
+    /// 記下這一輪的 id。事件必須自帶 id，重播才不會因插入順序而變。
+    ///
+    /// 號碼由呼叫端從 Store 配發後傳進來，Session 不自己產生：兩個獨立的
+    /// 配發者算出同一個號碼，就是一場會議的成果覆寫另一場的那條路徑。
+    /// 同一場會議只產生一份文件，第二輪起沿用既有的，`ids.document_id`
+    /// 那個號碼就空著不用。
+    fn allocate_run(&mut self, version: u32, ids: crate::store::RunIds) -> (i64, i64) {
+        let document_id = *self.document_id.get_or_insert(ids.document_id);
+        self.run_ids.insert(version, ids.run_id);
+        (document_id, ids.run_id)
     }
 
     fn finish_generation(
@@ -1409,7 +1406,7 @@ impl Session {
         }
     }
 
-    pub fn inject_fault(&mut self, kind: &str) -> CommandReceipt {
+    pub fn inject_fault(&mut self, kind: &str, ids: crate::store::RunIds) -> CommandReceipt {
         match kind {
             "micLost" => {
                 self.mic_health = Health::Lost;
@@ -1441,7 +1438,7 @@ impl Session {
                     state: "failed",
                     prompt: String::new(),
                 });
-                let (document_id, run_id) = self.allocate_run(version);
+                let (document_id, run_id) = self.allocate_run(version, ids);
                 self.record(
                     DomainEvent::SnapshotCreated {
                         document_id,
@@ -1643,16 +1640,17 @@ fn summarize_past_meeting(
     prompt: &str,
 ) -> Result<u32, String> {
     let (document_id, run_id, version, through, revise_of) = {
-        let st = store.exclusive().map_err(|e| e.to_string())?;
+        let mut st = store.exclusive().map_err(|e| e.to_string())?;
         let runs = st.runs(meeting_id).map_err(|e| e.to_string())?;
-        let seeds = st.id_seeds().map_err(|e| e.to_string())?;
+        // 配發在持鎖期間完成，號碼因此不會與錄音中那場會議的下一輪相同
+        let ids = st.allocate_run_ids().map_err(|e| e.to_string())?;
         let document_id = st
             .document_of(meeting_id)
             .map_err(|e| e.to_string())?
-            .unwrap_or(seeds.document_id + 1);
+            .unwrap_or(ids.document_id);
         (
             document_id,
-            seeds.run_id + 1,
+            ids.run_id,
             runs.iter().map(|r| r.version_no).max().unwrap_or(0) + 1,
             // 已結束的會議不會再有新事件，游標就是它的終點
             st.high_seq(meeting_id).map_err(|e| e.to_string())?,
@@ -1876,11 +1874,10 @@ pub fn start_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> 
         Ok(mut st) => {
             let title = format!("會議 {}", crate::clock::now_utc()[..16].replace('T', " "));
             st.create_meeting(&title)
-                .and_then(|id| Ok((id, st.id_seeds()?)))
         }
         Err(_) => return CommandReceipt::rejected("資料庫連線狀態已損毀"),
     };
-    let (meeting, seeds) = match created {
+    let meeting = match created {
         Ok(v) => v,
         Err(e) => return CommandReceipt::rejected(&format!("無法建立會議：{e}")),
     };
@@ -1908,7 +1905,7 @@ pub fn start_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> 
         }
     }
 
-    command(&state, &store, |s| s.start(meeting, seeds))
+    command(&state, &store, |s| s.start(meeting))
 }
 
 #[tauri::command]
@@ -1958,7 +1955,13 @@ pub fn create_snapshot(
     prompt: Option<String>,
 ) -> CommandReceipt {
     let prompt = prompt.unwrap_or_default();
-    let outcome = state.with(|s| s.create_snapshot(&prompt));
+    // 配發在這裡而不是 Session 裡：號碼是全域的，只能有一個配發者，
+    // 而 Session 看不到別場會議正在用哪些號碼
+    let ids = match store.exclusive().map(|mut st| st.allocate_run_ids()) {
+        Ok(Ok(ids)) => ids,
+        _ => return CommandReceipt::rejected("資料庫連線狀態已損毀"),
+    };
+    let outcome = state.with(|s| s.create_snapshot(&prompt, ids));
     let (receipt, snapshot) = match outcome {
         Ok(v) => v,
         Err(_) => return CommandReceipt::rejected(POISONED_NOTE),
@@ -2366,13 +2369,28 @@ pub fn inject_fault(
     store: State<StoreHandle>,
     kind: String,
 ) -> CommandReceipt {
-    command(&state, &store, |s| s.inject_fault(&kind))
+    let ids = match store.exclusive().map(|mut st| st.allocate_run_ids()) {
+        Ok(Ok(ids)) => ids,
+        _ => return CommandReceipt::rejected("資料庫連線狀態已損毀"),
+    };
+    command(&state, &store, |s| s.inject_fault(&kind, ids))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db;
+
+    /// 測試用的號碼。正式路徑由 `Store::allocate_run_ids` 配發，
+    /// 這裡只需要「每次都不一樣」這個性質。
+    fn ids() -> crate::store::RunIds {
+        static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::store::RunIds {
+            document_id: n,
+            run_id: n,
+        }
+    }
 
     /// 把 Session 累積的日誌寫進 Store，回傳配發到的 seq。
     /// 這是 `flush` 的測試版：同樣只有這一個 append 呼叫點。
@@ -2385,7 +2403,7 @@ mod tests {
         let mut store = Store::new(db::open_in_memory().unwrap());
         let meeting = store.create_meeting("測試").unwrap();
         let mut s = Session::default();
-        assert!(s.start(meeting, Default::default()).accepted);
+        assert!(s.start(meeting).accepted);
         (s, store, meeting)
     }
 
@@ -2434,7 +2452,7 @@ mod tests {
     /// 走真正的 `start` 命令，不手動設定狀態。
     fn recording() -> Session {
         let mut s = Session::default();
-        assert!(s.start(1, Default::default()).accepted);
+        assert!(s.start(1).accepted);
         s.pending.clear();
         s.take_journal();
         s
@@ -2508,7 +2526,7 @@ mod tests {
             src.push(b);
         }
         let mut s = Session::with_source(Box::new(src));
-        assert!(s.start(meeting, Default::default()).accepted);
+        assert!(s.start(meeting).accepted);
         s.pending.clear();
         s
     }
@@ -2687,7 +2705,7 @@ mod tests {
         s.settle(100);
         s.pause();
         s.pending.clear();
-        s.inject_fault("micLost");
+        s.inject_fault("micLost", ids());
         s.tick(200);
         let batch = s.drain(0);
         assert!(
@@ -2706,7 +2724,7 @@ mod tests {
     #[test]
     fn test_stt_outage_keeps_recording_and_produces_no_transcript() {
         let mut s = scripted(vec![vec![final_(1, "不該出現")]]);
-        s.inject_fault("sttDown");
+        s.inject_fault("sttDown", ids());
         s.tick(400);
         let batch = s.drain(0);
         assert_eq!(
@@ -2728,16 +2746,16 @@ mod tests {
     fn test_commands_are_rejected_outside_a_live_meeting() {
         let mut s = Session::default();
         assert!(!s.add_note("尚未開始").accepted);
-        assert!(!s.create_snapshot("").0.accepted);
+        assert!(!s.create_snapshot("", ids()).0.accepted);
         assert!(!s.confirm_speaker("s1", "某人").accepted);
         assert_eq!(s.seq, 0, "被拒絕的命令不得配發 seq");
 
-        s.start(1, Default::default());
+        s.start(1);
         stop_and_settle(&mut s);
         assert_eq!(s.state, MeetingState::Completed);
         assert!(!s.add_note("已結束").accepted);
         assert!(
-            !s.start(1, Default::default()).accepted,
+            !s.start(1).accepted,
             "結束後不得沿用同一個 Session 重新開始"
         );
     }
@@ -2746,7 +2764,7 @@ mod tests {
     #[test]
     fn test_words_still_being_transcribed_when_stop_is_pressed_still_land() {
         let mut s = Session::default();
-        assert!(s.start(1, Default::default()).accepted);
+        assert!(s.start(1).accepted);
         s.attach_source(Box::new(LateSource {
             pending: vec![TranscriptInput::Final {
                 segment_id: 1,
@@ -2776,7 +2794,7 @@ mod tests {
     #[test]
     fn test_the_meeting_waits_in_finalizing_until_the_source_is_drained() {
         let mut s = Session::default();
-        assert!(s.start(1, Default::default()).accepted);
+        assert!(s.start(1).accepted);
         s.attach_source(Box::new(LateSource {
             pending: vec![TranscriptInput::Final {
                 segment_id: 1,
@@ -2802,7 +2820,7 @@ mod tests {
         stop_and_settle(&mut s);
         assert_eq!(s.state, MeetingState::Completed);
 
-        let (receipt, work) = s.create_snapshot("整理今天的決議");
+        let (receipt, work) = s.create_snapshot("整理今天的決議", ids());
         assert!(receipt.accepted, "開完會之後就按不出摘要了");
         assert!(work.is_some(), "沒有實際排入生成工作");
     }
@@ -2811,7 +2829,7 @@ mod tests {
     #[test]
     fn test_an_idle_session_has_nothing_to_summarise() {
         let mut s = Session::default();
-        assert!(!s.create_snapshot("整理重點").0.accepted);
+        assert!(!s.create_snapshot("整理重點", ids()).0.accepted);
     }
 
     /// 開新會議之前，還在跑的生成必須有結局。
@@ -2821,7 +2839,7 @@ mod tests {
     #[test]
     fn test_a_generation_still_running_gets_a_verdict_before_the_session_is_replaced() {
         let mut s = recording();
-        assert!(s.create_snapshot("整理重點").0.accepted);
+        assert!(s.create_snapshot("整理重點", ids()).0.accepted);
         s.pending.clear();
         s.take_journal();
 
@@ -2840,7 +2858,7 @@ mod tests {
     #[test]
     fn test_finished_generations_are_left_alone() {
         let mut s = recording();
-        assert!(s.create_snapshot("整理重點").0.accepted);
+        assert!(s.create_snapshot("整理重點", ids()).0.accepted);
         s.finish_generation(1, Vec::new(), serde_json::json!({}), None);
         s.pending.clear();
         s.take_journal();
@@ -2905,7 +2923,7 @@ mod tests {
     #[test]
     fn test_pausing_actually_tells_the_audio_source_to_stop() {
         let mut s = Session::default();
-        assert!(s.start(1, Default::default()).accepted);
+        assert!(s.start(1).accepted);
         let toggles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         s.attach_source(Box::new(PauseSpy(toggles.clone())));
 
@@ -2965,7 +2983,7 @@ mod tests {
         // 這個值本來就存進資料庫了，只是沒送到畫面上。少了它，多個版本
         // 在畫面上看起來一模一樣，使用者無從知道哪一版問的是什麼。
         let mut s = recording();
-        s.create_snapshot("整理成決議清單");
+        s.create_snapshot("整理成決議清單", ids());
         assert_eq!(s.projection().snapshots[0].prompt, "整理成決議清單");
         assert!(
             s.drain(0)
@@ -2982,17 +3000,17 @@ mod tests {
         // 它沒有內容可以修訂。
         let mut s = recording();
         assert_eq!(
-            s.create_snapshot("").1.unwrap().revise_of,
+            s.create_snapshot("", ids()).1.unwrap().revise_of,
             None,
             "第一版沒有前一版"
         );
 
         s.finish_generation(1, Vec::new(), serde_json::json!({}), None);
-        assert_eq!(s.create_snapshot("").1.unwrap().revise_of, Some(1));
+        assert_eq!(s.create_snapshot("", ids()).1.unwrap().revise_of, Some(1));
 
         s.finish_generation(2, Vec::new(), serde_json::json!({}), Some("失敗".into()));
         assert_eq!(
-            s.create_snapshot("").1.unwrap().revise_of,
+            s.create_snapshot("", ids()).1.unwrap().revise_of,
             Some(1),
             "拿失敗的版本當基礎了"
         );
@@ -3002,7 +3020,7 @@ mod tests {
     fn test_snapshot_cursor_excludes_events_after_it() {
         let mut s = recording();
         s.add_note("快照前");
-        let (receipt, version) = s.create_snapshot("");
+        let (receipt, version) = s.create_snapshot("", ids());
         assert!(receipt.accepted);
         assert_eq!(version.map(|w| w.version), Some(1));
         let through = s.snapshots[0].through_event_seq;
@@ -3020,7 +3038,7 @@ mod tests {
         let mut s = scripted(vec![vec![final_(1, "第一句")]]);
         s.tick(100);
         s.add_note("一筆筆記");
-        s.create_snapshot("");
+        s.create_snapshot("", ids());
 
         let p = s.projection();
         assert_eq!(p.segments.len(), 1);
@@ -3141,7 +3159,7 @@ mod tests {
             s.add_note("記一筆"),
             s.confirm_speaker("s1", "小明"),
             s.edit_transcript(1, "改一下"),
-            s.create_snapshot("").0,
+            s.create_snapshot("", ids()).0,
         ] {
             assert!(!r.accepted, "日誌寫不進去時不得假裝命令成功");
             assert!(r.note.unwrap().contains("無法寫入本機資料庫"));
@@ -3398,7 +3416,7 @@ mod tests {
         let m = store.exclusive().unwrap().create_meeting("測試").unwrap();
         let mut s = scripted_for(m, vec![vec![final_(1, "報價要拆成設計、開發、維運三項")]]);
         s.tick(100);
-        let (receipt, snap) = s.create_snapshot("");
+        let (receipt, snap) = s.create_snapshot("", ids());
         assert!(receipt.accepted);
         let work = snap.unwrap();
         store
@@ -3859,7 +3877,7 @@ mod tests {
         // 多個版本在歷史頁上長得一模一樣的話，使用者無從知道哪一版問的是
         // 什麼。Prompt 要跟著版本一起存，不只是傳給 Planner 用完就丟。
         let mut s = recording();
-        let (receipt, snapshot) = s.create_snapshot("只列出待確認事項");
+        let (receipt, snapshot) = s.create_snapshot("只列出待確認事項", ids());
         assert!(receipt.accepted);
         assert!(snapshot.is_some());
 
@@ -3878,7 +3896,7 @@ mod tests {
     fn test_a_snapshot_without_a_prompt_stores_an_empty_one() {
         // 沒有特別要求是常態，不該變成缺漏或預設文字
         let mut s = recording();
-        s.create_snapshot("");
+        s.create_snapshot("", ids());
         let stored = s
             .journal
             .iter()

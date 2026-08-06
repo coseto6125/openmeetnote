@@ -1341,24 +1341,31 @@ impl Store {
             .optional()?)
     }
 
-    /// 全域 rowid 的目前上限，供 Session 配發新 id。
+    /// 配發一個文件 id 與一個生成版本 id。
     ///
-    /// 事件必須自帶 id（否則重播時 rowid 會隨插入順序改變），因此配發者是
-    /// Session 而不是資料庫。開新會議時從這裡續號。
-    pub fn id_seeds(&self) -> Result<IdSeeds> {
-        let max = |table: &str| -> Result<i64> {
-            Ok(self.conn.query_row(
-                &format!("SELECT COALESCE(MAX(id), 0) FROM {table}"),
-                [],
-                |r| r.get(0),
-            )?)
-        };
-        Ok(IdSeeds {
-            document_id: max("documents")?,
-            run_id: max("generation_runs")?,
-            attachment_id: max("attachments")?,
-            audio_segment_id: max("audio_segments")?,
+    /// 事件必須自帶 id（否則重播時 rowid 會隨插入順序改變），所以配發者在
+    /// 程式這邊。但配發者只能有一個：曾經是 Session 在會議開始時快取一次
+    /// `MAX(id)+1`、歷史頁的摘要每次重讀，於是錄音中對舊會議做摘要就會拿到
+    /// 同一個號碼，而撞號的後果是一場會議的成果被另一場覆寫（見 002 migration）。
+    ///
+    /// 遞增與讀取在同一個 statement 裡，因此就算配發之後隔很久才真的寫入
+    /// 事件，號碼也不會被別人拿走 —— 那是 `MAX(id)+1` 做不到的地方。
+    ///
+    /// 兩個號碼一起發：呼叫端可能只用得到其中一個（同一場會議的第二次生成
+    /// 沿用既有文件），沒用到的號碼就空著。空號沒有代價，重複的號碼有。
+    pub fn allocate_run_ids(&mut self) -> Result<RunIds> {
+        Ok(RunIds {
+            document_id: self.next_id("documents")?,
+            run_id: self.next_id("generation_runs")?,
         })
+    }
+
+    fn next_id(&mut self, name: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "UPDATE id_sequences SET next = next + 1 WHERE name = ?1 RETURNING next - 1",
+            params![name],
+            |r| r.get(0),
+        )?)
     }
 }
 
@@ -1369,16 +1376,11 @@ pub struct EvidenceText {
     pub created_event_seq: u64,
 }
 
+/// 一輪生成要用到的兩個 id，由 [`Store::allocate_run_ids`] 一起發出。
 #[derive(Debug, Clone, Copy, Default)]
-pub struct IdSeeds {
+pub struct RunIds {
     pub document_id: i64,
     pub run_id: i64,
-    // 附件與音訊分段還沒有產生者（前者無 UI，後者是 M1 的硬體工作）。
-    // 種子先備著，因為配發者是 Session，接上時不該再改這個結構。
-    #[allow(dead_code)]
-    pub attachment_id: i64,
-    #[allow(dead_code)]
-    pub audio_segment_id: i64,
 }
 
 fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<MeetingSummary> {
@@ -1967,6 +1969,63 @@ mod tests {
 
     fn recording(s: &mut Store, m: MeetingId) {
         set_state(s, m, MeetingState::Recording);
+    }
+
+    /// 兩個配發者不能算出同一個號碼。
+    ///
+    /// 舊做法是各自讀 `MAX(id)+1`：錄音中的會議在開始時讀一次就記在記憶體
+    /// 裡，歷史頁的摘要每次重讀，兩邊都還沒寫入時就會拿到同一個 run_id。
+    /// 撞號之後 `SnapshotCreated` 的 ON CONFLICT DO NOTHING 靜默吞掉，接著
+    /// `GenerationCompleted` 就把另一場會議的成果刪掉換成這一場的。
+    #[test]
+    fn allocated_ids_are_never_handed_out_twice_even_before_anything_is_written() {
+        let mut s = Store::new(db::open_in_memory().unwrap());
+        let n = 50;
+        let mut runs = Vec::with_capacity(n);
+        let mut docs = Vec::with_capacity(n);
+        for _ in 0..n {
+            // 一個字都還沒寫進 documents 或 generation_runs
+            let ids = s.allocate_run_ids().unwrap();
+            runs.push(ids.run_id);
+            docs.push(ids.document_id);
+        }
+        runs.sort_unstable();
+        runs.dedup();
+        docs.sort_unstable();
+        docs.dedup();
+        assert_eq!(runs.len(), n, "run_id 重複配發");
+        assert_eq!(docs.len(), n, "document_id 重複配發");
+    }
+
+    /// 刪掉會議留下的空號不再使用。
+    ///
+    /// `MAX(id)+1` 在刪除之後會倒退，於是新的一輪生成拿到一個曾經屬於別人的
+    /// 號碼。號碼只前進，代價是空號，而空號沒有代價。
+    #[test]
+    fn ids_move_forward_even_after_the_rows_that_used_them_are_gone() {
+        let mut s = Store::new(db::open_in_memory().unwrap());
+        let first = s.allocate_run_ids().unwrap();
+        let m = s.create_meeting("要被刪掉的").unwrap();
+        s.append(
+            m,
+            &[(
+                DomainEvent::SnapshotCreated {
+                    document_id: first.document_id,
+                    run_id: first.run_id,
+                    parent_run_id: None,
+                    version_no: 1,
+                    purpose: "meeting-summary".into(),
+                    title: "會議摘要".into(),
+                    through_event_seq: 0,
+                    prompt: String::new(),
+                },
+                Timeline::new(0, 0),
+            )],
+        )
+        .unwrap();
+        s.delete_meeting(m).unwrap();
+        let next = s.allocate_run_ids().unwrap();
+        assert!(next.run_id > first.run_id, "刪除之後號碼倒退了");
     }
 
     #[test]
