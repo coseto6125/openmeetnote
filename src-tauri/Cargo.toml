@@ -1,6 +1,6 @@
 [package]
 name = "openmeetnote"
-version = "0.1.0"
+version = "0.1.1"
 description = "本機優先的會議記錄與成果生成工具"
 authors = ["OpenMeetNote"]
 edition = "2021"

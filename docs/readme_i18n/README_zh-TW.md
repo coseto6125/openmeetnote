@@ -67,10 +67,11 @@ Windows 上跑過兩小時 soak：393 個定稿批次、2586 個片段、25594 �
 
 ## 執行
 
-模型**不隨安裝包發布**。合計超過一 GB，而你應該知道這一 GB 放在磁碟的哪裡。放在執行檔旁邊：
+模型**不隨安裝包發布**。合計超過一 GB，而你應該知道這一 GB 放在磁碟的哪裡。放在程式旁邊：
 
 ```text
-openmeetnote(.exe)
+openmeetnote.exe                    # Windows：放在 exe 旁邊
+OpenMeetNote.app                    # macOS：放在 .app 旁邊，不是放進去裡面
 vocabulary.txt                      # 專有名詞校正表，可自行編輯
 models/
   ggml-large-v3-turbo-q5_0.bin      # 定稿引擎
@@ -79,6 +80,8 @@ models/
   silero_vad.onnx                   # 語音活動偵測
   speaker-embedding.onnx            # 語者辨識（可選）
 ```
+
+程式裝在你寫不進去的地方（`/Applications`、`C:\Program Files`）時，把 `models/` 與 `vocabulary.txt` 放到使用者資料目錄：Windows 是 `%APPDATA%\OpenMeetNote`，macOS 是 `~/Library/Application Support/OpenMeetNote`。程式旁邊會先被搜尋。
 
 缺少必要模型時錄音會被拒絕並說明缺哪一個檔案，不會靜默降級成一場沒有逐字稿的錄音 — 那種失敗只有事後才會發現，而那時會議已經沒了。
 
@@ -92,7 +95,7 @@ models/
 | `OMN_VAD_MODEL` | 語音偵測模型 |
 | `OMN_PUNCT_MODEL` | 標點模型 |
 
-引擎載入與逐段結果寫在執行檔旁的 `stt.log`。Windows 的 GUI 子系統不接 stderr，沒有這個檔案的話，模型載入失敗會完全無聲無息。
+引擎載入與逐段結果寫在使用者資料目錄的 `stt.log`（`%APPDATA%\OpenMeetNote`、`~/Library/Application Support/OpenMeetNote`）。Windows 的 GUI 子系統不接 stderr，沒有這個檔案的話，模型載入失敗會完全無聲無息 — 這也是它不放在程式旁邊的理由：安裝位置經常是唯讀的。
 
 ### macOS 權限
 
