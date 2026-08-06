@@ -56,12 +56,14 @@ pub struct CliPlanner {
     exe: PathBuf,
     kind: CliKind,
     /// CLI 的工作目錄。生命週期綁在這個結構上，掉了目錄就會被清掉。
-    workdir: tempdir::TempDir,
+    workdir: tempfile::TempDir,
 }
 
 impl CliPlanner {
     pub fn new(exe: PathBuf, kind: CliKind) -> Result<Self> {
-        let workdir = tempdir::TempDir::new("openmeetnote-agent")
+        let workdir = tempfile::Builder::new()
+            .prefix("openmeetnote-agent")
+            .tempdir()
             .map_err(|e| AgentError::Provider(format!("無法建立工作目錄：{e}")))?;
         Ok(Self { exe, kind, workdir })
     }
