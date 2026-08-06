@@ -1893,9 +1893,7 @@ pub fn start_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> 
     // 走完之後的狀態，不是它開始之前的。
     match state.with(|s| s.state) {
         Ok(MeetingState::Idle) => {}
-        Ok(MeetingState::Completed) => {
-            return CommandReceipt::rejected("會議已結束，請建立新會議")
-        }
+        Ok(MeetingState::Completed) => return CommandReceipt::rejected("會議已結束，請建立新會議"),
         Ok(_) => return CommandReceipt::rejected("會議已在進行中"),
         Err(_) => return CommandReceipt::rejected(POISONED_NOTE),
     }

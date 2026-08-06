@@ -39,8 +39,9 @@ impl AudioCapture for WasapiCapture {
             (Track::System, Direction::Render),
         ] {
             let (tx, stop, ready) = (tx.clone(), self.stop.clone(), ready_tx.clone());
-            self.threads
-                .push(std::thread::spawn(move || capture(track, dir, tx, stop, &ready)));
+            self.threads.push(std::thread::spawn(move || {
+                capture(track, dir, tx, stop, &ready)
+            }));
         }
 
         match await_tracks(&ready_rx, 2) {

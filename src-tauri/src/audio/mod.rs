@@ -47,9 +47,10 @@ pub const CAPTURE_BACKLOG_CHUNKS: usize = 100;
 pub const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
-// NoDevice 與 Capture 只有平台實作會建構。Linux build 沒有 WASAPI，
-// 因此它們在這個 target 下確實用不到，但契約要對所有平台一致。
-#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+// 每個變體都只有一部分平台會建構：`Unsupported` 只在 Windows 與 macOS
+// 以外，`NoDevice` 只在有裝置列舉的平台。契約要對所有平台一致，所以三個
+// 變體一直都在，而不是各自 cfg 出去 —— 那會讓錯誤處理的 match 隨平台改變。
+#[allow(dead_code)]
 pub enum AudioError {
     #[error("找不到音訊裝置：{0}")]
     NoDevice(String),
@@ -96,7 +97,9 @@ pub fn await_tracks(
         match ready.recv_timeout(START_TIMEOUT) {
             Ok(Ok(())) => {}
             Ok(Err(e)) => failures.push(e),
-            Err(_) => failures.push("等待音訊裝置回應逾時（可能是權限對話框沒有被回答）".to_owned()),
+            Err(_) => {
+                failures.push("等待音訊裝置回應逾時（可能是權限對話框沒有被回答）".to_owned())
+            }
         }
     }
     if failures.is_empty() {

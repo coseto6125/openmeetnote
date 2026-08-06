@@ -323,6 +323,7 @@ fn settle_schema(
     planner: &mut dyn Planner,
     req: &DraftRequest<'_>,
     drafted: Vec<Block>,
+    calls: &mut CallBudget,
 ) -> Result<(Vec<Block>, Vec<Degraded>, usize)> {
     use crate::document::{BlockContent, BlockKind};
 
@@ -344,6 +345,11 @@ fn settle_schema(
         let original_kind = current.kind;
         let mut fixed = false;
         for _ in 0..BLOCK_RETRY_LIMIT {
+            // 整輪的呼叫預算用完就不再重試。這個區塊照樣走下面的移除或降級，
+            // 只是沒有再問一次的機會
+            if !calls.take() {
+                break;
+            }
             let Some(next) = planner.redraft(req, &current, &last_reason)? else {
                 break;
             };
@@ -576,12 +582,42 @@ impl GenerationResult {
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub max_rounds: u32,
+    /// 整輪生成最多呼叫幾次 Provider。
+    ///
+    /// `max_rounds` 管的是迴圈跑幾圈，不是花多少錢。每一圈是一次 draft，
+    /// 但每個 schema 不合的區塊還能各自再要兩次 —— 模型回五十個形狀都不對
+    /// 的區塊，一圈就是一百零一次呼叫，三圈三百次。§9.3 要的是「不得無限制
+    /// 自我呼叫」，那必須是呼叫次數的上限，不是迴圈次數的上限。
+    pub max_calls: u32,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        // Agent Loop 不得無限制自我呼叫（§9.3）
-        Self { max_rounds: 3 }
+        // Agent Loop 不得無限制自我呼叫（§9.3）。
+        // 三圈 draft 加上每圈約十次單塊重試，是「修得動、又不會失控」的量。
+        Self {
+            max_rounds: 3,
+            max_calls: 30,
+        }
+    }
+}
+
+/// 一輪生成剩餘的 Provider 呼叫次數。
+///
+/// 傳可變參考而不是各自記數：預算是整輪共用的，draft 與單塊重試都從同一個
+/// 池子扣，否則「上限」就會變成每一種呼叫各自的上限。
+struct CallBudget {
+    left: u32,
+}
+
+impl CallBudget {
+    /// 扣一次。用完回 false，呼叫端就地停手而不是再問一次模型。
+    fn take(&mut self) -> bool {
+        if self.left == 0 {
+            return false;
+        }
+        self.left -= 1;
+        true
     }
 }
 
@@ -679,9 +715,13 @@ pub fn generate(
     let mut duplicates = 0usize;
     // 目前最佳版本丟掉了幾個區塊。數量打平時用它決定要不要換。
     let mut best_rejected = usize::MAX;
-    // 迴圈一定至少跑一輪，所以這個值一定會在讀之前被寫入
-    let mut last_rejections: Vec<String>;
+    // 呼叫預算可能在第一次 draft 之前就用完（上一輪的重試把它花光），
+    // 那時一個拒絕原因都還沒產生，空的就是實話
+    let mut last_rejections: Vec<String> = Vec::new();
     let mut round = 0u32;
+    let mut calls = CallBudget {
+        left: limits.max_calls,
+    };
 
     let stop_reason = loop {
         round += 1;
@@ -692,9 +732,12 @@ pub fn generate(
             round,
             previous: &previous,
         };
+        if !calls.take() {
+            break StopReason::RoundLimit;
+        }
         let drafted = planner.draft(&req)?;
         // schema 先結清，再送引用驗證：形狀都不對的區塊沒必要去查證據
-        let (drafted, degraded_now, removed) = settle_schema(planner, &req, drafted)?;
+        let (drafted, degraded_now, removed) = settle_schema(planner, &req, drafted, &mut calls)?;
         rejected_total += removed;
         degraded.extend(degraded_now);
         let (admitted, verdicts) =
@@ -723,7 +766,7 @@ pub fn generate(
         if rejected.is_empty() {
             break StopReason::Verified;
         }
-        if round >= limits.max_rounds {
+        if round >= limits.max_rounds || calls.left == 0 {
             break if best.is_empty() {
                 StopReason::NothingAdmissible
             } else {
@@ -1141,7 +1184,10 @@ mod tests {
                 through_event_seq: cursor,
                 prompt: "",
                 budget: BudgetInputs::default(),
-                limits: Limits { max_rounds: 3 },
+                limits: Limits {
+                    max_rounds: 3,
+                    ..Default::default()
+                },
                 revise_of: None,
             },
             &mut p,
@@ -1793,7 +1839,10 @@ mod tests {
                 through_event_seq: cursor,
                 prompt: "",
                 budget: BudgetInputs::default(),
-                limits: Limits { max_rounds: 2 },
+                limits: Limits {
+                    max_rounds: 2,
+                    ..Default::default()
+                },
                 revise_of: None,
             },
             &mut AlwaysFabricates,
