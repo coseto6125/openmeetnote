@@ -36,12 +36,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 這份 bundle 設定刻意不叫 tauri.windows.conf.json。那個檔名是 Tauri
+          # 的平台慣例名,每一次 cargo 呼叫都會自動載入它 —— 包括 CI 那句
+          # `cargo clippy --target x86_64-pc-windows-msvc`(debug)。它的 glob
+          # 指向 target/*/release/,debug 底下沒有 DLL,build script 就 exit 1,
+          # 於是 Windows 的 Check 與開發者的 `tauri dev` 一起掛掉。改成只有
+          # 真正要打包的這一步明確傳進去。
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            bundle_config: --config src-tauri/bundle-dlls.windows.json
           - target: aarch64-apple-darwin
             os: macos-latest
+            bundle_config: ''
           - target: x86_64-apple-darwin
             os: macos-latest
+            bundle_config: ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -63,18 +72,19 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Build bundle
-        run: pnpm exec tauri build --target ${{ matrix.target }}
+        run: pnpm exec tauri build --target ${{ matrix.target }} ${{ matrix.bundle_config }}
 
       # 打包成單一壓縮檔再上傳：Tauri 依平台產出不同副檔名，
       # 收斂成一個名字才不會讓下載頁看起來像三個不同的產品
       # 安裝檔裡必須真的有 DLL。sherpa 與 onnxruntime 在 Windows 是動態連結，
       # 而 0.1.0 的 MSI 與 NSIS 沒有帶到它們 —— DLL 是 tauri build 跑完之後才
       # 被複製到外層 portable 目錄的，安裝檔內部什麼都沒有，裝完的程式在進
-      # main 之前就被 loader 終止。現在由 tauri.windows.conf.json 宣告成
+      # main 之前就被 loader 終止。現在由 bundle-dlls.windows.json 宣告成
       # bundle resources，這一步是確認那個宣告真的生效。
       #
       # 只驗一次就好的事不值得只靠設定檔：那個 glob 依賴 --target，而漏掉
-      # --target 的建置會安靜地產出一模一樣、但缺 DLL 的安裝檔。
+      # --target 的建置會安靜地產出一模一樣、但缺 DLL 的安裝檔。自從設定檔
+      # 改名、不再被自動載入之後，漏掉 matrix.bundle_config 也是同一種結局。
       - name: Assert the installers carry the DLLs
         if: runner.os == 'Windows'
         shell: pwsh
