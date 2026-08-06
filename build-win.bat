@@ -32,5 +32,11 @@ where cargo >nul 2>&1 || (
 
 cd /d "%~dp0"
 call pnpm.cmd install --frozen-lockfile || exit /b 1
-call pnpm.cmd tauri build || exit /b 1
-echo [build-win] bundles are under src-tauri\target\release\bundle
+REM --target is required, not optional. tauri.windows.conf.json declares the
+REM sherpa/onnxruntime DLLs as bundle resources with the glob
+REM `target/*/release/*.dll`, and that only matches when the build has a target
+REM triple. Without it the installers come out missing the DLLs, and the app
+REM they install dies in the loader before main -- which is exactly what 0.1.0
+REM shipped.
+call pnpm.cmd tauri build --target x86_64-pc-windows-msvc || exit /b 1
+echo [build-win] bundles are under src-tauri\target\x86_64-pc-windows-msvc\release\bundle

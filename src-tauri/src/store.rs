@@ -153,6 +153,13 @@ pub enum DomainEvent {
     MeetingStateChanged {
         state: MeetingState,
     },
+    /// 會議標題。建立時發一次，之後每次改名再發一次。
+    ///
+    /// 標題原本是就地 UPDATE，於是它是唯一一個重建不回來的欄位 ——
+    /// 「所有投影都能從日誌重建」有一個沒有人注意到的例外。
+    MeetingRenamed {
+        title: String,
+    },
     TranscriptSegmentFinalized {
         segment: SegmentRevision,
     },
@@ -250,6 +257,7 @@ impl DomainEvent {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::MeetingStateChanged { .. } => "MeetingStateChanged",
+            Self::MeetingRenamed { .. } => "MeetingRenamed",
             Self::TranscriptSegmentFinalized { .. } => "TranscriptSegmentFinalized",
             Self::TranscriptSegmentRevised { .. } => "TranscriptSegmentRevised",
             Self::TranscriptSegmentEdited { .. } => "TranscriptSegmentEdited",
@@ -311,7 +319,7 @@ impl DomainEvent {
             Self::GenerationCompleted { run_id, .. } | Self::GenerationFailed { run_id, .. } => {
                 (Some(run_id.to_string()), None)
             }
-            Self::MeetingStateChanged { .. } => (None, None),
+            Self::MeetingStateChanged { .. } | Self::MeetingRenamed { .. } => (None, None),
         }
     }
 }
@@ -568,6 +576,9 @@ impl Store {
             "INSERT INTO meetings (title, state, created_at) VALUES (?1, 'idle', ?2)",
             params![title, now],
         )?;
+        // 起始標題不發事件。這一列的存在本身就不是事件的投影 —— 事件要靠
+        // 外鍵指向它，列得先在那裡。建立時給的名字屬於那一步，之後的每一次
+        // 改名才是決定性事件。
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -650,6 +661,13 @@ impl Store {
         let events = load_events(&self.conn, meeting)?;
         let tx = self.conn.transaction()?;
         clear_projections(&tx, meeting)?;
+        // meetings 那一列上由事件決定的欄位也要重設，否則壞掉的狀態會直接
+        // 活過重建 —— 而重建正是為了修好它才跑的。標題不動：它由建立那一步
+        // 給定，之後的改名會在重播時把新的值寫回來。
+        tx.execute(
+            "UPDATE meetings SET state = 'idle', started_at = NULL, ended_at = NULL WHERE id = ?1",
+            params![meeting],
+        )?;
         for e in &events {
             project(&tx, meeting, e.seq, e.timeline, &e.created_at, &e.event)?;
         }
@@ -669,14 +687,29 @@ impl Store {
     ///
     /// 回傳被收尾的會議數，供啟動日誌記錄。
     pub fn close_abandoned_meetings(&mut self) -> Result<usize> {
-        let n = self.conn.execute(
-            "UPDATE meetings
-                SET state = 'failed',
-                    ended_at = COALESCE(ended_at, ?1)
-              WHERE state IN ('recording', 'paused', 'stopping', 'finalizing')",
-            [crate::clock::now_utc()],
-        )?;
-        Ok(n)
+        let stranded: Vec<MeetingId> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM meetings
+                  WHERE state IN ('recording', 'paused', 'stopping', 'finalizing')",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        // 走事件而不是就地 UPDATE：`failed` 是這場會議歷史的一部分，
+        // 重建投影時要回得來。日誌裡沒有它的話，重建之後那場會議會變回
+        // 「錄音中」，而它其實早就結束了。
+        for meeting in &stranded {
+            self.append(
+                *meeting,
+                &[(
+                    DomainEvent::MeetingStateChanged {
+                        state: MeetingState::Failed,
+                    },
+                    Timeline::new(0, 0),
+                )],
+            )?;
+        }
+        Ok(stranded.len())
     }
 
     /// 這場會議的標題。
@@ -1059,31 +1092,92 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// 快照涵蓋範圍內已經出現過的語者（§5.4.2）。
+    /// 快照涵蓋範圍內已經出現過的語者，以及他們在游標當下的名字（§5.4.2）。
     ///
-    /// 與 `segments_through` 同一個道理：本輪證據以游標凍結，游標之後才第一次
-    /// 發言的人不屬於這一輪。
+    /// 從事件流折出來，不查 `speakers` 投影。投影裡的 `confirmed_name` 與
+    /// `status` 是可變的，只用 `created_event_seq` 界定的話，游標之後才做的
+    /// 改名或合併會出現在一個游標更早的 Prompt 裡 —— 那個游標就不再是凍結的
+    /// 範圍，而生成期間使用者正好在確認語者名稱是很常見的事。
+    ///
+    /// 換欄位擋不住這件事：同一位語者可以被改名兩次，投影只留得下最後一次。
+    /// 「seq 10 當下他叫什麼」只有日誌答得出來。
     pub fn speakers_through(
         &self,
         meeting: MeetingId,
         through_event_seq: u64,
     ) -> Result<Vec<StoredSpeaker>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, ordinal, proposed_name, confirmed_name, status
-             FROM speakers
-             WHERE meeting_id = ?1 AND status <> 'merged' AND created_event_seq <= ?2
-             ORDER BY ordinal",
-        )?;
-        let rows = stmt.query_map(params![meeting, through_event_seq as i64], |r| {
-            Ok(StoredSpeaker {
-                speaker_id: r.get(0)?,
-                ordinal: r.get::<_, i64>(1)? as u32,
-                proposed_name: r.get(2)?,
-                confirmed_name: r.get(3)?,
-                status: r.get(4)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        use std::collections::HashMap;
+
+        let mut by_id: HashMap<String, StoredSpeaker> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for e in load_events(&self.conn, meeting)? {
+            if e.seq > through_event_seq {
+                break;
+            }
+            match &e.event {
+                DomainEvent::SpeakerProposed {
+                    speaker_id,
+                    ordinal,
+                    proposed_name,
+                    ..
+                } => {
+                    let entry = by_id.entry(speaker_id.clone()).or_insert_with(|| {
+                        order.push(speaker_id.clone());
+                        StoredSpeaker {
+                            speaker_id: speaker_id.clone(),
+                            ordinal: *ordinal,
+                            proposed_name: None,
+                            confirmed_name: None,
+                            status: "unconfirmed".into(),
+                        }
+                    });
+                    entry.ordinal = *ordinal;
+                    entry.proposed_name = proposed_name.clone();
+                    if proposed_name.is_some() && entry.confirmed_name.is_none() {
+                        entry.status = "proposed".into();
+                    }
+                }
+                DomainEvent::SpeakerConfirmed { speaker_id, name }
+                | DomainEvent::SpeakerRenamed { speaker_id, name } => {
+                    if let Some(s) = by_id.get_mut(speaker_id) {
+                        s.confirmed_name = Some(name.clone());
+                        s.status = "confirmed".into();
+                    }
+                }
+                DomainEvent::SpeakerMerged {
+                    from_speaker_id, ..
+                } => {
+                    if let Some(s) = by_id.get_mut(from_speaker_id) {
+                        s.status = "merged".into();
+                    }
+                }
+                DomainEvent::SpeakerSplit {
+                    new_speaker_id,
+                    ordinal,
+                    ..
+                } => {
+                    by_id.entry(new_speaker_id.clone()).or_insert_with(|| {
+                        order.push(new_speaker_id.clone());
+                        StoredSpeaker {
+                            speaker_id: new_speaker_id.clone(),
+                            ordinal: *ordinal,
+                            proposed_name: None,
+                            confirmed_name: None,
+                            status: "unconfirmed".into(),
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let mut out: Vec<StoredSpeaker> = order
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
+            .filter(|s| s.status != "merged")
+            .collect();
+        out.sort_by_key(|s| s.ordinal);
+        Ok(out)
     }
 
     /// 快照涵蓋範圍內的人工筆記。
@@ -1189,15 +1283,20 @@ impl Store {
         }))
     }
 
+    /// 改名。走事件，不是就地 UPDATE。
+    ///
+    /// 使用者命名的東西一樣是決定性事件：它會出現在匯出檔的標題與歷史頁上，
+    /// 而重建投影時得有辦法把它放回去。
     pub fn rename_meeting(&mut self, meeting: MeetingId, title: &str) -> Result<()> {
-        // 標題由使用者直接命名，不是事件的投影，因此就地更新
-        let n = self.conn.execute(
-            "UPDATE meetings SET title = ?2 WHERE id = ?1",
-            params![meeting, title],
+        self.append(
+            meeting,
+            &[(
+                DomainEvent::MeetingRenamed {
+                    title: title.to_owned(),
+                },
+                Timeline::new(0, 0),
+            )],
         )?;
-        if n == 0 {
-            return Err(StoreError::NoSuchMeeting(meeting));
-        }
         Ok(())
     }
 
@@ -1520,9 +1619,19 @@ fn project(
                     meeting,
                     state.as_str(),
                     *state == MeetingState::Recording,
-                    *state == MeetingState::Completed,
+                    // 收尾失敗的會議也是結束了。少了這一項，被中斷的會議在
+                    // 歷史頁上沒有結束時間，看起來像還在跑
+                    matches!(state, MeetingState::Completed | MeetingState::Failed),
                     now
                 ],
+            )?;
+            expect_touched(seq, "會議", n)?;
+        }
+
+        DomainEvent::MeetingRenamed { title } => {
+            let n = tx.execute(
+                "UPDATE meetings SET title = ?2 WHERE id = ?1",
+                params![meeting, title],
             )?;
             expect_touched(seq, "會議", n)?;
         }
@@ -2042,6 +2151,31 @@ mod tests {
         assert!(found.ended_at.is_some(), "沒有補上結束時間");
     }
 
+    /// 重建投影之後，被中斷的會議不能變回「錄音中」。
+    ///
+    /// `failed` 與使用者改的標題原本都是就地 UPDATE，日誌裡沒有它們。
+    /// 重建是修復投影的手段，而它會把這兩件事一起抹掉 —— 那不是重建，
+    /// 是資料遺失。
+    #[test]
+    fn a_rebuild_restores_the_failed_state_and_the_user_title_from_the_log() {
+        let (mut s, m) = store();
+        recording(&mut s, m);
+        s.rename_meeting(m, "Q3 預算會議").unwrap();
+        assert_eq!(s.close_abandoned_meetings().unwrap(), 1);
+
+        s.rebuild_projections(m).unwrap();
+
+        let found = s.list_meetings().unwrap().into_iter().find(|x| x.id == m);
+        let found = found.expect("會議不見了");
+        assert_eq!(found.state, MeetingState::Failed, "重建之後狀態退回去了");
+        assert!(found.ended_at.is_some(), "重建之後沒有結束時間");
+        assert_eq!(
+            s.meeting_title(m).unwrap(),
+            "Q3 預算會議",
+            "重建之後標題不見了"
+        );
+    }
+
     #[test]
     fn test_closing_abandoned_meetings_leaves_finished_ones_alone() {
         let (mut s, m) = store();
@@ -2358,6 +2492,83 @@ mod tests {
         assert_eq!(d.segments[0].text, "使用者改過");
         assert_eq!(d.segments[0].revision, 2);
         assert!(d.segments[0].user_edited);
+    }
+
+    #[test]
+    /// 游標之後才確認的名字不得進入更早的快照。
+    ///
+    /// 生成期間使用者確認語者名稱是很常見的動作，而查詢原本只用
+    /// `created_event_seq` 界定「這位語者出現過沒有」，名字卻讀的是投影上
+    /// 現在的值。那讓「凍結的涵蓋範圍」在名字這一欄破了個洞。
+    #[test]
+    fn a_name_confirmed_after_the_cursor_does_not_leak_into_the_snapshot() {
+        let (mut s, m) = store();
+        let seqs = s
+            .append(
+                m,
+                &[
+                    (
+                        DomainEvent::SpeakerProposed {
+                            speaker_id: "s1".into(),
+                            ordinal: 1,
+                            proposed_name: None,
+                            provider_labels: vec![],
+                        },
+                        Timeline::new(0, 0),
+                    ),
+                    (
+                        DomainEvent::SpeakerConfirmed {
+                            speaker_id: "s1".into(),
+                            name: "李部長".into(),
+                        },
+                        Timeline::new(1000, 1000),
+                    ),
+                ],
+            )
+            .unwrap();
+        let (proposed_at, confirmed_at) = (seqs[0], seqs[1]);
+
+        // 游標停在「出現了」那一刻：這時他還沒有名字
+        let at_proposal = s.speakers_through(m, proposed_at).unwrap();
+        assert_eq!(at_proposal.len(), 1);
+        assert_eq!(
+            at_proposal[0].confirmed_name, None,
+            "游標之後的名字漏進來了"
+        );
+        assert_eq!(at_proposal[0].status, "unconfirmed");
+
+        // 游標包含確認之後才看得到名字
+        let at_confirm = s.speakers_through(m, confirmed_at).unwrap();
+        assert_eq!(at_confirm[0].confirmed_name.as_deref(), Some("李部長"));
+        assert_eq!(at_confirm[0].status, "confirmed");
+
+        // 再改一次名。游標仍停在第一次確認，看到的必須是第一個名字 ——
+        // 投影只留得下最後一個，所以這一項只有日誌答得出來
+        let renamed = s
+            .append(
+                m,
+                &[(
+                    DomainEvent::SpeakerRenamed {
+                        speaker_id: "s1".into(),
+                        name: "李次長".into(),
+                    },
+                    Timeline::new(2000, 2000),
+                )],
+            )
+            .unwrap()[0];
+        assert_eq!(
+            s.speakers_through(m, confirmed_at).unwrap()[0]
+                .confirmed_name
+                .as_deref(),
+            Some("李部長"),
+            "游標之後的改名蓋掉了快照當下的名字"
+        );
+        assert_eq!(
+            s.speakers_through(m, renamed).unwrap()[0]
+                .confirmed_name
+                .as_deref(),
+            Some("李次長")
+        );
     }
 
     #[test]

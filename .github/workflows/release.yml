@@ -67,6 +67,33 @@ jobs:
 
       # 打包成單一壓縮檔再上傳：Tauri 依平台產出不同副檔名，
       # 收斂成一個名字才不會讓下載頁看起來像三個不同的產品
+      # 安裝檔裡必須真的有 DLL。sherpa 與 onnxruntime 在 Windows 是動態連結，
+      # 而 0.1.0 的 MSI 與 NSIS 沒有帶到它們 —— DLL 是 tauri build 跑完之後才
+      # 被複製到外層 portable 目錄的，安裝檔內部什麼都沒有，裝完的程式在進
+      # main 之前就被 loader 終止。現在由 tauri.windows.conf.json 宣告成
+      # bundle resources，這一步是確認那個宣告真的生效。
+      #
+      # 只驗一次就好的事不值得只靠設定檔：那個 glob 依賴 --target，而漏掉
+      # --target 的建置會安靜地產出一模一樣、但缺 DLL 的安裝檔。
+      - name: Assert the installers carry the DLLs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $base = "src-tauri/target/${{ matrix.target }}/release"
+          $installers = Get-ChildItem -Recurse "$base/bundle" -Include *.msi,*.exe
+          if (-not $installers) { throw "bundle 裡沒有任何安裝檔" }
+          $dlls = Get-ChildItem "$base/*.dll" | ForEach-Object { $_.Name }
+          if (-not $dlls) { throw "$base 裡沒有 DLL，連 portable 版都會壞" }
+          foreach ($i in $installers) {
+            $listed = & 7z l $i.FullName 2>$null
+            foreach ($dll in $dlls) {
+              if ($listed -notmatch [regex]::Escape($dll)) {
+                throw "$($i.Name) 裡找不到 $dll"
+              }
+            }
+            Write-Host "$($i.Name) 帶了 $($dlls.Count) 個 DLL"
+          }
+
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
