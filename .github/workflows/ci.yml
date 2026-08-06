@@ -83,23 +83,21 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml -p openmeetnote --all-targets -- -D warnings
 
   # ── Rust：測試。模型與音訊素材不在版本庫，需要它們的測試會自己跳過 ──
+  #
+  # 這一格刻意不掛 rust-cache。它是整個 workflow 裡唯一真的執行程式碼的
+  # 地方，而快取命中過的 target/ 已經用兩種方式騙過它：先是連結不到
+  # onnxruntime，補上下載目錄之後換成連結得過但執行時載入不了
+  # libsherpa-onnx-c-api.so。兩次都是同一件事 —— build script 被判定為不必
+  # 重跑，它產出的東西卻不完全在 target/ 裡。
+  #
+  # 冷建置每次多幾分鐘。換的是「綠燈代表程式碼會動」，而不是「綠燈代表
+  # 快取剛好是對的」。clippy 不執行任何二進位，那幾格留著快取。
   test:
     name: Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          workspaces: src-tauri
-          # sherpa-rs-sys 把預先編好的函式庫下載到 dirs::cache_dir()/sherpa-rs，
-          # 而那不在 target/ 底下。只快取 target/ 的話，快取命中時 build script
-          # 會被跳過、連結旗標照樣送出，但函式庫已經不在了 —— 冷快取會過、
-          # 熱快取必掛。三個平台三個位置，少列一個就等於少修一個平台
-          cache-directories: |
-            ~/.cache/sherpa-rs
-            ~/Library/Caches/sherpa-rs
-            ~/AppData/Local/sherpa-rs
       - name: Install Linux build deps
         run: |
           sudo apt-get update
