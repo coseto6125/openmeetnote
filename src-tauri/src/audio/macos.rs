@@ -694,6 +694,9 @@ mod tests {
         // 三秒的 48 kHz 音訊
         assert!(p.feed(&vec![0.5; 48_000 * 3], 1));
         p.flush();
+        // Downmix 握著 Batcher，Batcher 握著 tx。不先放掉它，into_iter()
+        // 就是在等一個永遠不會關閉的通道 —— 測試不會失敗，它會一直跑。
+        drop(p);
         let frames: usize = rx.into_iter().map(|c| c.samples.len()).sum();
         let ms = frames * 1000 / SAMPLE_RATE as usize;
         assert!(
