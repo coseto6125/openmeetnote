@@ -85,6 +85,9 @@ jobs:
       # 只驗一次就好的事不值得只靠設定檔：那個 glob 依賴 --target，而漏掉
       # --target 的建置會安靜地產出一模一樣、但缺 DLL 的安裝檔。自從設定檔
       # 改名、不再被自動載入之後，漏掉 matrix.bundle_config 也是同一種結局。
+      #
+      # 驗法是把安裝檔攤開來看真實佈局。第一版是 `7z l` 抓字串，而那對 MSI
+      # 一律回報「什麼都沒有」—— 那個綠燈或紅燈都不代表安裝檔的內容。
       - name: Assert the installers carry the DLLs
         if: runner.os == 'Windows'
         shell: pwsh
@@ -94,12 +97,30 @@ jobs:
           if (-not $installers) { throw "bundle 裡沒有任何安裝檔" }
           $dlls = Get-ChildItem "$base/*.dll" | ForEach-Object { $_.Name }
           if (-not $dlls) { throw "$base 裡沒有 DLL，連 portable 版都會壞" }
+          $stage = Join-Path $env:RUNNER_TEMP "installer-check"
           foreach ($i in $installers) {
-            $listed = & 7z l $i.FullName 2>$null
-            foreach ($dll in $dlls) {
-              if ($listed -notmatch [regex]::Escape($dll)) {
-                throw "$($i.Name) 裡找不到 $dll"
-              }
+            $dir = Join-Path $stage ([IO.Path]::GetFileNameWithoutExtension($i.Name))
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            # 真的把安裝檔解開，不是在它的位元組裡找檔名字串。MSI 把檔案放進
+            # cab，而 cab 裡的名字是 WiX 產生的 File Id，不是 `cargs.dll`——
+            # 用 `7z l` 比對原檔名，任何一個 MSI 都會被判定成空的。
+            if ($i.Extension -eq ".msi") {
+              # /a 是 administrative install：把安裝檔攤成它會安裝出來的樣子，
+              # 不需要提權，也不會動到這台機器
+              $p = Start-Process msiexec -Wait -PassThru -ArgumentList @(
+                "/a", "`"$($i.FullName)`"", "/qn", "TARGETDIR=`"$dir`""
+              )
+              if ($p.ExitCode -ne 0) { throw "$($i.Name) 展開失敗（msiexec $($p.ExitCode)）" }
+            } else {
+              & 7z x -y -o"$dir" $i.FullName | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "$($i.Name) 展開失敗（7z $LASTEXITCODE）" }
+            }
+            $inside = Get-ChildItem -Recurse -File $dir | ForEach-Object { $_.Name }
+            $missing = $dlls | Where-Object { $inside -notcontains $_ }
+            if ($missing) {
+              Write-Host "$($i.Name) 展開後的內容："
+              Get-ChildItem -Recurse -File $dir | ForEach-Object { Write-Host "  $($_.FullName)" }
+              throw "$($i.Name) 裡找不到：$($missing -join '、')"
             }
             Write-Host "$($i.Name) 帶了 $($dlls.Count) 個 DLL"
           }
