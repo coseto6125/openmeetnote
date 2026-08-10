@@ -568,6 +568,11 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                 {s.state === 'failed' && s.reason && (
                   <span className="snap-reason">{s.reason}</span>
                 )}
+                {/* 生成期間 Provider 的最新一行。一輪最多十分鐘，只顯示
+                    「生成中」的話使用者分不出在跑還是卡死。 */}
+                {s.state === 'running' && s.progress && (
+                  <span className="snap-progress">{s.progress}</span>
+                )}
               </button>
             ))}
 

@@ -128,7 +128,7 @@ impl Batcher {
         let chunk = Chunk {
             track: self.track,
             captured_start_ms: self.sent_frames * 1000 / SAMPLE_RATE as u64,
-            samples,
+            samples: samples.into(),
         };
         self.sent_frames += frames;
         match self.tx.try_send(chunk) {

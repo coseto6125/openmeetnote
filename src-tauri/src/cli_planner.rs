@@ -13,7 +13,7 @@
 //! - 輸出一律當成不受信任內容解析：模型可能回傳散文、markdown 圍欄或半截
 //!   JSON，任何一種都不該讓這一輪炸掉，只該讓它失敗。
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -24,8 +24,10 @@ use crate::document::Block;
 /// 單輪生成的時間上限。
 ///
 /// CLI 後端拿不到 token 用量，費用上限只能用時間與輪數表達（§5.5.1）。
-/// 三分鐘足夠一輪包含思考的生成，又不會讓使用者對著沒有回應的畫面枯等。
-const TIMEOUT: Duration = Duration::from_secs(180);
+/// 原本設三分鐘，實測不夠：codex 以 high reasoning effort 處理百來筆逐字稿的
+/// 一輪就超過了，生成本身沒問題卻被殺掉，使用者看到的是「生成逾時」。
+/// 十分鐘是一輪的上限，不是預期耗時；真的卡死仍然會被收掉。
+const TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliKind {
@@ -39,7 +41,10 @@ impl CliKind {
         match self {
             // -p 是 print 模式：跑完就結束，不進互動會話
             CliKind::ClaudeCode => &["-p"],
-            CliKind::Codex => &["exec", "-"],
+            // codex 預設要求 cwd 在 git repo 底下，否則直接拒絕跑（"Not inside a
+            // trusted directory"）。我們刻意把它關在一個空的 tempdir 裡，本來就
+            // 不會是 repo，所以必須明說跳過這項檢查。
+            CliKind::Codex => &["exec", "--skip-git-repo-check", "-"],
         }
     }
 
@@ -52,11 +57,22 @@ impl CliKind {
     }
 }
 
+/// 進度回報的最小間隔。
+///
+/// CLI 一秒可以寫好幾行 stderr，每一行都往 Session 的鎖跑一次沒有意義：
+/// 畫面只顯示最新一行，而事件泵本身也是幾十毫秒才送一批。
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 進度訊息的接收端。實作在 `session`，這裡只知道「有東西可以告訴使用者」。
+pub type ProgressSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct CliPlanner {
     exe: PathBuf,
     kind: CliKind,
     /// CLI 的工作目錄。生命週期綁在這個結構上，掉了目錄就會被清掉。
     workdir: tempfile::TempDir,
+    /// 沒有接收端時照舊安靜跑完，測試與 fixture 不必配一個。
+    progress: Option<ProgressSink>,
 }
 
 impl CliPlanner {
@@ -65,7 +81,17 @@ impl CliPlanner {
             .prefix("openmeetnote-agent")
             .tempdir()
             .map_err(|e| AgentError::Provider(format!("無法建立工作目錄：{e}")))?;
-        Ok(Self { exe, kind, workdir })
+        Ok(Self {
+            exe,
+            kind,
+            workdir,
+            progress: None,
+        })
+    }
+
+    /// 把生成期間的進度送到哪裡去。
+    pub fn on_progress(&mut self, sink: ProgressSink) {
+        self.progress = Some(sink);
     }
 
     fn run(&self, prompt: &str) -> Result<String> {
@@ -82,6 +108,7 @@ impl CliPlanner {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
+        crate::config::hide_console(&mut cmd);
         let child = cmd
             .spawn()
             .map_err(|e| AgentError::Provider(format!("無法執行 {}：{e}", self.exe.display())))?;
@@ -112,12 +139,38 @@ impl CliPlanner {
                 .take()
                 .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
         );
-        let err_reader = drain(
-            child
-                .stderr
-                .take()
-                .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-        );
+        // stderr 同樣要一路讀走，順路把每一行當成進度送出去。整段內容仍然
+        // 留在 buf 裡：失敗時的原因取自完整 stderr，不是取自進度那幾行。
+        let err_pipe = child.stderr.take();
+        let sink = self.progress.clone();
+        let err_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(p) = err_pipe {
+                let mut reader = std::io::BufReader::new(p);
+                let mut line = Vec::new();
+                let mut last_sent: Option<Instant> = None;
+                loop {
+                    line.clear();
+                    match reader.read_until(b'\n', &mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    buf.extend_from_slice(&line);
+                    let Some(sink) = &sink else { continue };
+                    if !last_sent.is_none_or(|t| t.elapsed() >= PROGRESS_INTERVAL) {
+                        continue;
+                    }
+                    // 空行不送：把畫面上剛顯示的訊息換成空白等於閃一下就沒了
+                    let text = String::from_utf8_lossy(&line).trim().to_owned();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    last_sent = Some(Instant::now());
+                    sink(&text);
+                }
+            }
+            buf
+        });
 
         // Prompt 從 stdin 送，而且在另一條執行緒上寫。
         //
@@ -215,11 +268,13 @@ impl Drop for ChildGuard {
 fn kill_tree(child: &mut std::process::Child) {
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &child.id().to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = crate::config::hide_console(
+            Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &child.id().to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .status();
     }
     // unix 上子行程自成一個 process group（`run` 裡設的），負號的 pid 就是
     // 整個 group。少了這一步只殺得掉 `claude` 本身，它開出來的 node 行程
@@ -961,6 +1016,8 @@ mod tests {
         // 進到互動會話會讓生成永遠不返回
         assert!(CliKind::ClaudeCode.args().contains(&"-p"));
         assert!(CliKind::Codex.args().contains(&"exec"));
+        // 工作目錄是 tempdir，不是 git repo；少了這個旗標 codex 會拒絕啟動
+        assert!(CliKind::Codex.args().contains(&"--skip-git-repo-check"));
         assert_eq!(
             CliKind::from_provider("claude-code"),
             Some(CliKind::ClaudeCode)

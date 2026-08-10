@@ -131,14 +131,22 @@ export function SettingsView() {
   const [backends, setBackends] = useState<BackendOption[]>([]);
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [status, setStatus] = useState<{ tone: 'ok' | 'bad'; text: string } | null>(null);
+  // null 代表還沒讀到。用它區分「載入中」與「已知關閉」，
+  // 否則畫面會先閃一下錯的狀態，讓人以為設定被改掉了。
+  const [keepAudio, setKeepAudio] = useState<boolean | null>(null);
 
   const reload = useCallback(async () => {
     try {
       // 偵測要啟動子行程，比讀設定慢，但兩者一起等：先畫出一個
       // 還不知道能不能用的選單，只會讓使用者選到一半又被換掉
-      const [r, b] = await Promise.all([settings.get(), settings.backends()]);
+      const [r, b, keep] = await Promise.all([
+        settings.get(),
+        settings.backends(),
+        settings.keepAudio(),
+      ]);
       setBackends(b);
       setRows(r);
+      setKeepAudio(keep);
       // 草稿從已解析的值起始，包含環境變數提供的值：
       // 使用者看到的就是實際生效的內容
       setDrafts(
@@ -323,6 +331,37 @@ export function SettingsView() {
           </section>
         );
       })}
+
+      <section className="panel">
+        <div className="panel-head">
+          <span className="card-title">錄音保存</span>
+        </div>
+        <label className="keep-audio">
+          <input
+            type="checkbox"
+            checked={keepAudio ?? true}
+            disabled={keepAudio === null}
+            onChange={async (e) => {
+              const next = e.target.checked;
+              // 先寫後端再更新畫面：反過來的話寫入失敗時畫面會顯示
+              // 一個沒有生效的狀態，而使用者以為已經關掉了
+              try {
+                await settings.setKeepAudio(next);
+                setKeepAudio(next);
+                setStatus({ tone: 'ok', text: next ? '之後的會議會保留原音' : '之後的會議不保留原音' });
+              } catch (err) {
+                setStatus({ tone: 'bad', text: String(err) });
+              }
+            }}
+          />
+          <span>保留原音（下一場會議開始時生效）</span>
+        </label>
+        <p className="hint">
+          原音是驗證逐字稿的唯一依據：轉錯字或漏掉發言時，沒有它就只能憑印象判斷，
+          也無法換模型重跑同一段話比較。代價是磁碟，兩軌約 230 MB/小時。
+          單場的音檔可以到歷史頁個別刪除。
+        </p>
+      </section>
 
       <section className="panel">
         <div className="panel-head">

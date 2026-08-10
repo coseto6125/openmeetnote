@@ -1434,6 +1434,26 @@ svg { display: block; }
   color: var(--red);
 }
 
+/* 設定頁的核取方塊。文字與方塊垂直對齊，整行可點。 */
+.keep-audio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+/* 進度是過程訊息，不是結果：比 snap-reason 更淡，而且長行截斷不換行，
+   免得一行 CLI 日誌把版本卡片撐開、下面的版本全被推走。 */
+.snap-progress {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .snap[data-s="failed"] { cursor: pointer; }
 
 .summarize-row {

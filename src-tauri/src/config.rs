@@ -334,9 +334,44 @@ pub fn resolve_exe(name: &str) -> Option<std::path::PathBuf> {
 
 /// 跑一次 `--version`。有輸出才算真的可用：檔案存在但跑不起來
 /// （缺 node、權限不足）與沒安裝要分開講。
+/// 這場會議的原音要寫去哪。
+///
+/// 一小時兩軌約 230 MB（16-bit、16 kHz、單聲道）。留著它的理由是逐字稿沒有
+/// 原音就無法被驗證：轉錯字、漏掉發言，事後只能憑印象爭論，也沒辦法換模型
+/// 或換參數重跑同一段話比較好壞。不需要的話刪掉整個會議目錄即可。
+pub fn audio_dir(
+    app: &tauri::AppHandle,
+    meeting: crate::store::MeetingId,
+) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("audio")
+        .join(meeting.to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// 不要讓子行程在桌面上開 console 視窗。
+///
+/// npm 裝出來的 `claude.cmd` / `codex.CMD` 是批次檔，Windows 交給 cmd.exe 跑，
+/// 預設就配一個 console，使用者看到的是憑空跳出一個黑框、擋住整個畫面。
+/// CREATE_NO_WINDOW 只拿掉視窗，管線、結束碼、輸出都不受影響。
+/// 每個 spawn 外部 CLI 的地方都要套，只漏一個就會閃一次。
+pub fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 fn probe_version(exe: &std::path::Path) -> Result<String, String> {
-    let out = std::process::Command::new(exe)
-        .arg("--version")
+    let out = hide_console(std::process::Command::new(exe).arg("--version"))
         .output()
         .map_err(|e| format!("無法執行：{e}"))?;
     if !out.status.success() {

@@ -240,6 +240,18 @@ export function HistoryView({ activeMeetingId }: HistoryViewProps) {
     }
   };
 
+  const removeAudio = async (id: number) => {
+    try {
+      const n = await history.removeAudio(id);
+      // 說出刪了幾個，而不是靜默完成：刪除是不可逆的，使用者需要知道
+      // 剛才到底發生了什麼。零個也要說 —— 那代表這場本來就沒有原音。
+      setError(n > 0 ? `已刪除 ${n} 個音檔，逐字稿與摘要保留` : '這場沒有保存原音');
+      await reload();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   return (
     <div className="page page-split">
       <section className="panel">
@@ -332,6 +344,20 @@ export function HistoryView({ activeMeetingId }: HistoryViewProps) {
                 }}
               >
                 改名
+              </button>
+              {/* 只刪音檔，留下逐字稿與摘要。音檔是最佔空間的東西，
+                  而它的用途（驗證逐字稿）通常在看過之後就結束了。 */}
+              <button
+                className="mini"
+                disabled={m.id === activeMeetingId}
+                title={
+                  m.id === activeMeetingId
+                    ? '進行中的會議不能刪除音檔'
+                    : '只刪原音，保留逐字稿與摘要'
+                }
+                onClick={() => void removeAudio(m.id)}
+              >
+                刪音檔
               </button>
               <button
                 className="mini mini-danger"

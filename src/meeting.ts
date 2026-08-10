@@ -51,6 +51,8 @@ export interface Snapshot {
   meetingTimeMs: number;
   state: 'queued' | 'running' | 'completed' | 'failed';
   reason?: string;
+  /** 生成期間 Provider 的最新一行輸出。只在 running 有意義，完成或失敗後就沒用了。 */
+  progress?: string;
   /** 本輪要求。空字串代表使用者沒填，交給 AI 自行規劃。 */
   prompt: string;
 }
@@ -84,6 +86,8 @@ export interface MeetingModel {
   desynced: boolean;
   /** 本機資料庫寫不進去。畫面上的內容不保證有被保存。 */
   journalError: string | null;
+  /** 這場已經落地幾段原音。0 代表沒有保存，事後無法驗證逐字稿。 */
+  audioSegments: number;
   degrade: Degrade | null;
 }
 
@@ -102,6 +106,7 @@ export const emptyMeeting: MeetingModel = {
   appliedSeq: 0,
   desynced: false,
   journalError: null,
+  audioSegments: 0,
   degrade: null,
 };
 
@@ -244,12 +249,29 @@ function applyEvent(m: MeetingModel, ev: SessionEvent, batch: SessionEventBatch)
             ],
           };
 
+    case 'audioSegmentStored':
+      // 只記段數。畫面要回答的是「原音有在存嗎」，不是「存了哪些檔案」。
+      return { ...m, audioSegments: m.audioSegments + 1 };
+
+    case 'generationProgress':
+      // 只更新已知的那一版。進度是暫態的，不該讓它自己長出一個版本節點：
+      // 真正建立版本的是 snapshotCreated。
+      return m.snapshots.some((s) => s.version === ev.version)
+        ? {
+            ...m,
+            snapshots: m.snapshots.map((s) =>
+              s.version === ev.version ? { ...s, progress: ev.text } : s,
+            ),
+          }
+        : m;
+
     case 'generationCompleted':
       return {
         ...m,
         activeVersion: ev.version,
         snapshots: m.snapshots.map((s) =>
-          s.version === ev.version ? { ...s, state: 'completed' } : s,
+          // 進度連同狀態一起收掉：完成之後那行字只會誤導
+          s.version === ev.version ? { ...s, state: 'completed', progress: undefined } : s,
         ),
       };
 
@@ -259,7 +281,9 @@ function applyEvent(m: MeetingModel, ev: SessionEvent, batch: SessionEventBatch)
         ...m,
         snapshots: exists
           ? m.snapshots.map((s) =>
-              s.version === ev.version ? { ...s, state: 'failed', reason: ev.reason } : s,
+              s.version === ev.version
+                ? { ...s, state: 'failed', reason: ev.reason, progress: undefined }
+                : s,
             )
           : [
               ...m.snapshots,
@@ -362,6 +386,8 @@ export function speakerDisplayName(s: NamedSpeaker, all: NamedSpeaker[]): string
 export function fromProjection(m: MeetingModel, p: SessionProjection): MeetingModel {
   return {
     ...m,
+    // 每個列表欄位都從投影重建，計數也一樣：留著舊值等於 resync 修不了它
+    audioSegments: p.audioSegments,
     state: p.state,
     meetingTimeMs: p.meetingTimeMs,
     capturedAudioMs: p.capturedAudioMs,

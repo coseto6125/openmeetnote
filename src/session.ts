@@ -68,6 +68,16 @@ export type SessionEvent =
       meetingTimeMs: number;
       prompt: string;
     }
+  /** 一段原音已落地。決定性事件，佔一個 seq，所以必須送到 UI 才不會被當成缺號 */
+  | {
+      kind: 'audioSegmentStored';
+      seq: number;
+      track: 'mic' | 'system';
+      capturedStartMs: number;
+      capturedEndMs: number;
+    }
+  /** 暫態：生成期間 Provider 的進度訊息，同一個 version 就地覆蓋，不進事件序列 */
+  | { kind: 'generationProgress'; version: number; text: string }
   | { kind: 'generationCompleted'; seq: number; version: number }
   | { kind: 'generationFailed'; seq: number; version: number; reason: string }
   /** 帶轉換當下的兩條時間軸，UI 不必從批次邊界回推 */
@@ -141,6 +151,8 @@ export interface SessionProjection {
     prompt: string;
   }[];
   pauses: { fromMs: number; toMs: number | null }[];
+  /** 這場已落地幾段原音。重新同步要能修正它，否則計數會停在缺號之前。 */
+  audioSegments: number;
 }
 
 export type FaultKind = 'micLost' | 'micRestored' | 'sttDown' | 'sttUp' | 'generationFailed';
@@ -264,6 +276,13 @@ export const history = {
   rename: (meetingId: number, title: string) =>
     invoke<void>('rename_meeting', { meetingId, title }),
   remove: (meetingId: number) => invoke<void>('delete_meeting', { meetingId }),
+  /**
+   * 只刪這場的原音，留下逐字稿與摘要，回傳刪掉幾個檔案。
+   *
+   * 音檔是這個 app 最佔空間的東西（兩軌約 230 MB/小時），用途是事後驗證
+   * 逐字稿。驗完了就該能把空間拿回來，而不必連會議紀錄一起丟。
+   */
+  removeAudio: (meetingId: number) => invoke<number>('delete_meeting_audio', { meetingId }),
   /** 匯出成果 HTML，回傳寫出的檔案路徑。 */
   exportDocument: (meetingId: number, runId: number) =>
     invoke<string>('export_document', { meetingId, runId }),
@@ -323,6 +342,9 @@ export const settings = {
   saveSecret: (kind: ProviderKind, value: string) =>
     invoke<void>('save_secret', { kind, value }),
   clearSecret: (kind: ProviderKind) => invoke<void>('clear_secret', { kind }),
+  /** 錄音時是否保留原音。關掉之後逐字稿就是唯一紀錄，事後無法驗證。 */
+  keepAudio: () => invoke<boolean>('get_keep_audio'),
+  setKeepAudio: (keep: boolean) => invoke<void>('set_keep_audio', { keep }),
 };
 
 export function subscribe(onBatch: (b: SessionEventBatch) => void): Promise<UnlistenFn> {

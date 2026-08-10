@@ -87,6 +87,7 @@ pub struct SpeakerSpan {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioSegment {
+    /// 由資料庫配發。事件裡的值不具意義，投影不會使用它（冪等靠 `path`）。
     pub id: i64,
     pub track: Track,
     /// 裝置重新開啟就換一個 epoch。跨 epoch 的樣本計數不可直接相加。
@@ -228,6 +229,13 @@ pub enum DomainEvent {
     AudioSegmentFinalized {
         segment: AudioSegment,
     },
+    /// 使用者刪掉了這場的原音。
+    ///
+    /// 刪除本身必須是事件：只清投影的話，一次 `rebuild_projections` 就會把
+    /// 索引重播回來，指向已經不存在的檔案 —— 畫面上有音訊、打不開也刪不掉。
+    /// `AudioSegmentFinalized` 仍然留在日誌裡，「當時確實錄過」不因為現在
+    /// 刪了檔案而變成沒發生。
+    AudioSegmentsForgotten,
     /// 建立摘要快照。文件本身也在這裡落地，因為 `documents` 同樣是投影，
     /// 沒有事件承載它就無法從日誌重建。
     SnapshotCreated {
@@ -274,6 +282,7 @@ impl DomainEvent {
             Self::AttachmentExtracted { .. } => "AttachmentExtracted",
             Self::AttachmentRemoved { .. } => "AttachmentRemoved",
             Self::AudioSegmentFinalized { .. } => "AudioSegmentFinalized",
+            Self::AudioSegmentsForgotten => "AudioSegmentsForgotten",
             Self::SnapshotCreated { .. } => "SnapshotCreated",
             Self::GenerationCompleted { .. } => "GenerationCompleted",
             Self::GenerationFailed { .. } => "GenerationFailed",
@@ -312,7 +321,8 @@ impl DomainEvent {
                 extraction_revision,
                 ..
             } => (Some(attachment_id.to_string()), Some(*extraction_revision)),
-            Self::AudioSegmentFinalized { segment } => (Some(segment.id.to_string()), None),
+            Self::AudioSegmentFinalized { segment } => (Some(segment.path.clone()), None),
+            Self::AudioSegmentsForgotten => (None, None),
             Self::SnapshotCreated {
                 run_id, version_no, ..
             } => (Some(run_id.to_string()), Some(*version_no)),
@@ -1319,6 +1329,67 @@ impl Store {
         Ok(())
     }
 
+    /// 這場會議保存的原音檔路徑。
+    ///
+    /// 刪除音檔時要用它逐檔刪，不是直接砍目錄：路徑是事件裡記下來的事實，
+    /// 照著它刪才不會漏掉寫在別處的檔案，也不會誤刪目錄裡不屬於這場的東西。
+    pub fn audio_paths(&self, meeting: MeetingId) -> Result<Vec<String>> {
+        let mut q = self
+            .conn
+            .prepare("SELECT path FROM audio_segments WHERE meeting_id = ?1")?;
+        let rows = q
+            .query_map(params![meeting], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// 忘掉這場會議的原音索引。檔案本身由呼叫端刪，這裡只管資料庫。
+    ///
+    /// 走事件而不是直接 DELETE：`audio_segments` 是投影，而投影會被
+    /// `rebuild_projections` 從日誌重建。只清投影的話，重建一次索引就回來了，
+    /// 指向早已刪掉的檔案。
+    ///
+    /// 逐字稿與 `AudioSegmentFinalized` 都留著：使用者刪的是佔空間的音檔，
+    /// 不是會議紀錄，「當時確實錄過」仍然是事實。
+    pub fn forget_audio(&mut self, meeting: MeetingId) -> Result<usize> {
+        let n = self.audio_paths(meeting)?.len();
+        // 沿用這場會議目前的兩條時間軸。`append` 會拿最後一個事件的 Timeline
+        // 去更新 meetings 的長度，給 0 會把整場會議的時間歸零。
+        let tl = self.conn.query_row(
+            "SELECT meeting_time_ms, captured_audio_ms FROM meetings WHERE id = ?1",
+            params![meeting],
+            |r| {
+                Ok(Timeline::new(
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                ))
+            },
+        )?;
+        self.append(meeting, &[(DomainEvent::AudioSegmentsForgotten, tl)])?;
+        Ok(n)
+    }
+
+    /// 讀一個應用設定。沒設定過就回 `None`，由呼叫端決定預設。
+    pub fn app_setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_app_setting(&mut self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     /// 讀出 GUI 存下的非敏感 Provider 設定。沒有設定過就回預設值。
     pub fn provider_settings(
         &self,
@@ -1852,16 +1923,27 @@ fn project(
             expect_touched(seq, &format!("附件 {attachment_id}"), n)?;
         }
 
+        DomainEvent::AudioSegmentsForgotten => {
+            tx.execute(
+                "DELETE FROM audio_segments WHERE meeting_id = ?1",
+                params![meeting],
+            )?;
+        }
+
         DomainEvent::AudioSegmentFinalized { segment } => {
+            // 冪等靠 path 而不是 id：id 是全域主鍵，由資料庫配發，事件裡帶不出
+            // 一個穩定的值 —— 帶 0 的話第一段之後全部撞主鍵，被 DO NOTHING 靜靜
+            // 吞掉，磁碟上有檔案而索引裡沒有，刪音檔就再也刪不到它們。
+            // path 由軌道與起點組成，重播同一個事件會得到同一個路徑，正是冪等
+            // 需要的那把鍵（schema 上它本來就是 UNIQUE）。
             tx.execute(
                 "INSERT INTO audio_segments
-                     (id, meeting_id, track, source_epoch, path, captured_start_ms,
+                     (meeting_id, track, source_epoch, path, captured_start_ms,
                       captured_end_ms, meeting_start_ms, meeting_end_ms, is_silence_fill,
                       checksum, created_event_seq)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-                 ON CONFLICT (id) DO NOTHING",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                 ON CONFLICT (path) DO NOTHING",
                 params![
-                    segment.id,
                     meeting,
                     segment.track.as_str(),
                     segment.source_epoch as i64,
@@ -3131,6 +3213,112 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.meeting(m).unwrap().segments[0].text, "第二次改");
+    }
+
+    /// 每一段原音都要進得了索引，不是只有第一段。
+    ///
+    /// `audio_segments.id` 是全域主鍵，而事件帶不出一個穩定的 id。曾經用
+    /// `ON CONFLICT (id)` 配上事件裡固定的 0，結果第一段之後全部撞主鍵被
+    /// 靜靜吞掉：磁碟上有檔案、索引裡沒有，「刪音檔」永遠刪不到它們。
+    /// 刪掉的音訊索引不會被重建救回來。
+    ///
+    /// `audio_segments` 是投影，而投影會從日誌重播。只清投影的話，一次
+    /// `rebuild_projections` 就把索引還原了，指向 `remove_audio_files`
+    /// 早就刪掉的檔案 —— 畫面上有音訊、開不起來也刪不掉。
+    #[test]
+    fn forgetting_audio_survives_a_projection_rebuild() {
+        let mut s = Store::new(db::open_in_memory().unwrap());
+        let m = s.create_meeting("原音").unwrap();
+        let seg = |path: &str, start: u64| DomainEvent::AudioSegmentFinalized {
+            segment: AudioSegment {
+                id: 0,
+                track: Track::Mic,
+                source_epoch: 0,
+                path: path.into(),
+                captured_start_ms: start,
+                captured_end_ms: start + 60_000,
+                meeting_start_ms: start,
+                meeting_end_ms: start + 60_000,
+                is_silence_fill: false,
+                checksum: format!("sum-{start}"),
+            },
+        };
+        s.append(
+            m,
+            &[
+                (seg("/tmp/a.wav", 0), tl(100)),
+                (seg("/tmp/b.wav", 60_000), tl(200)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(s.forget_audio(m).unwrap(), 2, "回報的刪除數不是實際筆數");
+        assert!(s.audio_paths(m).unwrap().is_empty());
+
+        s.rebuild_projections(m).unwrap();
+        assert!(
+            s.audio_paths(m).unwrap().is_empty(),
+            "重建把已經刪掉的音訊索引救了回來"
+        );
+        // 事件本身留著：「當時確實錄過」不因為刪了檔案而變成沒發生
+        let kinds: Vec<String> = s
+            .conn
+            .prepare("SELECT kind FROM meeting_events WHERE meeting_id = ?1")
+            .unwrap()
+            .query_map(params![m], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| *k == "AudioSegmentFinalized")
+                .count(),
+            2,
+            "錄過的事實被刪掉了"
+        );
+        assert!(kinds.iter().any(|k| k == "AudioSegmentsForgotten"));
+    }
+
+    #[test]
+    fn every_audio_segment_reaches_the_index_not_just_the_first() {
+        let mut s = Store::new(db::open_in_memory().unwrap());
+        let m = s.create_meeting("原音").unwrap();
+        let seg = |path: &str, start: u64| DomainEvent::AudioSegmentFinalized {
+            segment: AudioSegment {
+                // 事件裡的 id 一律是這個值，正是當初出事的形狀
+                id: 0,
+                track: Track::Mic,
+                source_epoch: 0,
+                path: path.into(),
+                captured_start_ms: start,
+                captured_end_ms: start + 60_000,
+                meeting_start_ms: start,
+                meeting_end_ms: start + 60_000,
+                is_silence_fill: false,
+                checksum: format!("sum-{start}"),
+            },
+        };
+        s.append(
+            m,
+            &[
+                (seg("/tmp/mic-000000000.wav", 0), tl(100)),
+                (seg("/tmp/mic-000060000.wav", 60_000), tl(200)),
+                (seg("/tmp/mic-000120000.wav", 120_000), tl(300)),
+            ],
+        )
+        .unwrap();
+
+        let paths = s.audio_paths(m).unwrap();
+        assert_eq!(paths.len(), 3, "只有第一段進得了索引，其餘被主鍵吞掉了");
+
+        // 重播同一批不得長出第二份：冪等靠 path
+        s.append(m, &[(seg("/tmp/mic-000060000.wav", 60_000), tl(400))])
+            .unwrap();
+        assert_eq!(
+            s.audio_paths(m).unwrap().len(),
+            3,
+            "重播同一段音訊在索引裡長出了第二筆"
+        );
     }
 
     #[test]

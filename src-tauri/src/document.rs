@@ -432,9 +432,9 @@ pub fn normalize_for_match(text: &str) -> String {
     out
 }
 
-pub fn sha256_hex(s: &str) -> String {
+pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     let mut h = Sha256::new();
-    h.update(s.as_bytes());
+    h.update(bytes.as_ref());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
