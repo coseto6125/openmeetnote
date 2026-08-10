@@ -83,6 +83,20 @@ const failed = (seq: number, version: number, reason: string): SessionEvent => (
   reason,
 });
 
+const audioStored = (seq: number, track: 'mic' | 'system' = 'mic'): SessionEvent => ({
+  kind: 'audioSegmentStored',
+  seq,
+  track,
+  capturedStartMs: 0,
+  capturedEndMs: 60_000,
+});
+
+const progress = (version: number, text: string): SessionEvent => ({
+  kind: 'generationProgress',
+  version,
+  text,
+});
+
 const note = (seq: number, noteId: number, text: string): SessionEvent => ({
   kind: 'noteAdded',
   seq,
@@ -173,6 +187,7 @@ describe('sequence gap detection', () => {
         { version: 1, throughEventSeq: 4, meetingTimeMs: 3000, state: 'completed', prompt: '' },
       ],
       pauses: [{ fromMs: 1000, toMs: 2000 }],
+      audioSegments: 0,
     };
     m = fromProjection(m, projection);
     expect(m.desynced).toBe(false);
@@ -318,6 +333,39 @@ describe('生成失敗', () => {
     expect(m.snapshots[0].prompt).toBe('整理成決議清單');
   });
 
+  test('progress_shows_on_the_running_version_and_the_latest_line_wins', () => {
+    // 一輪最多十分鐘，只顯示「生成中」使用者分不出在跑還是卡死
+    let m = applyBatch(emptyMeeting, batchOf([snapshot(1, 1)], 0));
+    m = applyBatch(m, batchOf([progress(1, '讀取證據')], 1));
+    expect(m.snapshots[0].progress).toBe('讀取證據');
+
+    m = applyBatch(m, batchOf([progress(1, 'tokens used 5,580')], 1));
+    expect(m.snapshots[0].progress).toBe('tokens used 5,580');
+    // 進度是暫態的，不帶 seq，不該推進已套用的事件序列
+    expect(m.appliedSeq).toBe(1);
+  });
+
+  test('progress_for_an_unknown_version_does_not_invent_a_snapshot', () => {
+    // 建立版本的是 snapshotCreated。進度先到就長出一個空節點的話，
+    // 畫面上會多一個沒有涵蓋範圍、點不開的版本
+    const m = applyBatch(emptyMeeting, batchOf([progress(9, '讀取證據')], 0));
+    expect(m.snapshots).toHaveLength(0);
+  });
+
+  test('progress_is_cleared_once_the_round_settles', () => {
+    // 完成或失敗之後那行過期的進度只會誤導
+    let m = applyBatch(emptyMeeting, batchOf([snapshot(1, 1)], 0));
+    m = applyBatch(m, batchOf([progress(1, '正在生成區塊')], 1));
+    m = applyBatch(m, batchOf([completed(2, 1)], 1));
+    expect(m.snapshots[0].progress).toBeUndefined();
+
+    let n = applyBatch(emptyMeeting, batchOf([snapshot(1, 2)], 0));
+    n = applyBatch(n, batchOf([progress(2, '正在生成區塊')], 1));
+    n = applyBatch(n, batchOf([failed(2, 2, '生成逾時（600 秒）')], 1));
+    expect(n.snapshots[0].progress).toBeUndefined();
+    expect(n.snapshots[0].reason).toBe('生成逾時（600 秒）');
+  });
+
   test('a_failed_generation_keeps_the_snapshot_and_shows_why', () => {
     let m = applyBatch(emptyMeeting, batchOf([snapshot(1, 1)], 0));
     m = applyBatch(m, batchOf([failed(2, 1, 'CLI 尚未登入')], 1));
@@ -361,6 +409,49 @@ describe('生成失敗', () => {
 
     expect(m.snapshots[0].state).toBe('completed');
     expect(m.activeVersion).toBe(1);
+  });
+});
+
+describe('原音保存', () => {
+  test('a_stored_audio_segment_counts_without_breaking_seq_continuity', () => {
+    // 音訊落地是決定性事件、佔一個 seq。不送到 UI 的話前端會把那個 seq
+    // 當成缺號而要求重新同步，畫面上就是無故閃一次「內容不可信」。
+    let m = applyBatch(emptyMeeting, batchOf([audioStored(1)], 0));
+    expect(m.audioSegments).toBe(1);
+    expect(m.desynced).toBe(false);
+    expect(m.appliedSeq).toBe(1);
+
+    m = applyBatch(m, batchOf([audioStored(2, 'system')], 1));
+    expect(m.audioSegments).toBe(2);
+    expect(m.desynced).toBe(false);
+  });
+
+  test('resync_corrects_the_audio_count_it_does_not_inherit_a_stale_one', () => {
+    // 缺號後重新同步的目的就是修正計數。沿用舊值的話，被漏掉的那幾段
+    // 永遠補不回來，而畫面會宣稱原音比實際少。
+    let m = applyBatch(emptyMeeting, batchOf([audioStored(1)], 0));
+    expect(m.audioSegments).toBe(1);
+    const p: SessionProjection = {
+      state: 'recording',
+      seq: 9,
+      meetingTimeMs: 5000,
+      capturedAudioMs: 5000,
+      segments: [],
+      speakers: [],
+      notes: [],
+      snapshots: [],
+      pauses: [],
+      audioSegments: 4,
+    };
+    m = fromProjection(m, p);
+    expect(m.audioSegments).toBe(4);
+  });
+
+  test('no_audio_events_means_the_transcript_cannot_be_verified_later', () => {
+    // 0 是有意義的狀態，不是「還沒收到」：關掉保存或寫入失敗時，
+    // 逐字稿就是唯一紀錄
+    const m = applyBatch(emptyMeeting, batchOf([finalized(1, 1, '開始討論')], 0));
+    expect(m.audioSegments).toBe(0);
   });
 });
 

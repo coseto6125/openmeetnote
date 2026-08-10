@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, TrySendError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use std::io::Write;
 
@@ -139,6 +140,12 @@ const FAST_BACKLOG_CHUNKS: usize = 150;
 /// 但仍然有界：whisper 卡住時無界佇列會一路長到會議結束。
 const SLOW_BACKLOG_CHUNKS: usize = 6_000;
 
+/// 寫檔佇列的長度上限（每批 100 ms），約十分鐘。
+///
+/// 跟定稿一樣寬：丟掉一批就是原音真的缺一段，而原音的用途正是事後驗證。
+/// 但仍然有界 —— 防毒掃描或磁碟卡住時，無界佇列會一路長到會議結束。
+const WRITE_BACKLOG_CHUNKS: usize = 6_000;
+
 #[derive(Debug, Clone)]
 pub struct ModelPaths {
     pub whisper: String,
@@ -247,6 +254,8 @@ pub struct LocalSttSource {
     workers: Vec<JoinHandle<()>>,
     levels: Arc<Levels>,
     paused: Arc<AtomicBool>,
+    /// 擷取開始的時刻。裝置比會議時鐘早跑，差多少由 session 問。
+    capture_started: Instant,
 }
 
 impl LocalSttSource {
@@ -254,7 +263,9 @@ impl LocalSttSource {
     ///
     /// 模型載入失敗就直接失敗，不退回 fixture：靜默換成假逐字稿會讓使用者
     /// 以為會議被記錄下來了。
-    pub fn start(models: ModelPaths) -> Result<Self> {
+    /// `audio_dir` 是這場會議的音訊要寫去哪。`None` 代表不保留原音 —— 那時
+    /// 逐字稿就是唯一紀錄，事後無法驗證也無法換模型重跑。
+    pub fn start(models: ModelPaths, audio_dir: Option<std::path::PathBuf>) -> Result<Self> {
         // 只有「這個平台沒有實作」才映成 NoCapture。裝置不見了、擷取起不來
         // 都是真的失敗，不該讓上層退回 fixture。
         let mut capture = platform_capture().map_err(|e| match e {
@@ -264,6 +275,9 @@ impl LocalSttSource {
         let audio_rx = capture
             .start()
             .map_err(|e| SttError::Audio(e.to_string()))?;
+        // 裝置從這一刻起就在收音，而會議時鐘要等模型載入完、`start` 回傳
+        // 之後才開始跑。兩者都以實時前進，差的就是這中間的長度。
+        let capture_started = Instant::now();
         log("音訊擷取已啟動");
 
         let (result_tx, rx) = channel();
@@ -272,6 +286,25 @@ impl LocalSttSource {
         // 停在「收尾中」十幾分鐘。滿了就丟並記錄，見 audio::Chunk 那一層。
         let (fast_tx, fast_rx) = sync_channel(FAST_BACKLOG_CHUNKS);
         let (slow_tx, slow_rx) = sync_channel(SLOW_BACKLOG_CHUNKS);
+        // 保存原音的那一條。跟兩個引擎一樣自己一條 channel 加一條執行緒：
+        // 磁碟 I/O 會阻塞，壓在分流的熱路徑上會拖慢即時稿。
+        let audio_writer = audio_dir.map(|dir| {
+            let (tx, chunk_rx) = sync_channel(WRITE_BACKLOG_CHUNKS);
+            let (seg_tx, seg_rx) = channel();
+            let worker =
+                std::thread::spawn(move || crate::audio::writer::run(chunk_rx, dir, seg_tx));
+            (tx, seg_rx, worker)
+        });
+        let (write_tx, written_rx, write_worker) = match audio_writer {
+            Some((tx, rx, w)) => (Some(tx), Some(rx), Some(w)),
+            None => {
+                log("沒有指定音訊目錄，這場會議不保留原音");
+                (None, None, None)
+            }
+        };
+        // 只有真的在寫音訊時才需要回報用的 Sender：多留一個沒人用的
+        // Sender 會讓 session 端的 channel 永遠不關閉。
+        let audio_tx = write_tx.as_ref().map(|_| result_tx.clone());
         // 引擎在這裡載入完才算開始。載入失敗原本是工作執行緒裡的一行 log
         // 加上 `return`：Session 仍然停在 Recording、健康狀態顯示 ok，而
         // 定稿執行緒死掉還會讓分流停止讀音訊 —— 使用者錄完整場才發現一個字
@@ -288,8 +321,10 @@ impl LocalSttSource {
         let levels = Arc::new(Levels::default());
         let paused = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicU64::new(0));
+        let write_dropped = Arc::new(AtomicU64::new(0));
         let dispatcher = {
             let (levels, paused, dropped) = (levels.clone(), paused.clone(), dropped.clone());
+            let write_dropped = write_dropped.clone();
             std::thread::spawn(move || {
                 for chunk in audio_rx {
                     // 暫停期間直接丟掉，連引擎都不進。擷取執行緒繼續跑是
@@ -301,6 +336,20 @@ impl LocalSttSource {
                     // 音量在這裡取：每個 chunk 都會經過，而且還沒被任何
                     // 閘門篩掉，畫面上的音量條反映的是真的收到什麼
                     levels.observe(chunk.track, rms(&chunk.samples));
+                    // 原音先送去寫檔。它不受任何閘門影響：閘門判斷的是
+                    // 「要不要送去轉錄」，而事後要驗證的恰好包含被擋掉的那些。
+                    if let Some(w) = &write_tx {
+                        match w.try_send(chunk.clone()) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                let n = write_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n.is_power_of_two() {
+                                    log(&format!("音訊寫入佇列已滿，累計丟棄 {n} 批原音"));
+                                }
+                            }
+                            Err(TrySendError::Disconnected(_)) => {}
+                        }
+                    }
                     // 即時稿是拋棄式的，滿了就丟那一批：它每 800 ms 重算
                     // 整個視窗，少一批不會留下痕跡
                     let _ = fast_tx.try_send(chunk.clone());
@@ -333,12 +382,42 @@ impl LocalSttSource {
             std::thread::spawn(move || final_loop(slow_rx, tx, &models, progress, &ready_tx))
         };
 
+        // 落地的音訊段走逐字稿同一條 channel 回 session。音訊執行緒不碰
+        // SQLite（§12），由 session 配發 seq 並寫入事件序列。
+        let mut workers = vec![dispatcher, fast, slow];
+        if let (Some(tx), Some(written_rx), Some(w)) = (audio_tx, written_rx, write_worker) {
+            workers.push(std::thread::spawn(move || {
+                for seg in written_rx {
+                    log(&format!(
+                        "{} 軌音訊落地：{} ms 到 {} ms → {}",
+                        seg.track.as_str(),
+                        seg.captured_start_ms,
+                        seg.captured_end_ms,
+                        seg.path
+                    ));
+                    if tx
+                        .send(TranscriptInput::AudioSegment {
+                            track: seg.track,
+                            path: seg.path,
+                            captured_span: (seg.captured_start_ms, seg.captured_end_ms),
+                            checksum: seg.checksum,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+            workers.push(w);
+        }
+
         let source = Self {
             rx,
             capture,
-            workers: vec![dispatcher, fast, slow],
+            workers,
             levels,
             paused,
+            capture_started,
         };
         // 兩個引擎都回報載入結果才回傳。失敗時 `source` 在這裡被 drop，
         // 它的 Drop 會停掉擷取並 join 三條執行緒 —— 開了一半的狀態不留下。
@@ -388,6 +467,14 @@ impl TranscriptSource for LocalSttSource {
     /// 這個方法在 session 的事件迴圈上被呼叫，阻塞它等於卡住整個會議狀態機。
     fn poll(&mut self, _window_ms: u64) -> Vec<TranscriptInput> {
         self.rx.try_iter().collect()
+    }
+
+    /// 模型載入期間裝置已經在收音了，這段長度是兩個時鐘的固定落差。
+    ///
+    /// whisper 那顆模型有五百多 MB，載入要好幾秒到數十秒。不扣掉它，每一段
+    /// 音訊的會議時間都會晚上這麼多，而且每場會議都會發生，不只暫停時。
+    fn captured_before_attach_ms(&self) -> u64 {
+        self.capture_started.elapsed().as_millis() as u64
     }
 
     fn set_paused(&mut self, paused: bool) {
@@ -767,39 +854,31 @@ fn final_loop(
             }
         };
         let voiced_pct = voiced as f64 * 100.0 / buffered_ms.max(1) as f64;
-        // 人聲少到這個地步，whisper 拿到的等於是噪音，它會編出「好」這種
-        // 正常詞 —— 黑名單治不了，結構判準也治不了（單句、不重複、不是
-        // 碎片），只有佔比看得出來。
-        //
-        // 門檻取兩邊的空隙：實測真實會議的批次最低 31%，中位 88%（85 批
-        // 最低 68%）；漏過的噪音幻覺是 4% 與 14%。20% 兩邊都不碰。
-        // VAD 說有人聲、佔比也夠了，最後看能量。
-        //
-        // 這道門檻放在 VAD 之後不是順序問題而是安全問題：VAD 已經確認裡面
-        // 有語音結構，這時再看能量不會誤殺小聲說的話 —— 放在前面才會。
-        //
-        // 擋的是「微弱到不可能是有意義發言、但 VAD 仍判得出結構」的音訊：
-        // 外放的遠端回音、隔壁房間的說話聲。whisper 在那上面會編出整段
-        // 不存在的內容（實測 RMS 0.0042 產出七句，包括「我想要吃飯」這種
-        // 跟會議毫無關係的句子）。
+        // 能量擋的是「微弱到不可能是有意義發言、但 VAD 仍判得出結構」的音訊：
+        // 外放的遠端回音、隔壁房間的說話聲。whisper 在那上面會編出整段不存在
+        // 的內容（實測 RMS 0.0042 產出七句，包括「我想要吃飯」這種跟會議毫無
+        // 關係的句子）。
         //
         // 兩個來源取大：SPEECH_FLOOR 是真實發言的絕對下限（實測幻覺最高
         // 0.0050、小聲語音 0.0107、真實批次最低 0.0628），底噪估計則讓
         // 吵雜場地自動提高標準。
         let speech_floor = SPEECH_FLOOR.max(floors.entry(track).or_default().threshold());
-        if voiced_pct >= MIN_VOICED_PCT && level < speech_floor {
-            log(&format!(
-                "{} 軌略過 {buffered_ms} ms（起點 {batch_start_ms} ms，RMS {level:.4} < 發言下限 {speech_floor:.4}）",
-                track.as_str()
-            ));
-            continue;
-        }
-        if voiced_pct < MIN_VOICED_PCT {
-            log(&format!(
-                "{} 軌略過 {buffered_ms} ms（起點 {batch_start_ms} ms，RMS {level:.4}，人聲僅 {voiced_pct:.0}%）",
-                track.as_str()
-            ));
-            continue;
+        match gate(voiced, buffered_ms, level, speech_floor) {
+            Gate::Send => {}
+            Gate::TooQuiet => {
+                log(&format!(
+                    "{} 軌略過 {buffered_ms} ms（起點 {batch_start_ms} ms，RMS {level:.4} < 發言下限 {speech_floor:.4}）",
+                    track.as_str()
+                ));
+                continue;
+            }
+            Gate::TooSparse => {
+                log(&format!(
+                    "{} 軌略過 {buffered_ms} ms（起點 {batch_start_ms} ms，RMS {level:.4}，人聲僅 {voiced_pct:.0}%、{voiced} ms）",
+                    track.as_str()
+                ));
+                continue;
+            }
         }
 
         match engine.transcribe(&batch) {
@@ -1023,6 +1102,43 @@ const SPEECH_FLOOR: f32 = 0.008;
 /// 最高 14%。收尾批次不套用這條 —— 那是使用者按下結束前的最後一段，
 /// 寧可留著也不要賭。
 const MIN_VOICED_PCT: f64 = 20.0;
+
+/// 佔比不足時，湊得出一句話的最低人聲總長。
+///
+/// 佔比擋得住噪音幻覺，卻連短回應一起擋掉：使用者大部分時間在聽，「對」
+/// 「OK」「了解」落在 8 秒批次裡天然只有 12-18%，跟實測幻覺的 4-14% 同一
+/// 個區間 —— 一場 295 秒的會議，麥克風軌 27 個批次被擋掉 21 個。
+///
+/// 分開兩者的訊號是能量而不是佔比（見 [`SPEECH_FLOOR`]：幻覺實測 0.0050
+/// 以下，被擋掉的短回應 0.0083 以上），所以這個值只負責擋「零星幾百毫秒」
+/// 那一種：500 ms 在實測最零碎的幻覺總長 320 ms 之上，又容得下一個「了解」。
+const MIN_VOICED_MS: u64 = 500;
+
+/// 這批音訊要不要送去定稿。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    Send,
+    /// VAD 判得出語音結構，但能量不到有意義發言的下限
+    TooQuiet,
+    /// 人聲太零碎，湊不出一句話
+    TooSparse,
+}
+
+/// 能量先判、佔比後判，兩者都在 VAD 之後。
+///
+/// 能量放在 VAD 之後是安全考量而非順序偏好：VAD 已經確認裡面有語音結構，
+/// 這時再看能量不會誤殺小聲說的話，放在前面才會。
+fn gate(voiced_ms: u64, buffered_ms: u64, level: f32, speech_floor: f32) -> Gate {
+    if level < speech_floor {
+        return Gate::TooQuiet;
+    }
+    let pct = voiced_ms as f64 * 100.0 / buffered_ms.max(1) as f64;
+    if pct >= MIN_VOICED_PCT || voiced_ms >= MIN_VOICED_MS {
+        Gate::Send
+    } else {
+        Gate::TooSparse
+    }
+}
 
 /// 低於這個能量就當數位靜音，連 VAD 都不必跑。
 ///
@@ -1651,35 +1767,80 @@ mod level_tests {
 }
 
 #[cfg(test)]
-mod voiced_pct_tests {
+mod gate_decision_tests {
     use super::*;
 
-    fn pct(voiced_ms: u64, buffered_ms: u64) -> f64 {
-        voiced_ms as f64 * 100.0 / buffered_ms.max(1) as f64
-    }
+    /// 實測幻覺的能量上限與被誤殺短回應的能量下限，門檻落在兩者之間
+    const PHANTOM_RMS: f32 = 0.0050;
+    const SHORT_REPLY_RMS: f32 = 0.0083;
 
     /// 真機漏過的兩批噪音幻覺，內容都是「好」，黑名單與結構判準都治不了
     #[test]
-    fn test_the_two_phantom_batches_measured_in_the_field_are_below_the_bar() {
-        assert!(pct(320, 8_000) < MIN_VOICED_PCT, "4% 那批仍會通過");
-        assert!(pct(1_120, 8_000) < MIN_VOICED_PCT, "14% 那批仍會通過");
+    fn test_the_two_phantom_batches_measured_in_the_field_are_still_blocked() {
+        // 4% 那批：時長與能量都不到
+        assert_eq!(gate(320, 8_000, PHANTOM_RMS, SPEECH_FLOOR), Gate::TooQuiet);
+        // 14% 那批：人聲總長 1120 ms 比真實短回應還長，只有能量攔得住它。
+        // 這就是判準不能只看時長的理由。
+        assert_eq!(
+            gate(1_120, 8_000, PHANTOM_RMS, SPEECH_FLOOR),
+            Gate::TooQuiet
+        );
     }
 
     /// 實測真實會議批次的分布：最低 31%、五百分位 74%、中位 88%
     #[test]
     fn test_every_measured_real_batch_clears_the_bar() {
-        for p in [31.0, 68.0, 74.0, 79.0, 88.0, 96.0, 99.0] {
-            assert!(p >= MIN_VOICED_PCT, "真實會議的 {p}% 批次會被擋掉");
+        for pct in [31.0, 68.0, 74.0, 79.0, 88.0, 96.0, 99.0] {
+            let voiced = (8_000.0 * pct / 100.0) as u64;
+            assert_eq!(
+                gate(voiced, 8_000, 0.0628, SPEECH_FLOOR),
+                Gate::Send,
+                "真實會議的 {pct}% 批次會被擋掉"
+            );
         }
     }
 
-    /// 門檻與兩邊都要有距離，不能剛好貼著任何一側
+    /// meeting 57 被門檻吃掉的麥克風批次，換判準之後必須放行
     #[test]
-    fn test_the_bar_sits_in_the_gap_not_against_either_side() {
-        const HIGHEST_PHANTOM: f64 = 14.0;
-        const LOWEST_REAL: f64 = 31.0;
-        const { assert!(MIN_VOICED_PCT > HIGHEST_PHANTOM * 1.3) };
-        const { assert!(MIN_VOICED_PCT < LOWEST_REAL / 1.3) };
+    fn test_the_short_replies_the_ratio_bar_ate_now_pass() {
+        // 實測值：人聲 3% 到 18%、RMS 0.0083 到 0.0142，27 批被擋掉 21 批
+        for (pct, rms) in [
+            (12.0, 0.0090_f32),
+            (13.0, 0.0087),
+            (14.0, 0.0094),
+            (15.0, 0.0142),
+            (16.0, 0.0101),
+            (17.0, 0.0096),
+            (18.0, 0.0102),
+        ] {
+            let voiced = (8_000.0 * pct / 100.0) as u64;
+            assert_eq!(
+                gate(voiced, 8_000, rms, SPEECH_FLOOR),
+                Gate::Send,
+                "{pct}%（{voiced} ms、RMS {rms:.4}）的短回應又被擋掉了"
+            );
+        }
+    }
+
+    /// 能量夠但人聲只有零星碎片，仍然不送
+    #[test]
+    fn test_a_few_scattered_milliseconds_never_reach_the_model() {
+        assert_eq!(
+            gate(320, 8_000, SHORT_REPLY_RMS, SPEECH_FLOOR),
+            Gate::TooSparse
+        );
+    }
+
+    /// 兩條門檻各自要與實測資料保持距離
+    #[test]
+    fn test_both_bars_sit_in_the_gap_not_against_either_side() {
+        // 能量是分開幻覺與短回應的那一條，必須落在兩者中間
+        const { assert!(SPEECH_FLOOR > PHANTOM_RMS) };
+        const { assert!(SPEECH_FLOOR < SHORT_REPLY_RMS) };
+        // 時長只負責擋零星碎片：低於實測最短的真實短回應（3% = 240 ms 之上），
+        // 又要高於實測最零碎的幻覺（320 ms）
+        const { assert!(MIN_VOICED_MS > 320) };
+        const { assert!(MIN_VOICED_MS < 960) };
     }
 }
 

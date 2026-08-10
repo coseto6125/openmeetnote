@@ -30,6 +30,9 @@ use crate::store::{DomainEvent, MeetingId, SegmentRevision, Store, StoreHandle};
 
 pub const EVENT_CHANNEL: &str = "session://events";
 
+/// 「要不要保留原音」的設定鍵。預設保留（見 migration 003）。
+const KEEP_AUDIO: &str = "keep_audio";
+
 /// UI 事件批次的節流窗。逐 frame 或逐字呼叫 WebView 會讓渲染成為熱點（§12）。
 const BATCH_MS: u64 = 100;
 
@@ -105,6 +108,25 @@ pub enum SessionEvent {
         /// 使用者無從知道哪一版問的是什麼 —— 這個值本來就存了，只是沒送出來。
         prompt: String,
     },
+    /// 一段原音已經寫到磁碟上。
+    ///
+    /// UI 不需要顯示檔案路徑，但這是決定性事件、佔了一個 seq，而前端靠
+    /// 「seq 連續」偵測漏事件 —— 不送出去，畫面會把它當成缺號而要求重新
+    /// 同步。順帶讓使用者看得到原音真的有在存。
+    AudioSegmentStored {
+        seq: u64,
+        track: Track,
+        captured_start_ms: u64,
+        captured_end_ms: u64,
+    },
+    /// 暫態：CLI 生成期間的進度訊息，同一個 `version` 就地更新。
+    ///
+    /// 沒有它，一輪生成對使用者就是最多十分鐘的「生成中…」，分不出在跑
+    /// 還是卡死。內容是 Provider 寫到 stderr 的東西，不落地、重開就沒有。
+    GenerationProgress {
+        version: u32,
+        text: String,
+    },
     GenerationCompleted {
         seq: u64,
         version: u32,
@@ -143,8 +165,11 @@ impl SessionEvent {
             | SessionEvent::SnapshotCreated { seq, .. }
             | SessionEvent::GenerationCompleted { seq, .. }
             | SessionEvent::GenerationFailed { seq, .. }
+            | SessionEvent::AudioSegmentStored { seq, .. }
             | SessionEvent::MeetingStateChanged { seq, .. } => Some(*seq),
-            SessionEvent::TranscriptPartial { .. } | SessionEvent::TrackActivity { .. } => None,
+            SessionEvent::TranscriptPartial { .. }
+            | SessionEvent::GenerationProgress { .. }
+            | SessionEvent::TrackActivity { .. } => None,
         }
     }
 }
@@ -209,6 +234,9 @@ pub struct SessionProjection {
     pub notes: Vec<ProjectedNote>,
     pub snapshots: Vec<ProjectedSnapshot>,
     pub pauses: Vec<ProjectedPause>,
+    /// 這場已經落地幾段原音。重新同步時要能修正它，否則畫面上的數字會
+    /// 停在缺號發生前的值 —— 而修正缺號正是重新同步存在的理由。
+    pub audio_segments: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -282,6 +310,17 @@ pub enum TranscriptInput {
         /// `None` 代表來源給不出時間（例如 Fixture），由 session 用當下時鐘推算。
         audio_span: Option<(u64, u64)>,
     },
+    /// 一段原音已經寫到磁碟上（§11 的 `audio_segments`）。
+    ///
+    /// 走逐字稿同一條通道，因為寫檔發生在音訊執行緒，而那裡不碰 SQLite
+    /// （§12）：seq 的配發與落地一律由 session 負責。
+    AudioSegment {
+        track: Track,
+        path: String,
+        /// 這段音訊在該軌擷取音訊中的區間。
+        captured_span: (u64, u64),
+        checksum: String,
+    },
 }
 
 /// `MeetingSession` 只認識這個 trait。換成真實 STT 時，
@@ -289,6 +328,16 @@ pub enum TranscriptInput {
 pub trait TranscriptSource: Send {
     /// 推進 `window_ms` 毫秒，回傳這段時間內產生的逐字稿輸入。
     fn poll(&mut self, window_ms: u64) -> Vec<TranscriptInput>;
+
+    /// 擷取開始得比這個來源交到 session 手上早了多久。
+    ///
+    /// 音訊裝置在模型載入之前就開始收音（那是刻意的，否則開頭會掉字），
+    /// 而會議時鐘要等 `start` 才開始跑。兩者都以實時前進，所以它們之間
+    /// 只差這一個常數 —— 少了它，每一段音訊的會議時間都會晚上一個模型
+    /// 載入的長度。預設 0：fixture 沒有裝置，兩個時鐘同時開始。
+    fn captured_before_attach_ms(&self) -> u64 {
+        0
+    }
 
     /// 暫停或恢復音訊收集。
     ///
@@ -482,6 +531,10 @@ pub struct Session {
     /// 上次結算的時刻，對應 `SessionHandle` 的 epoch 經過毫秒數。
     last_settled_ms: u64,
     next_note_id: u64,
+    /// 已落地的原音段數。畫面用它回答「原音有在存嗎」。
+    audio_segments: u32,
+    /// 擷取時鐘與會議時鐘的固定落差（見 `captured_before_attach_ms`）。
+    device_offset_ms: u64,
     segments: HashMap<u64, SegmentRecord>,
     /// 正規化音訊區間到片段的對應（§5.3.2）。
     ///
@@ -522,6 +575,7 @@ impl Default for Session {
 impl Session {
     /// 換掉逐字稿來源。只在 Idle 狀態有意義：錄音中換來源會讓片段身分斷掉。
     pub fn attach_source(&mut self, source: Box<dyn TranscriptSource>) {
+        self.device_offset_ms = source.captured_before_attach_ms();
         self.source = source;
     }
 
@@ -534,6 +588,8 @@ impl Session {
             captured_audio_ms: 0,
             last_settled_ms: 0,
             next_note_id: 1,
+            audio_segments: 0,
+            device_offset_ms: 0,
             segments: HashMap::new(),
             intervals: HashMap::new(),
             speakers: HashMap::new(),
@@ -616,6 +672,51 @@ impl Session {
 
     fn push(&mut self, ev: SessionEvent) {
         self.pending.push(ev);
+    }
+
+    /// 裝置時鐘上的一個位置，對應到會議時間軸的哪裡。
+    ///
+    /// 兩者都以實時前進（會議時間在暫停、收尾期間照走），差的只有擷取比
+    /// 會議早開始的那一段，所以換算是一個減法。
+    ///
+    /// 這裡刻意不用「現在的 meeting 減現在的 captured」：那個差值是到此刻
+    /// 為止累積的非錄音時間，拿它去換算一段更早錄下的音訊，就會把之後才
+    /// 發生的暫停也算進去 —— 一段暫停前錄的音訊會被標到暫停之後。
+    fn meeting_at_device(&self, device_ms: u64) -> u64 {
+        device_ms.saturating_sub(self.device_offset_ms)
+    }
+
+    /// 同一個位置對應到擷取音訊時間軸的哪裡。
+    ///
+    /// 擷取時間只計實際錄音，所以要扣掉這個位置之前已經結束的暫停。
+    fn captured_at_device(&self, device_ms: u64) -> u64 {
+        let m = self.meeting_at_device(device_ms);
+        let paused: u64 = self
+            .pauses
+            .iter()
+            .map(|p| {
+                let from = p.from_ms.min(m);
+                let to = p.to_ms.unwrap_or(m).min(m);
+                to.saturating_sub(from)
+            })
+            .sum();
+        m.saturating_sub(paused)
+    }
+
+    /// 記下這一輪生成的最新進度。
+    ///
+    /// 同一批次裡只留最後一條：Provider 一秒可以寫好幾行，全部堆進佇列
+    /// 等於讓 UI 收到未經節流的事件流，而使用者只看得到最新那行。
+    fn note_generation_progress(&mut self, version: u32, text: String) {
+        if let Some(SessionEvent::GenerationProgress { text: slot, .. }) =
+            self.pending.iter_mut().find(|e| {
+                matches!(e, SessionEvent::GenerationProgress { version: v, .. } if *v == version)
+            })
+        {
+            *slot = text;
+            return;
+        }
+        self.push(SessionEvent::GenerationProgress { version, text });
     }
 
     /// 把時間推進到 `elapsed_ms`，依「目前」狀態分配這段時間。
@@ -730,6 +831,14 @@ impl Session {
         }
 
         if self.state == MeetingState::Finalizing && self.source.drained() {
+            // 收乾淨了再收一次：poll 與 drained 之間仍然會有東西被送進來，
+            // 而工作執行緒的最後一個動作往往正是那個 send（寫檔執行緒收尾時
+            // 送出兩軌的尾段，然後才結束）。少了這一次，轉成 Completed 之後
+            // tick 直接返回，那些尾段永遠留在 channel 裡：磁碟上有檔案，
+            // 索引裡沒有，刪音檔也刪不到。
+            for input in self.source.poll(0) {
+                self.apply_transcript_input(input);
+            }
             self.transition(MeetingState::Completed);
         }
     }
@@ -826,6 +935,41 @@ impl Session {
                     meeting_time_ms,
                 });
             }
+            TranscriptInput::AudioSegment {
+                track,
+                path,
+                captured_span,
+                checksum,
+            } => {
+                // 寫檔那一端數的是裝置送出的樣本，時鐘從擷取開始就跑，
+                // 暫停期間也不停（擷取執行緒刻意繼續跑，否則恢復時會掉字）。
+                // 兩條時間軸都由它換算，不能拿它當成擷取音訊的位置直接寫進去。
+                let (start, end) = captured_span;
+                let domain = DomainEvent::AudioSegmentFinalized {
+                    segment: crate::store::AudioSegment {
+                        // id 由資料庫配發，冪等靠 path，事件裡放 0 只是佔位
+                        id: 0,
+                        track,
+                        source_epoch: 0,
+                        path,
+                        captured_start_ms: self.captured_at_device(start),
+                        captured_end_ms: self.captured_at_device(end),
+                        meeting_start_ms: self.meeting_at_device(start),
+                        meeting_end_ms: self.meeting_at_device(end),
+                        is_silence_fill: false,
+                        checksum,
+                    },
+                };
+                let (cap_start, cap_end) =
+                    (self.captured_at_device(start), self.captured_at_device(end));
+                self.audio_segments += 1;
+                self.record(domain, |seq| SessionEvent::AudioSegmentStored {
+                    seq,
+                    track,
+                    captured_start_ms: cap_start,
+                    captured_end_ms: cap_end,
+                });
+            }
             TranscriptInput::Final {
                 segment_id,
                 speaker_id,
@@ -860,12 +1004,26 @@ impl Session {
                 // 時間戳要用這句話在音訊裡的位置，不是收到它的時刻。
                 // 一批轉錄結果會在同一個瞬間全部送達，用收到的時刻等於讓
                 // 整批共用一個時間，畫面上就是連續好幾句都標同一個時刻。
-                let first_seen = match audio_span {
-                    Some((start, _)) => Timeline::new(
-                        meeting_time_ms.saturating_sub(captured_audio_ms.saturating_sub(start)),
-                        start,
+                //
+                // 起點與終點都要換算。只換起點的話結束時間仍然是批次結尾，
+                // 同一批的句子全部共用它：真機實測 105 段平均算出 38 秒，
+                // 而單段上限是 15 秒。
+                //
+                // `audio_span` 來自擷取端的裝置時鐘，跟音訊段是同一個來源，
+                // 所以走同一套換算。兩邊各自推算的話，暫停之後同一段聲音會
+                // 被逐字稿標在一處、被音訊索引標在另一處。
+                let at = |device: u64| {
+                    Timeline::new(
+                        self.meeting_at_device(device),
+                        self.captured_at_device(device),
+                    )
+                };
+                let (first_seen, last_seen) = match audio_span {
+                    Some((start, end)) => (at(start), at(end)),
+                    None => (
+                        first_seen,
+                        Timeline::new(meeting_time_ms, captured_audio_ms),
                     ),
-                    None => first_seen,
                 };
                 match self.intervals.get(&key).copied() {
                     Some(existing) if existing != segment_id => {
@@ -878,7 +1036,7 @@ impl Session {
                         if same_text {
                             return;
                         }
-                        self.revise_segment(existing, &text, track);
+                        self.revise_segment(existing, &text, track, last_seen);
                         return;
                     }
                     _ => {
@@ -910,9 +1068,9 @@ impl Session {
                         speaker_id: Some(speaker_id.clone()),
                         track,
                         meeting_start_ms: first_seen.meeting_time_ms,
-                        meeting_end_ms: meeting_time_ms,
+                        meeting_end_ms: last_seen.meeting_time_ms,
                         captured_start_ms: first_seen.captured_audio_ms,
-                        captured_end_ms: captured_audio_ms,
+                        captured_end_ms: last_seen.captured_audio_ms,
                         echo_likelihood: None,
                         overlap_group_id: None,
                         provider_stream_id: None,
@@ -938,7 +1096,9 @@ impl Session {
     }
 
     /// Provider 對同一段音訊給出不同結果：建立新 revision，不建立新片段。
-    fn revise_segment(&mut self, segment_id: u64, text: &str, track: Track) {
+    /// `last_seen` 是這句話在音訊裡結束的位置。跟定稿走同一套換算，
+    /// 否則修訂會把一個正確的結束時間換成批次送達的時刻。
+    fn revise_segment(&mut self, segment_id: u64, text: &str, track: Track, last_seen: Timeline) {
         let Some(rec) = self.segments.get_mut(&segment_id) else {
             return;
         };
@@ -954,7 +1114,6 @@ impl Session {
             rec.first_seen,
             rec.meeting_time_ms,
         );
-        let captured_end = self.captured_audio_ms;
         let domain = DomainEvent::TranscriptSegmentRevised {
             segment: SegmentRevision {
                 segment_id,
@@ -963,9 +1122,9 @@ impl Session {
                 speaker_id: Some(speaker_id.clone()),
                 track,
                 meeting_start_ms: first_seen.meeting_time_ms,
-                meeting_end_ms: self.meeting_time_ms,
+                meeting_end_ms: last_seen.meeting_time_ms,
                 captured_start_ms: first_seen.captured_audio_ms,
-                captured_end_ms: captured_end,
+                captured_end_ms: last_seen.captured_audio_ms,
                 echo_likelihood: None,
                 overlap_group_id: None,
                 provider_stream_id: None,
@@ -984,7 +1143,7 @@ impl Session {
             speaker_id,
             text: owned,
             meeting_time_ms: start_ms,
-            captured_audio_ms: captured_end,
+            captured_audio_ms: last_seen.captured_audio_ms,
         });
     }
 
@@ -1062,6 +1221,7 @@ impl Session {
                 })
                 .collect(),
             pauses: self.pauses.clone(),
+            audio_segments: self.audio_segments,
         }
     }
 
@@ -1881,7 +2041,11 @@ pub fn spawn_pump(app: AppHandle) {
 /* ── 命令 ─────────────────────────────────────────────────────────── */
 
 #[tauri::command]
-pub fn start_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> CommandReceipt {
+pub fn start_meeting(
+    app: AppHandle,
+    state: State<SessionHandle>,
+    store: State<StoreHandle>,
+) -> CommandReceipt {
     // 一次只有一個開始流程。少了這道門，雙擊的第二次會建立空會議、開音訊
     // 裝置、把正在錄音的來源換掉，最後才由 `Session::start` 回報「已在進行
     // 中」—— 拒絕得太晚，傷害已經造成。
@@ -1911,9 +2075,34 @@ pub fn start_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> 
         Err(e) => return CommandReceipt::rejected(&format!("無法建立會議：{e}")),
     };
 
+    // 原音跟資料庫放在一起（app data dir），不放安裝目錄：後者在 Windows
+    // 需要提權才能寫，而且解除安裝會把會議紀錄一起清掉。每場一個子目錄，
+    // 要清哪一場就刪哪一個。
+    //
+    // 讀不到設定就當成要保留：預設保留原音，而讀取失敗不該悄悄改變預設。
+    let keep_audio = with_store(&store, |st| st.app_setting(KEEP_AUDIO))
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("0");
+    let audio_dir = match keep_audio {
+        false => {
+            crate::stt::live::log("設定為不保留原音，這場只留逐字稿");
+            None
+        }
+        true => match crate::config::audio_dir(&app, meeting) {
+            Ok(dir) => Some(dir),
+            Err(e) => {
+                crate::stt::live::log(&format!("無法建立音訊目錄，這場不保留原音：{e}"));
+                None
+            }
+        },
+    };
+
     // 音訊裝置在這裡才開，不在 app 啟動時：錄音沒開始就佔住麥克風，
     // 其他程式會拿不到，而使用者不會知道是誰佔的。
-    match crate::stt::live::ModelPaths::discover().and_then(crate::stt::live::LocalSttSource::start)
+    match crate::stt::live::ModelPaths::discover()
+        .and_then(|m| crate::stt::live::LocalSttSource::start(m, audio_dir))
     {
         Ok(src) => {
             if let Ok(mut s) = state.inner.lock() {
@@ -2020,6 +2209,14 @@ pub fn create_snapshot(
             // 「找不到 claude，請到設定頁確認」糟得多。
             match planner_for(&store) {
                 PlannerChoice::Cli(mut cli) => {
+                    // 進度回報走同一條事件通道，不另開一條路：暫態事件本來就
+                    // 由批次泵節流，UI 收進度與收逐字稿是同一個機制。
+                    let progress_app = worker.clone();
+                    cli.on_progress(std::sync::Arc::new(move |line| {
+                        let session: State<SessionHandle> = progress_app.state();
+                        let _ =
+                            session.with(|s| s.note_generation_progress(version, line.to_owned()));
+                    }));
                     run_generation(&session, &store, &mut cli, work, &prompt)
                 }
                 PlannerChoice::Fixture => run_generation(
@@ -2338,6 +2535,7 @@ pub fn rename_meeting(
 
 #[tauri::command]
 pub fn delete_meeting(
+    app: AppHandle,
     state: State<SessionHandle>,
     store: State<StoreHandle>,
     meeting_id: i64,
@@ -2346,7 +2544,76 @@ pub fn delete_meeting(
     if matches!(state.with(|s| s.active_meeting_id()), Ok(Some(id)) if id == meeting_id) {
         return Err("這場會議正在進行中，請先停止錄音".into());
     }
-    with_store(&store, |st| st.delete_meeting(meeting_id))
+    // 音檔先刪。順序反過來的話，會議一旦從資料庫消失就再也查不到它的
+    // 音訊索引，那些檔案會永遠留在磁碟上而且沒有任何入口看得到。
+    let removed = remove_audio_files(&app, &store, meeting_id);
+    with_store(&store, |st| st.delete_meeting(meeting_id))?;
+    if removed > 0 {
+        crate::stt::live::log(&format!(
+            "刪除會議 {meeting_id} 時一併刪掉 {removed} 個音檔"
+        ));
+    }
+    Ok(())
+}
+
+/// 只刪原音，留下逐字稿與摘要。
+///
+/// 音檔是這個 app 最佔空間的東西（兩軌約 230 MB/小時），而它的用途是事後
+/// 驗證逐字稿。驗完了、或這場不需要再追究，就該能把空間拿回來而不必連
+/// 會議紀錄一起丟。
+#[tauri::command]
+pub fn delete_meeting_audio(
+    app: AppHandle,
+    state: State<SessionHandle>,
+    store: State<StoreHandle>,
+    meeting_id: i64,
+) -> Result<usize, String> {
+    // 正在錄的那場不能刪：寫入執行緒還握著檔案，刪了它會邊錄邊消失
+    if matches!(state.with(|s| s.active_meeting_id()), Ok(Some(id)) if id == meeting_id) {
+        return Err("這場會議正在進行中，請先停止錄音".into());
+    }
+    let removed = remove_audio_files(&app, &store, meeting_id);
+    with_store(&store, |st| st.forget_audio(meeting_id))?;
+    crate::stt::live::log(&format!("刪除會議 {meeting_id} 的 {removed} 個音檔"));
+    Ok(removed)
+}
+
+/// 依資料庫裡的索引刪檔，回傳真的刪掉幾個。
+///
+/// 刪不掉的檔案（被佔用、權限不足）只記日誌不中斷：資料庫那邊仍然要清掉，
+/// 否則使用者按了刪除卻看到音訊還在，下次也永遠刪不掉。
+fn remove_audio_files(app: &AppHandle, store: &State<StoreHandle>, meeting_id: i64) -> usize {
+    let Ok(paths) = with_store(store, |st| st.audio_paths(meeting_id)) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for p in &paths {
+        match std::fs::remove_file(p) {
+            Ok(()) => removed += 1,
+            // 檔案本來就不在等於目標已達成，不值得驚動使用者
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => crate::stt::live::log(&format!("刪不掉音檔 {p}：{e}")),
+        }
+    }
+    // 目錄空了才移除，留著一個空目錄沒有壞處但會累積
+    if let Ok(dir) = crate::config::audio_dir(app, meeting_id) {
+        let _ = std::fs::remove_dir(dir);
+    }
+    removed
+}
+
+/// 是否保留原音。預設保留：沒有原音就無法驗證逐字稿。
+#[tauri::command]
+pub fn get_keep_audio(store: State<StoreHandle>) -> Result<bool, String> {
+    let v = with_store(&store, |st| st.app_setting(KEEP_AUDIO))?;
+    Ok(v.as_deref() != Some("0"))
+}
+
+#[tauri::command]
+pub fn set_keep_audio(store: State<StoreHandle>, keep: bool) -> Result<(), String> {
+    with_store(&store, |st| {
+        st.set_app_setting(KEEP_AUDIO, if keep { "1" } else { "0" })
+    })
 }
 
 /// 從事件日誌重建投影。
@@ -2734,6 +3001,152 @@ mod tests {
     }
 
     #[test]
+    fn test_only_the_latest_generation_progress_survives_a_batch() {
+        // Provider 一秒可以寫好幾行，全部堆進佇列等於讓 UI 收到未經節流的
+        // 事件流，而畫面上只顯示最新那行
+        let mut s = recording();
+        s.pending.clear();
+        s.note_generation_progress(1, "讀取證據".into());
+        s.note_generation_progress(1, "正在生成區塊".into());
+        s.note_generation_progress(2, "另一輪".into());
+
+        let progress: Vec<_> = s
+            .pending
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::GenerationProgress { version, text } => {
+                    Some((*version, text.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            progress,
+            vec![(1, "正在生成區塊".to_string()), (2, "另一輪".to_string())],
+            "同一輪只該留最後一條，不同輪不該互相覆蓋"
+        );
+        // 暫態事件不進事件序列
+        assert!(s
+            .pending
+            .iter()
+            .all(|e| !matches!(e, SessionEvent::GenerationProgress { .. }) || e.seq().is_none()));
+    }
+
+    /// 暫停之後，音訊段仍然落在它真正被錄下的那個時間。
+    ///
+    /// 寫檔端數的是裝置送出的樣本，而擷取執行緒在暫停期間刻意繼續跑（重開
+    /// 裝置要一到兩秒，恢復時會掉字）。曾經用「現在的 meeting 減現在的
+    /// captured」去換算，那個差值是到此刻為止累積的非錄音時間，拿它換算一段
+    /// 更早錄下的音訊，就會把之後才發生的暫停也算進去 —— 一段暫停前錄的
+    /// 音訊被標到暫停之後，而逐字稿說的是另一個時間，同一段聲音兩個答案。
+    /// 模型載入期間錄下的音訊，會議時間要從 0 起算而不是從載入完起算。
+    ///
+    /// 音訊裝置在模型載入前就開始收音（否則開頭會掉字），會議時鐘卻要等
+    /// `start` 才跑。少了這個常數，每一段音訊的會議時間都晚上一個模型載入
+    /// 的長度 —— whisper 那顆五百多 MB，這不是可以忽略的誤差，而且每場
+    /// 會議都會發生，不只暫停時。
+    #[test]
+    fn test_audio_recorded_while_the_models_loaded_keeps_its_meeting_time() {
+        struct SlowToLoad;
+        impl TranscriptSource for SlowToLoad {
+            fn poll(&mut self, _window_ms: u64) -> Vec<TranscriptInput> {
+                Vec::new()
+            }
+            /// 擷取比會議早開始 8 秒
+            fn captured_before_attach_ms(&self) -> u64 {
+                8_000
+            }
+        }
+
+        let mut s = Session::default();
+        s.attach_source(Box::new(SlowToLoad));
+        assert!(s.start(1).accepted);
+        s.settle(12_000); // 會議開始後 12 秒
+        s.pending.clear();
+        s.take_journal();
+
+        // 裝置時鐘 8000 到 20000：前 8 秒是載入期間，會議時間應該是 0 到 12000
+        s.apply_transcript_input(TranscriptInput::AudioSegment {
+            track: Track::Mic,
+            path: "/tmp/mic-000008000.wav".into(),
+            captured_span: (8_000, 20_000),
+            checksum: "c".into(),
+        });
+        let seg = s
+            .take_journal()
+            .into_iter()
+            .find_map(|(e, _)| match e {
+                DomainEvent::AudioSegmentFinalized { segment } => Some(segment),
+                _ => None,
+            })
+            .expect("沒有音訊事件");
+        assert_eq!(
+            (seg.meeting_start_ms, seg.meeting_end_ms),
+            (0, 12_000),
+            "整段音訊被往後推了一個模型載入的長度"
+        );
+    }
+
+    #[test]
+    fn test_a_pause_does_not_shift_where_the_audio_was_recorded() {
+        let mut s = recording();
+        s.settle(10_000); // 錄 10 秒：meeting=10000, captured=10000
+        s.pause();
+        s.settle(70_000); // 暫停 60 秒：meeting=70000, captured 不動
+        s.resume();
+        s.settle(75_000); // 再錄 5 秒：meeting=75000, captured=15000
+        s.pending.clear();
+        s.take_journal();
+
+        // 暫停前錄的那一段，在暫停結束後才落地（寫檔端偵測到時間跳空才切段）
+        s.apply_transcript_input(TranscriptInput::AudioSegment {
+            track: Track::Mic,
+            path: "/tmp/mic-000000000.wav".into(),
+            captured_span: (0, 10_000),
+            checksum: "a".into(),
+        });
+        // 恢復後錄的那一段：裝置時鐘 70000 到 75000
+        s.apply_transcript_input(TranscriptInput::AudioSegment {
+            track: Track::Mic,
+            path: "/tmp/mic-000070000.wav".into(),
+            captured_span: (70_000, 75_000),
+            checksum: "b".into(),
+        });
+
+        let segs: Vec<_> = s
+            .take_journal()
+            .into_iter()
+            .filter_map(|(e, _)| match e {
+                DomainEvent::AudioSegmentFinalized { segment } => Some(segment),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(segs.len(), 2);
+
+        // 第一段：錄在會議的 0 到 10 秒，那時還沒有暫停，兩條時間軸一致
+        assert_eq!(
+            (segs[0].meeting_start_ms, segs[0].meeting_end_ms),
+            (0, 10_000),
+            "暫停前錄的音訊被標到暫停之後了"
+        );
+        assert_eq!(
+            (segs[0].captured_start_ms, segs[0].captured_end_ms),
+            (0, 10_000)
+        );
+
+        // 第二段：會議時間 70 到 75 秒，但擷取音訊只到 10 到 15 秒（暫停不計）
+        assert_eq!(
+            (segs[1].meeting_start_ms, segs[1].meeting_end_ms),
+            (70_000, 75_000)
+        );
+        assert_eq!(
+            (segs[1].captured_start_ms, segs[1].captured_end_ms),
+            (10_000, 15_000),
+            "擷取時間軸沒有把暫停扣掉，音訊檔內定位會錯"
+        );
+    }
+
+    #[test]
     fn test_health_events_are_emitted_while_paused() {
         let mut s = recording();
         s.settle(100);
@@ -2841,6 +3254,49 @@ mod tests {
         }));
         s.stop();
         assert_eq!(s.state, MeetingState::Finalizing, "stop 不該直接跳到結束");
+    }
+
+    /// 每一句的結束時間要是它在音訊裡結束的位置，不是整批送達的時刻。
+    ///
+    /// 一批轉錄結果會在同一個瞬間全部抵達，end 用送達時刻的話，同一批的
+    /// 句子全部共用批次結尾：真機一場 295 秒的會議，105 段算出來平均長度
+    /// 38 秒（上限是 15 秒），四段共用同一個 26950。時間軸與引用定位都靠
+    /// 這個值。
+    #[test]
+    fn test_a_sentence_ends_where_its_audio_ends_not_when_the_batch_arrived() {
+        let mut s = recording();
+        // 批次在 30 秒處送達，裡面那句話的音訊只佔 1.0 到 4.0 秒
+        s.settle(30_000);
+        s.captured_audio_ms = 30_000;
+        s.pending.clear();
+        s.take_journal();
+
+        s.apply_transcript_input(TranscriptInput::Final {
+            segment_id: 1,
+            speaker_id: "s1".into(),
+            text: "那我們下週再談。".into(),
+            track: Track::System,
+            audio_span: Some((1_000, 4_000)),
+        });
+
+        let journal = s.take_journal();
+        let seg = journal
+            .iter()
+            .find_map(|(e, _)| match e {
+                DomainEvent::TranscriptSegmentFinalized { segment } => Some(segment),
+                _ => None,
+            })
+            .expect("沒有定稿事件");
+        assert_eq!(seg.captured_start_ms, 1_000);
+        assert_eq!(
+            seg.captured_end_ms, 4_000,
+            "結束時間用了批次送達的時刻，不是這句話的音訊位置"
+        );
+        assert_eq!(
+            seg.meeting_end_ms - seg.meeting_start_ms,
+            3_000,
+            "句子長度應該是音訊裡的 3 秒"
+        );
     }
 
     /// 會議結束之後仍然可以建立摘要。

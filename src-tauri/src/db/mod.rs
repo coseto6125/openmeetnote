@@ -15,7 +15,7 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
 
 /// 目前的 schema 版本。新增 migration 時同步 +1。
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// 等鎖的時限。生成與錄音在不同連線上競爭，瞬間撞上時預設行為是立刻回
 /// SQLITE_BUSY，而等一下就好的事不該變成錯誤。讀寫兩條連線用同一個值。
@@ -25,6 +25,7 @@ const BUSY_TIMEOUT_MS: i64 = 5_000;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/001_initial.sql")),
     (2, include_str!("migrations/002_id_sequences.sql")),
+    (3, include_str!("migrations/003_app_settings.sql")),
 ];
 
 #[derive(Debug, thiserror::Error)]

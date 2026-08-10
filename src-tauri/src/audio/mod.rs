@@ -10,6 +10,8 @@ use std::sync::mpsc::Receiver;
 
 use crate::model::Track;
 
+pub mod writer;
+
 #[cfg(target_os = "windows")]
 pub mod wasapi;
 
@@ -24,7 +26,10 @@ pub mod macos;
 pub struct Chunk {
     pub track: Track,
     pub captured_start_ms: u64,
-    pub samples: Vec<f32>,
+    /// 共享而不是各自持有：每個 chunk 會分給三個消費者（即時稿、定稿、
+    /// 寫檔），`Vec` 的話每多一個消費者就多一次 6.4 KB 的配置與複製，
+    /// 而那全發生在必須跟上兩個音訊裝置的分流執行緒上。三者都只讀。
+    pub samples: std::sync::Arc<[f32]>,
 }
 
 /// 轉錄引擎要的取樣率。在擷取層就轉好，避免事後再重取樣一次。
