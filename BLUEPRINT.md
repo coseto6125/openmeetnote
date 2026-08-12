@@ -192,6 +192,7 @@ whisper 必須帶時間戳執行。`-nt`（no timestamps）會抑制時間戳 to
 | SenseVoice int8 | 全面輸給同級的 Paraformer：更慢、命中更少 |
 | whisper medium-q5 | 與 turbo 同分但更慢、記憶體多三成 |
 | 雲端 STT（Azure 等） | 與本機優先定位衝突，且需付費 |
+| 把使用者詞表餵給 whisper 當 initial prompt | 好處只在提示裡全是這場真的講到的詞時存在，而那是事前不會知道的事。同一段音訊七個關鍵詞，命中數：不餵 3、餵這場的 7 個詞 5、15 詞 3、22 詞 3、37 詞 2 —— 多加八個沒講到的詞就把好處抵銷掉，還弄錯本來就對的「達悟族」「原民會」，所以也沒有一個安全的長度上限可設。「召委」「拼板舟」每一種長度都轉不對，校正表一行就解決。重跑方式見 `stt::whisper` 的 `initial_prompt_probe` |
 
 ### 5.4 `MeetingDocument`
 
