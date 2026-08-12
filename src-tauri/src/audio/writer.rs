@@ -65,8 +65,9 @@ impl TrackWriter {
 
     fn push(&mut self, chunk: &Chunk) -> Option<WrittenSegment> {
         let chunk_ms = chunk.samples.len() as u64 * 1_000 / SAMPLE_RATE as u64;
-        // 擷取時間往回跳或跳空，代表裝置重開過（§5.2 的 source_epoch）。
-        // 把手上的東西先收掉，不要把兩個不連續的時段黏進同一個檔案。
+        // 擷取時間往回跳或跳空，代表中間掉了音訊：裝置重開、暫停、寫入
+        // 佇列滿。把手上的東西先收掉，不要把兩個不連續的時段黏進同一個
+        // 檔案 —— 落地之後，這個洞就是相鄰兩段 captured 時間的差值。
         let discontinuous = self.started && chunk.captured_start_ms != self.end_ms;
         let flushed = if discontinuous { self.flush() } else { None };
 

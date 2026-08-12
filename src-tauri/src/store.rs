@@ -84,22 +84,22 @@ pub struct SpeakerSpan {
     pub char_end: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// 一個落地的音訊檔。
+///
+/// 沒有 `id`：主鍵由資料庫配發，事件裡放什麼都不具意義，冪等靠 `path`。
+/// 也沒有「裝置重開過」或「這段是壓縮掉的靜音」的旗標 —— 相鄰兩列已經把
+/// 它們說完了。captured 時間軸不含暫停，所以同一軌前一段的 `captured_end_ms`
+/// 等於下一段的 `captured_start_ms` 就代表音訊接得起來，差值不為零就代表
+/// 中間掉了音訊（裝置重開、寫入佇列滿）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioSegment {
-    /// 由資料庫配發。事件裡的值不具意義，投影不會使用它（冪等靠 `path`）。
-    pub id: i64,
     pub track: Track,
-    /// 裝置重新開啟就換一個 epoch。跨 epoch 的樣本計數不可直接相加。
-    pub source_epoch: u32,
     pub path: String,
     pub captured_start_ms: u64,
     pub captured_end_ms: u64,
     pub meeting_start_ms: u64,
     pub meeting_end_ms: u64,
-    /// 壓縮靜音自成的段：captured 長度為零、meeting 長度不為零（§5.2.3）。
-    #[serde(default)]
-    pub is_silence_fill: bool,
     pub checksum: String,
 }
 
@@ -1938,21 +1938,18 @@ fn project(
             // 需要的那把鍵（schema 上它本來就是 UNIQUE）。
             tx.execute(
                 "INSERT INTO audio_segments
-                     (meeting_id, track, source_epoch, path, captured_start_ms,
-                      captured_end_ms, meeting_start_ms, meeting_end_ms, is_silence_fill,
-                      checksum, created_event_seq)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                     (meeting_id, track, path, captured_start_ms, captured_end_ms,
+                      meeting_start_ms, meeting_end_ms, checksum, created_event_seq)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
                  ON CONFLICT (path) DO NOTHING",
                 params![
                     meeting,
                     segment.track.as_str(),
-                    segment.source_epoch as i64,
                     segment.path,
                     segment.captured_start_ms as i64,
                     segment.captured_end_ms as i64,
                     segment.meeting_start_ms as i64,
                     segment.meeting_end_ms as i64,
-                    segment.is_silence_fill as i64,
                     segment.checksum,
                     seq as i64
                 ],
@@ -3231,15 +3228,12 @@ mod tests {
         let m = s.create_meeting("原音").unwrap();
         let seg = |path: &str, start: u64| DomainEvent::AudioSegmentFinalized {
             segment: AudioSegment {
-                id: 0,
                 track: Track::Mic,
-                source_epoch: 0,
                 path: path.into(),
                 captured_start_ms: start,
                 captured_end_ms: start + 60_000,
                 meeting_start_ms: start,
                 meeting_end_ms: start + 60_000,
-                is_silence_fill: false,
                 checksum: format!("sum-{start}"),
             },
         };
@@ -3279,22 +3273,49 @@ mod tests {
         assert!(kinds.iter().any(|k| k == "AudioSegmentsForgotten"));
     }
 
+    /// 拿掉欄位之後，早就寫下的事件仍然要讀得動。
+    ///
+    /// `id`、`sourceEpoch`、`isSilenceFill` 從 `AudioSegment` 上消失了，但
+    /// 使用者資料庫裡的 `AudioSegmentFinalized` 還帶著它們，而
+    /// `rebuild_projections` 會把每一筆重新反序列化一次。多出來的欄位若讓
+    /// serde 報錯，那場會議就再也開不起來，而且錯誤訊息指向 payload 而不是
+    /// 這次的改動。
+    #[test]
+    fn an_audio_event_written_before_the_columns_were_dropped_still_replays() {
+        let now = DomainEvent::AudioSegmentFinalized {
+            segment: AudioSegment {
+                track: Track::Mic,
+                path: "/tmp/a.wav".into(),
+                captured_start_ms: 0,
+                captured_end_ms: 60_000,
+                meeting_start_ms: 0,
+                meeting_end_ms: 60_000,
+                checksum: "sha".into(),
+            },
+        };
+        // 把三個欄位補回去，做出使用者資料庫裡那些事件的形狀
+        let mut v = serde_json::to_value(&now).unwrap();
+        let seg = v["segment"].as_object_mut().unwrap();
+        seg.insert("id".into(), 7.into());
+        seg.insert("sourceEpoch".into(), 0.into());
+        seg.insert("isSilenceFill".into(), false.into());
+
+        let back: DomainEvent = serde_json::from_str(&v.to_string()).expect("舊 payload 讀不動");
+        assert_eq!(back, now);
+    }
+
     #[test]
     fn every_audio_segment_reaches_the_index_not_just_the_first() {
         let mut s = Store::new(db::open_in_memory().unwrap());
         let m = s.create_meeting("原音").unwrap();
         let seg = |path: &str, start: u64| DomainEvent::AudioSegmentFinalized {
             segment: AudioSegment {
-                // 事件裡的 id 一律是這個值，正是當初出事的形狀
-                id: 0,
                 track: Track::Mic,
-                source_epoch: 0,
                 path: path.into(),
                 captured_start_ms: start,
                 captured_end_ms: start + 60_000,
                 meeting_start_ms: start,
                 meeting_end_ms: start + 60_000,
-                is_silence_fill: false,
                 checksum: format!("sum-{start}"),
             },
         };
@@ -3436,15 +3457,12 @@ mod tests {
                 (
                     DomainEvent::AudioSegmentFinalized {
                         segment: AudioSegment {
-                            id: 1,
                             track: Track::Mic,
-                            source_epoch: 0,
                             path: "/tmp/a.wav".into(),
                             captured_start_ms: 0,
                             captured_end_ms: 900,
                             meeting_start_ms: 0,
                             meeting_end_ms: 900,
-                            is_silence_fill: false,
                             checksum: "sha".into(),
                         },
                     },

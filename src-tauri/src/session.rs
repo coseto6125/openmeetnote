@@ -947,16 +947,12 @@ impl Session {
                 let (start, end) = captured_span;
                 let domain = DomainEvent::AudioSegmentFinalized {
                     segment: crate::store::AudioSegment {
-                        // id 由資料庫配發，冪等靠 path，事件裡放 0 只是佔位
-                        id: 0,
                         track,
-                        source_epoch: 0,
                         path,
                         captured_start_ms: self.captured_at_device(start),
                         captured_end_ms: self.captured_at_device(end),
                         meeting_start_ms: self.meeting_at_device(start),
                         meeting_end_ms: self.meeting_at_device(end),
-                        is_silence_fill: false,
                         checksum,
                     },
                 };
@@ -3143,6 +3139,54 @@ mod tests {
             (segs[1].captured_start_ms, segs[1].captured_end_ms),
             (10_000, 15_000),
             "擷取時間軸沒有把暫停扣掉，音訊檔內定位會錯"
+        );
+        assert_eq!(
+            segs[1].captured_start_ms - segs[0].captured_end_ms,
+            0,
+            "暫停在擷取時間軸上留下了洞，會被當成掉音訊"
+        );
+    }
+
+    /// 掉音訊跟暫停必須長得不一樣。
+    ///
+    /// `audio_segments` 沒有「裝置重開過」的欄位，相鄰兩段的擷取時間差就是
+    /// 唯一的判準：上面那個測試守住「暫停收斂成零」，這個守住「掉音訊留下
+    /// 一個洞」。兩者都塌成零的話，重放時會把中間少掉的那幾秒黏起來，之後
+    /// 每一句話的落點都偏掉。
+    #[test]
+    fn test_lost_audio_leaves_a_gap_that_a_pause_does_not() {
+        let mut s = recording();
+        s.settle(20_000);
+        s.pending.clear();
+        s.take_journal();
+
+        // 沒有暫停，但裝置時鐘從 10 秒跳到 15 秒：裝置重開，或寫入佇列滿到
+        // 丟批。中間那 5 秒沒有落地成檔案。
+        for (path, span) in [
+            ("/tmp/mic-000000000.wav", (0, 10_000)),
+            ("/tmp/mic-000015000.wav", (15_000, 20_000)),
+        ] {
+            s.apply_transcript_input(TranscriptInput::AudioSegment {
+                track: Track::Mic,
+                path: path.into(),
+                captured_span: span,
+                checksum: path.into(),
+            });
+        }
+
+        let segs: Vec<_> = s
+            .take_journal()
+            .into_iter()
+            .filter_map(|(e, _)| match e {
+                DomainEvent::AudioSegmentFinalized { segment } => Some(segment),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(
+            segs[1].captured_start_ms - segs[0].captured_end_ms,
+            5_000,
+            "掉掉的音訊被抹平了，兩段看起來接得起來"
         );
     }
 
