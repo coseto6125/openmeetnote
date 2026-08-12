@@ -15,7 +15,7 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
 
 /// 目前的 schema 版本。新增 migration 時同步 +1。
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// 等鎖的時限。生成與錄音在不同連線上競爭，瞬間撞上時預設行為是立刻回
 /// SQLITE_BUSY，而等一下就好的事不該變成錯誤。讀寫兩條連線用同一個值。
@@ -26,6 +26,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/001_initial.sql")),
     (2, include_str!("migrations/002_id_sequences.sql")),
     (3, include_str!("migrations/003_app_settings.sql")),
+    (
+        4,
+        include_str!("migrations/004_drop_unused_audio_columns.sql"),
+    ),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -217,25 +221,44 @@ mod tests {
     }
 
     #[test]
-    fn silence_fill_segment_must_have_zero_captured_length() {
-        let conn = open_in_memory().unwrap();
+    fn dropping_the_placeholder_audio_columns_keeps_every_row() {
+        // 004 重建整張表，而重建是資料會不見的那種 migration：先用 001 到 003
+        // 建出舊 schema、放一列進去，再讓 004 跑過去。
+        let conn = Connection::open_in_memory().unwrap();
+        prepare(&conn).unwrap();
         conn.execute_batch(
-            "INSERT INTO meetings (id, title, state, created_at) VALUES (1,'m','idle','now')",
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
         )
         .unwrap();
-        let insert = |is_fill: i64, cap_end: i64| {
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v < 4) {
+            conn.execute_batch(sql).unwrap();
             conn.execute(
-                "INSERT INTO audio_segments (meeting_id, track, source_epoch, path,
-                     captured_start_ms, captured_end_ms, meeting_start_ms, meeting_end_ms,
-                     is_silence_fill, checksum, created_event_seq)
-                 VALUES (1,'mic',0,?1, 100, ?2, 100, 900, ?3, 'sha', 1)",
-                rusqlite::params![format!("p{is_fill}{cap_end}"), cap_end, is_fill],
+                "INSERT INTO schema_migrations VALUES (?1, 'x')",
+                rusqlite::params![v],
             )
-        };
-        // captured 長度為零、meeting 長度不為零：合法的壓縮靜音段
-        assert!(insert(1, 100).is_ok());
-        // 標成靜音卻有 captured 長度：矛盾，必須擋下
-        assert!(insert(1, 500).is_err());
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO meetings (id, title, state, created_at) VALUES (1,'m','idle','now');
+             INSERT INTO audio_segments (meeting_id, track, source_epoch, path,
+                 captured_start_ms, captured_end_ms, meeting_start_ms, meeting_end_ms,
+                 is_silence_fill, checksum, created_event_seq)
+             VALUES (1,'mic',0,'a.wav',0,60000,0,60000,0,'sha',3)",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert!(!has_column(&conn, "audio_segments", "source_epoch").unwrap());
+        assert!(!has_column(&conn, "audio_segments", "is_silence_fill").unwrap());
+        let row: (String, i64) = conn
+            .query_row(
+                "SELECT path, captured_end_ms FROM audio_segments",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("a.wav".to_owned(), 60_000));
     }
 
     #[test]

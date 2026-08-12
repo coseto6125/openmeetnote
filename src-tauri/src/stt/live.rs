@@ -109,6 +109,18 @@ pub fn log(msg: &str) {
     eprint!("{line}");
 }
 
+/// 記一批被丟掉的音訊，並在累計數是二的冪時說一次。
+///
+/// 每次都記的話，一旦佇列開始滿就是每 100 ms 一行；只記第一次又看不出
+/// 塞了多久。二的冪讓行數隨時間成對數成長，而且每一行都比前一行多一倍，
+/// 「偶爾一批」與「持續塞住」在 log 上長得不一樣。
+fn note_drop(dropped: &AtomicU64, queue: &str) {
+    let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        log(&format!("{queue}佇列已滿，累計丟棄 {n} 批音訊"));
+    }
+}
+
 /// 每軌已經定稿幾段，由定稿執行緒推進、即時稿執行緒讀取。
 #[derive(Default, Clone)]
 struct Progress {
@@ -341,12 +353,9 @@ impl LocalSttSource {
                     if let Some(w) = &write_tx {
                         match w.try_send(chunk.clone()) {
                             Ok(()) => {}
-                            Err(TrySendError::Full(_)) => {
-                                let n = write_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                                if n.is_power_of_two() {
-                                    log(&format!("音訊寫入佇列已滿，累計丟棄 {n} 批原音"));
-                                }
-                            }
+                            Err(TrySendError::Full(_)) => note_drop(&write_dropped, "音訊寫入"),
+                            // 寫檔那一條收掉了原音就沒得留，但逐字稿還在跑，
+                            // 不能因此停止分流
                             Err(TrySendError::Disconnected(_)) => {}
                         }
                     }
@@ -355,12 +364,8 @@ impl LocalSttSource {
                     let _ = fast_tx.try_send(chunk.clone());
                     match slow_tx.try_send(chunk) {
                         Ok(()) => {}
-                        Err(TrySendError::Full(_)) => {
-                            let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n.is_power_of_two() {
-                                log(&format!("定稿佇列已滿，累計丟棄 {n} 批音訊"));
-                            }
-                        }
+                        Err(TrySendError::Full(_)) => note_drop(&dropped, "定稿"),
+                        // 定稿執行緒沒了就沒有逐字稿，繼續分流沒有意義
                         Err(TrySendError::Disconnected(_)) => break,
                     }
                 }
