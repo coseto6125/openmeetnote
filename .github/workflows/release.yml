@@ -71,6 +71,19 @@ jobs:
       # 冷建置每個平台多十幾分鐘，換的是「發出去的東西完全來自這個 commit」。
       - run: pnpm install --frozen-lockfile
 
+      # DLL 要先在位，bundle 的 glob 才抓得到。放置 DLL 的是 sherpa-rs-sys 的
+      # build script，求值 glob 的是 openmeetnote 自己的 build script，而 cargo
+      # 只保證 build script 排在 build-dependencies 之後,不排在一般 dependencies
+      # 之後 —— 兩者因此是競態的。v0.1.1 賭贏了,v0.2.1 賭輸,症狀是建置在
+      # 「glob pattern target/*/release/*.dll ... didn't match any files」停下,
+      # 而 sherpa-rs-sys 是九十秒前才開始編譯的。
+      #
+      # 先跑一次不帶 bundle 設定的建置就沒有這個順序問題:那一次沒有 glob 要
+      # 求值,跑完 DLL 就在 target/<triple>/release/ 底下。第二次是增量的。
+      - name: Put the DLLs in place before the bundle glob runs
+        if: runner.os == 'Windows'
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path src-tauri/Cargo.toml
+
       - name: Build bundle
         run: pnpm exec tauri build --target ${{ matrix.target }} ${{ matrix.bundle_config }}
 
