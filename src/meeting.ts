@@ -356,8 +356,16 @@ export function applyBatch(m: MeetingModel, batch: SessionEventBatch): MeetingMo
 }
 
 /** 用完整投影取代目前狀態，清掉 desynced 旗標。 */
+/**
+ * 聲紋分不出是誰時，遠端發言掛的識別碼（後端 `live.rs` 的 `UNKNOWN_REMOTE`）。
+ *
+ * 它不是一個人，是「遠端，但不確定是誰」，所以不參與「語者 N」的編號。
+ */
+export const UNKNOWN_REMOTE = 'remote';
+
 /** `speakerDisplayName` 需要的欄位。錄音分頁與歷史分頁的語者形狀不同，取交集。 */
 export interface NamedSpeaker {
+  id: string;
   ordinal: number;
   track: 'mic' | 'system';
   proposedName: string | null;
@@ -375,11 +383,17 @@ export interface NamedSpeaker {
  * 內部 id（`s2`），而同一句話在錄音分頁顯示「沈立群」。
  */
 export function speakerDisplayName(s: NamedSpeaker, all: NamedSpeaker[]): string {
+  // 排在確認名之前，不是之後。這個識別碼底下可能有好幾個人，讓其中一個名字
+  // 蓋住全部就是把他們併成一位；後端已經擋掉命名，這裡擋的是既有資料裡
+  // 已經被命名過的那些。
+  if (s.id === UNKNOWN_REMOTE) return '遠端';
   if (s.confirmedName) return s.confirmedName;
   if (s.proposedName) return s.proposedName;
   // 軌道先驗只到「本機 vs 遠端」，不能再往「遠端只有一人」推（§8.1）
   if (s.track === 'mic') return '我';
-  const nth = all.filter((x) => x.track === 'system' && x.ordinal <= s.ordinal).length;
+  const nth = all.filter(
+    (x) => x.track === 'system' && x.id !== UNKNOWN_REMOTE && x.ordinal <= s.ordinal,
+  ).length;
   return `語者 ${nth}`;
 }
 

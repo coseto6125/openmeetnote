@@ -628,7 +628,17 @@ pub struct RenderContext<'a> {
 ///
 /// 「語者 N」只數遠端語者：麥克風軌會佔掉一個 ordinal，跟著數的話遠端第一位
 /// 就變成「語者 2」。
-fn speaker_names(
+///
+/// [`UNKNOWN_REMOTE`] 顯示成「遠端」，而且不佔編號 —— 它不是一個人（§8.1）。
+/// 這一條排在確認名之前：那個識別碼底下可能有好幾位不同的人，讓其中一個名字
+/// 蓋住全部，等於把他們併成一位。
+///
+/// 摘要的 `EvidenceIndex` 也呼叫這裡（`agent::build_index`）。三個渲染器各自
+/// 實作過一次，結果同一位語者在畫面上是「遠端」、匯出檔裡是「語者 1」、送進
+/// 模型的 prompt 裡是 `remote`。
+///
+/// [`UNKNOWN_REMOTE`]: crate::model::UNKNOWN_REMOTE
+pub(crate) fn speaker_names(
     speakers: &[crate::store::StoredSpeaker],
     transcript: &[crate::store::StoredSegment],
 ) -> std::collections::HashMap<String, String> {
@@ -647,6 +657,9 @@ fn speaker_names(
                 .get(s.speaker_id.as_str())
                 .copied()
                 .unwrap_or(Track::System);
+            if s.speaker_id == crate::model::UNKNOWN_REMOTE {
+                return (s.speaker_id.clone(), "遠端".to_owned());
+            }
             if track == Track::System {
                 remote += 1;
             }
@@ -1240,6 +1253,70 @@ mod tests {
             html.contains("語者 2"),
             "遠端語者的編號跟著麥克風軌一起數了"
         );
+    }
+
+    /// `remote` 與 `s1` 同時在場時，三個渲染器要說出同一組名字。
+    fn remote_and_one_named_speaker() -> std::collections::HashMap<String, String> {
+        use crate::model::{Track, UNKNOWN_REMOTE};
+        let seg = |id: &str, track| crate::store::StoredSegment {
+            segment_id: 1,
+            revision: 1,
+            origin: crate::model::Origin::Provider,
+            speaker_id: Some(id.into()),
+            text: "說了一句話".into(),
+            track,
+            meeting_start_ms: 0,
+            meeting_end_ms: 1000,
+            user_edited: false,
+        };
+        let speaker = |id: &str, ordinal| crate::store::StoredSpeaker {
+            speaker_id: id.into(),
+            ordinal,
+            proposed_name: None,
+            confirmed_name: None,
+            status: "proposed".into(),
+        };
+        speaker_names(
+            &[speaker(UNKNOWN_REMOTE, 1), speaker("s1", 2)],
+            &[seg(UNKNOWN_REMOTE, Track::System), seg("s1", Track::System)],
+        )
+    }
+
+    #[test]
+    fn test_the_unidentified_remote_speaker_is_not_numbered_in_the_export() {
+        // 畫面上是「遠端」「語者 1」。匯出自己數編號的話會變成「語者 1」
+        // 「語者 2」，同一場會議於是在兩個地方看起來像有不同的人。
+        let names = remote_and_one_named_speaker();
+        assert_eq!(names[crate::model::UNKNOWN_REMOTE], "遠端");
+        assert_eq!(names["s1"], "語者 1", "「遠端」佔掉了一個編號");
+    }
+
+    #[test]
+    fn test_a_name_stored_on_the_remote_sentinel_does_not_take_effect() {
+        // 舊資料裡可能已經有人替「遠端」命過名。那個識別碼底下是好幾個
+        // 不同的人，讓那個名字生效等於把他們全部併成一位。
+        use crate::model::{Track, UNKNOWN_REMOTE};
+        let names = speaker_names(
+            &[crate::store::StoredSpeaker {
+                speaker_id: UNKNOWN_REMOTE.into(),
+                ordinal: 1,
+                proposed_name: None,
+                confirmed_name: Some("Alice".into()),
+                status: "confirmed".into(),
+            }],
+            &[crate::store::StoredSegment {
+                segment_id: 1,
+                revision: 1,
+                origin: crate::model::Origin::Provider,
+                speaker_id: Some(UNKNOWN_REMOTE.into()),
+                text: "說了一句話".into(),
+                track: Track::System,
+                meeting_start_ms: 0,
+                meeting_end_ms: 1000,
+                user_edited: false,
+            }],
+        );
+        assert_eq!(names[UNKNOWN_REMOTE], "遠端");
     }
 
     #[test]

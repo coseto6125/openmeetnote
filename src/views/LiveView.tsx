@@ -13,7 +13,7 @@ import {
   snapshotDocument,
   type DocumentBlock,
 } from '../session';
-import { speakerDisplayName } from '../meeting';
+import { speakerDisplayName, UNKNOWN_REMOTE } from '../meeting';
 import type { Degrade, MeetingModel, Snapshot, Speaker } from '../meeting';
 import { Spine, type SpinePause } from '../components/Spine';
 import { DocumentView, type CitedSegment } from '../components/DocumentView';
@@ -96,6 +96,8 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
   const baseVersion = [...model.snapshots].reverse().find((s) => s.state === 'completed');
   const degrade = localDegrade ?? model.degrade;
   const live = model.state === 'recording' || model.state === 'paused';
+  // 誰是誰通常散會後才確定得下來，所以命名的窗口比錄音本身長
+  const canName = model.state !== 'idle' && model.state !== 'stopping';
   /// 結束之後仍可建立摘要：最常見的流程就是開完會才要，那時內容才完整。
   const canSnapshot = live || model.state === 'completed';
 
@@ -511,7 +513,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                     ) : (
                       <button
                         className="mini"
-                        disabled={!live}
+                        disabled={!canName || s.id === UNKNOWN_REMOTE}
                         onClick={() => {
                           setNameDraft(s.confirmedName ?? '');
                           setNaming(s.id);

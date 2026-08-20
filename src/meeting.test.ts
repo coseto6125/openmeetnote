@@ -4,6 +4,7 @@ import {
   emptyMeeting,
   fromProjection,
   speakerDisplayName,
+  UNKNOWN_REMOTE,
   type MeetingModel,
 } from './meeting';
 import type { SessionEvent, SessionEventBatch, SessionProjection } from './session';
@@ -456,7 +457,14 @@ describe('原音保存', () => {
 });
 
 describe('speaker display name', () => {
-  const s = (ordinal: number, track: 'mic' | 'system', proposed = null, confirmed = null) => ({
+  const s = (
+    ordinal: number,
+    track: 'mic' | 'system',
+    proposed = null,
+    confirmed = null,
+    id = `s${ordinal}`,
+  ) => ({
+    id,
     ordinal,
     track,
     proposedName: proposed as string | null,
@@ -485,8 +493,23 @@ describe('speaker display name', () => {
     expect(all.map((x) => speakerDisplayName(x, all))).toEqual(['我', '語者 1', '語者 2']);
   });
 
+  // 聲紋分不出是誰的那些話掛在 UNKNOWN_REMOTE 底下。叫它「語者 1」的話它會
+  // 看起來像一個人，然後被命名成某人 —— 話就被安到那個人頭上了。
+  test('the_unidentified_remote_speaker_is_not_numbered', () => {
+    const all = [s(1, 'mic'), s(2, 'system', null, null, UNKNOWN_REMOTE), s(3, 'system')];
+    expect(all.map((x) => speakerDisplayName(x, all))).toEqual(['我', '遠端', '語者 1']);
+  });
+
   // 歷史分頁曾經直接印內部 id，同一句話在錄音分頁是「沈立群」、在歷史分頁是
   // 「s2」。兩邊現在共用這個函式，這條測試守的是那個規則本身。
+  // 後端已經拒絕命名這個識別碼，這條守的是既有資料：舊版本存進去的名字
+  // 不能在畫面上生效。那底下是好幾位分不出來的人，讓其中一個名字蓋住全部
+  // 就是把他們併成一位。
+  test('a_name_stored_on_the_unidentified_remote_speaker_does_not_take_effect', () => {
+    const all = [s(1, 'system', null, 'Alice' as never, UNKNOWN_REMOTE), s(2, 'system')];
+    expect(all.map((x) => speakerDisplayName(x, all))).toEqual(['遠端', '語者 1']);
+  });
+
   test('numbering_is_stable_when_a_remote_speaker_gets_a_name', () => {
     const all = [s(1, 'mic'), s(2, 'system', null, '沈立群' as never), s(3, 'system')];
     expect(all.map((x) => speakerDisplayName(x, all))).toEqual(['我', '沈立群', '語者 2']);

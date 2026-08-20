@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -372,19 +372,25 @@ impl LocalSttSource {
             })
         };
 
+        // 標點在這裡載一次，兩條執行緒共用同一個實例（見 [`SharedPunct`]）。
+        // 各自載一份會多吃三百多 MB，而它們的呼叫都短到搶不到鎖。
+        let punct = load_punct(models.punct.as_deref());
         let fast = {
-            let (dir, vad, tx, progress, ready) = (
+            let (dir, vad, tx, punct, progress, ready) = (
                 models.paraformer_dir.clone(),
                 models.vad.clone(),
                 result_tx.clone(),
+                punct.clone(),
                 progress.clone(),
                 ready_tx.clone(),
             );
-            std::thread::spawn(move || partial_loop(fast_rx, tx, &dir, &vad, progress, &ready))
+            std::thread::spawn(move || {
+                partial_loop(fast_rx, tx, &dir, &vad, punct, progress, &ready)
+            })
         };
         let slow = {
             let (models, tx) = (models.clone(), result_tx);
-            std::thread::spawn(move || final_loop(slow_rx, tx, &models, progress, &ready_tx))
+            std::thread::spawn(move || final_loop(slow_rx, tx, &models, punct, progress, &ready_tx))
         };
 
         // 落地的音訊段走逐字稿同一條 channel 回 session。音訊執行緒不碰
@@ -507,8 +513,7 @@ fn speaker_of(track: Track) -> &'static str {
     match track {
         // 麥克風軌一定是使用者本人，這是不需要模型就能知道的事
         Track::Mic => "me",
-        // 遠端先當成單一語者，diarization 是 M3 的工作
-        Track::System => "s1",
+        Track::System => crate::model::UNKNOWN_REMOTE,
     }
 }
 
@@ -527,6 +532,102 @@ struct TrackBuffer {
     silent_batches: u32,
 }
 
+/// 定稿與即時稿共用的標點模型。
+///
+/// 兩邊都要標點，而這個模型載進來要三百多 MB。各載一份就多吃這麼多，所以
+/// 共用同一個實例：一次呼叫約 7 ms，而定稿每十幾秒才來一次、即時稿每
+/// [`PARTIAL_EVERY_MS`] 一次，兩者搶同一把鎖的機會可以忽略。
+#[derive(Clone)]
+pub struct SharedPunct(Arc<PunctState>);
+
+struct PunctState {
+    model: Mutex<Punctuation>,
+    /// 兩種降級各自只記一次。即時稿每 [`PARTIAL_EVERY_MS`] 呼叫一次，
+    /// 每次都記的話同一行會把日誌洗掉。
+    warned_nul: AtomicBool,
+    warned_poison: AtomicBool,
+}
+
+impl SharedPunct {
+    /// 標點失敗時回原文。
+    ///
+    /// 沒有標點的逐字稿還是逐字稿，所以這裡的每一條失敗路徑都讓錄音繼續，
+    /// 但都要留下訊號：靜默降級的話，使用者拿到一整場沒有標點的稿子，而
+    /// 沒有任何地方說得出為什麼。
+    pub fn apply(&self, text: &str) -> String {
+        // NUL 要在進鎖之前擋掉。sherpa 的 FFI 邊界用 `CString::new(…).expect(…)`
+        // 轉字串（vendor/sherpa-rs/src/utils.rs），內嵌的 NUL 會在持鎖期間 panic：
+        // 那條 worker 當場死掉，另一條之後每次都拿到中毒的鎖，整場就這樣沒了
+        // 標點。擋在鎖外面，壞的只有這一句。
+        if text.contains('\0') {
+            self.warn(&self.0.warned_nul, "這一句含 NUL，跳過標點");
+            return text.to_owned();
+        }
+        match self.0.model.lock() {
+            Ok(mut p) => p.add_punctuation(text),
+            Err(_) => {
+                self.warn(
+                    &self.0.warned_poison,
+                    "標點模型的鎖已中毒，這場之後的逐字稿不會有標點",
+                );
+                text.to_owned()
+            }
+        }
+    }
+
+    /// 同一種降級只講一次。
+    fn warn(&self, flag: &AtomicBool, what: &str) {
+        if !flag.swap(true, Ordering::Relaxed) {
+            log(what);
+        }
+    }
+}
+
+/// 載入標點模型。載不起來就回 `None`，逐字稿照樣產生，只是讀起來像一長串。
+///
+/// whisper 自己會加一些標點，但它只看得到單一個切片，句子被切斷的地方就
+/// 加不出來；Paraformer 則完全不出標點。
+pub fn load_punct(model: Option<&str>) -> Option<SharedPunct> {
+    let model = model?;
+    match Punctuation::new(PunctuationConfig {
+        model: model.to_owned(),
+        num_threads: Some(1),
+        provider: None,
+        debug: false,
+    }) {
+        Ok(p) => {
+            log(&format!("標點模型已載入：{model}"));
+            Some(SharedPunct(Arc::new(PunctState {
+                model: Mutex::new(p),
+                warned_nul: AtomicBool::new(false),
+                warned_poison: AtomicBool::new(false),
+            })))
+        }
+        Err(e) => {
+            log(&format!("標點模型載入失敗，逐字稿將沒有標點：{e}"));
+            None
+        }
+    }
+}
+
+/// 即時稿送出前的文字整形：先標點再轉繁。
+///
+/// 順序跟定稿那邊一致（見 `emit_final`）：標點模型吃的是簡體語料，繁體輸入
+/// 它認得的詞會變少，所以標點要排在轉繁之前。
+///
+/// 詞表不套用，而這不是為了省時間。詞表收的是使用者在**完成的**逐字稿裡看到
+/// 的錯字，那份稿是 whisper 出的，所以規則天生對著 whisper 的錯法；Paraformer
+/// 錯在別的地方（whisper 寫「達物族」時它寫「達塢族」）。實測一場真實會議
+/// 13 條規則命中 0 次，另一段錄音命中 3 次 —— 而那 3 個字在下一次定稿覆蓋
+/// 上來時本來就會修好。
+fn shape_partial(text: &str, punct: Option<&SharedPunct>) -> String {
+    let punctuated = match punct {
+        Some(p) => p.apply(text),
+        None => text.to_owned(),
+    };
+    super::diff::to_traditional(&punctuated, &Default::default())
+}
+
 /// 即時稿迴圈：每 [`PARTIAL_EVERY_MS`] 對目前累積的音訊重跑一次。
 ///
 /// 重跑整段而不是接續解碼，是因為 Paraformer 是離線模型：它每次都要看完整段。
@@ -536,6 +637,7 @@ fn partial_loop(
     tx: Sender<TranscriptInput>,
     model_dir: &str,
     vad_model: &str,
+    punct: Option<SharedPunct>,
     progress: Progress,
     ready: &Sender<std::result::Result<(), String>>,
 ) {
@@ -657,7 +759,7 @@ fn partial_loop(
                 .send(TranscriptInput::Partial {
                     segment_id: id,
                     speaker_id: speaker_of(track).into(),
-                    text: super::diff::to_traditional(&text, &Default::default()),
+                    text: shape_partial(&text, punct.as_ref()),
                     track,
                 })
                 .is_err()
@@ -679,11 +781,11 @@ fn final_loop(
     rx: Receiver<Chunk>,
     tx: Sender<TranscriptInput>,
     models: &ModelPaths,
+    punct: Option<SharedPunct>,
     progress: Progress,
     ready: &Sender<std::result::Result<(), String>>,
 ) {
     let (model, vad_model) = (models.whisper.as_str(), models.vad.as_str());
-    let punct_model = models.punct.as_deref();
     let speaker_model = models
         .speaker
         .as_ref()
@@ -701,26 +803,6 @@ fn final_loop(
             return;
         }
     };
-
-    // 標點是可選的：沒有它逐字稿照樣產生，只是讀起來像一長串。
-    // whisper 自己會加一些，但它只看得到單一個切片，句子被切斷的地方就加不出來。
-    let mut punct = punct_model.and_then(|m| {
-        match Punctuation::new(PunctuationConfig {
-            model: m.to_owned(),
-            num_threads: Some(1),
-            provider: None,
-            debug: false,
-        }) {
-            Ok(p) => {
-                log(&format!("標點模型已載入：{m}"));
-                Some(p)
-            }
-            Err(e) => {
-                log(&format!("標點模型載入失敗，逐字稿將沒有標點：{e}"));
-                None
-            }
-        }
-    });
 
     // 詞表跟模型走同一組搜尋路徑，使用者自己維護。找不到就只有內建的簡繁詞彙。
     let vocab = {
@@ -922,7 +1004,7 @@ fn final_loop(
                     track,
                     finalized: n,
                     batch_start_ms,
-                    punct: punct.as_mut(),
+                    punct: punct.as_ref(),
                     spans: &spans,
                     vocab: &vocab,
                 };
@@ -978,7 +1060,7 @@ fn final_loop(
             track: *track,
             finalized: n,
             batch_start_ms: buf.start_ms,
-            punct: punct.as_mut(),
+            punct: punct.as_ref(),
             spans: &spans,
             vocab: &vocab,
         };
@@ -1232,7 +1314,7 @@ struct FinalContext<'a> {
     finalized: u64,
     /// 這批音訊在該軌擷取音訊中的起點
     batch_start_ms: u64,
-    punct: Option<&'a mut Punctuation>,
+    punct: Option<&'a SharedPunct>,
     spans: &'a [SpeakerSpan],
     vocab: &'a Corrections,
 }
@@ -1264,8 +1346,8 @@ fn emit_final(
             continue;
         }
         // 標點在轉繁之前套用：標點模型吃的是簡體語料，繁體輸入它認得的詞會變少
-        let punctuated = match punct.as_deref_mut() {
-            Some(p) => p.add_punctuation(text),
+        let punctuated = match punct {
+            Some(p) => p.apply(text),
             None => text.to_owned(),
         };
         // 每一句都帶自己的音訊區間。少了它，同一批的每一句會拿到相同的
@@ -1292,6 +1374,13 @@ fn emit_final(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_the_partial_still_converts_to_traditional_without_the_punctuation_model() {
+        // 標點模型是可選的，而它缺席時走的是另一條分支。那條分支要是漏掉
+        // 轉繁，簡體就會直接上畫面，而且只在沒帶標點模型的組建上才看得到。
+        assert_eq!(shape_partial("这个报价单", None), "這個報價單");
+    }
 
     #[test]
     fn test_two_tracks_never_share_a_segment_id() {

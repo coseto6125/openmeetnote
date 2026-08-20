@@ -18,7 +18,14 @@ use openmeetnote_lib::stt::{
     whisper::Whisper,
 };
 
-const THREADS: i32 = 4;
+/// 兩個引擎各用幾個執行緒。定稿的吞吐直接決定會議結束後要等多久，
+/// 所以這裡要能改：`OMN_THREADS=8 cargo run --release --example compare -- x.wav`
+fn threads() -> i32 {
+    std::env::var("OMN_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+}
 
 fn env_or(key: &str, fallback: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| fallback.to_owned())
@@ -42,12 +49,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("音訊 {audio_s:.1}s（{wav}）\n");
 
     let t = Instant::now();
-    let mut fast = Paraformer::load(&paraformer_dir, THREADS)?;
+    let mut fast = Paraformer::load(&paraformer_dir, threads())?;
     let tokens = fast.tokens(&samples);
     let fast_s = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
-    let slow = Whisper::load(&whisper_model, THREADS)?.transcribe(&samples)?;
+    let slow = Whisper::load(&whisper_model, threads())?.transcribe(&samples)?;
     let slow_s = t.elapsed().as_secs_f64();
 
     // 使用者詞表之後從設定讀。現在放這裡是為了讓輸出示範校正表的效果，

@@ -205,6 +205,7 @@ export function SettingsView() {
             <b>{status.tone === 'ok' ? '已更新' : '沒有存成功'}</b>
             <p>{status.text}</p>
           </span>
+          <span className="spacer" />
           <button className="btn-ghost close" onClick={() => setStatus(null)} aria-label="關閉">
             ×
           </button>
@@ -228,9 +229,14 @@ export function SettingsView() {
             <div className="panel-head">
               <span className="card-title">{KIND_LABEL[p.kind]}</span>
               <span className="spacer" />
-              <span className="secret-pill" data-s={p.secret}>
-                {SECRET_LABEL[p.secret]}
-              </span>
+              {/* 不需要金鑰的後端不顯示金鑰狀態。Claude Code 這類 Agent CLI 用的是
+                  使用者在該 CLI 上已完成的登入，永遠是「尚未設定」—— 那句話會讓人
+                  以為東西沒存好，實際上剛按過儲存而且成功了。 */}
+              {needsKey && (
+                <span className="secret-pill" data-s={p.secret}>
+                  {SECRET_LABEL[p.secret]}
+                </span>
+              )}
             </div>
             <p className="hint">{KIND_HINT[p.kind]}</p>
 

@@ -29,6 +29,9 @@
   --canvas: var(--slate-25);
   --panel: #ffffff;
   --panel-2: var(--slate-50);
+  /* 可編輯欄位的底色。跟 --panel-2 分開：那個代表「不能改」，
+     兩者同色的話唯讀欄位看起來就跟能打字的一樣 */
+  --field: #ffffff;
   --ink: var(--slate-900);
   --ink-2: var(--slate-700);
   --muted: var(--slate-500);
@@ -52,9 +55,15 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    /* 原生控制項（下拉選單的 popup、捲軸、日期選擇器）由系統畫，
+       只認 color-scheme。少了它 popup 會用淺色系統樣式，而 option 的字
+       繼承 --ink 的淺灰 —— 白底淺灰字，實測整份選單讀不出來 */
+    color-scheme: dark;
+
     --canvas: var(--slate-950);
     --panel: var(--slate-900);
     --panel-2: #101a21;
+    --field: #1a252d;
     --ink: #e8eef2;
     --ink-2: #b8c6d0;
     --muted: #7d8f9d;
@@ -73,10 +82,15 @@
   }
 }
 
+:root[data-theme="light"] { color-scheme: light; }
+
 :root[data-theme="dark"] {
+  color-scheme: dark;
+
   --canvas: var(--slate-950);
   --panel: var(--slate-900);
   --panel-2: #101a21;
+  --field: #1a252d;
   --ink: #e8eef2;
   --ink-2: #b8c6d0;
   --muted: #7d8f9d;
@@ -1192,7 +1206,7 @@ svg { display: block; }
   padding: 2px 6px;
   border: 1px solid var(--live);
   border-radius: 6px;
-  background: var(--bg);
+  background: var(--field);
   color: inherit;
   font: inherit;
   font-size: 13.5px;
@@ -1283,7 +1297,7 @@ svg { display: block; }
   padding: 7px 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--bg);
+  background: var(--field);
   color: inherit;
   font: inherit;
   font-size: 13px;
@@ -1305,10 +1319,19 @@ svg { display: block; }
   padding: 7px 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--bg);
+  background: var(--field);
   color: inherit;
   font-size: 13px;
 }
+
+/* option 的樣式由系統畫，顏色不從 select 繼承。不寫死的話深色主題下
+   popup 會是白底，而字跟著 --ink 變淺 */
+.setting-field select option {
+  background: var(--panel);
+  color: var(--ink);
+}
+
+.setting-field select option:disabled { color: var(--muted); }
 
 .setting-field select:disabled {
   background: var(--panel-2);
@@ -1350,7 +1373,7 @@ svg { display: block; }
   padding: 2px 7px;
   border: 1px solid var(--live);
   border-radius: 6px;
-  background: var(--bg);
+  background: var(--field);
   color: inherit;
   font: inherit;
   font-size: 12px;

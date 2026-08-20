@@ -47,3 +47,7 @@ Thumbs.db
 
 # 引擎日誌
 stt.log
+
+# 實驗腳本的產物
+__pycache__/
+/test_output/

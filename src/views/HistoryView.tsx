@@ -33,6 +33,7 @@ function speakerNames(detail: MeetingDetail): Map<string, string> {
   }
   const named: (NamedSpeaker & { speakerId: string })[] = detail.speakers.map((s) => ({
     speakerId: s.speakerId,
+    id: s.speakerId,
     ordinal: s.ordinal,
     track: trackOf.get(s.speakerId) ?? 'system',
     proposedName: s.proposedName,

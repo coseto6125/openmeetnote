@@ -132,7 +132,7 @@ pub struct EvidenceIndex {
 #[serde(rename_all = "camelCase")]
 pub struct SpeakerName {
     pub id: String,
-    /// §8.4 的優先順序：確認名 > 暫定名 > 識別碼
+    /// §8.4 的優先順序，與匯出共用 `document::speaker_names`。
     pub display: String,
 }
 
@@ -149,14 +149,16 @@ pub fn build_index(
 ) -> Result<EvidenceIndex> {
     let segments = store.segments_through(meeting, through_event_seq)?;
     let notes = store.notes_through(meeting, through_event_seq)?;
-    let speakers = store
-        .speakers_through(meeting, through_event_seq)?
+    // 跟匯出共用同一份規則。自己算的話，未命名的語者會以內部識別碼進 prompt，
+    // 模型於是在摘要裡寫出 `remote` 跟 `s2`。
+    let stored = store.speakers_through(meeting, through_event_seq)?;
+    let names = crate::document::speaker_names(&stored, &segments);
+    let speakers = stored
         .into_iter()
         .map(|s| SpeakerName {
-            display: s
-                .confirmed_name
-                .clone()
-                .or(s.proposed_name.clone())
+            display: names
+                .get(&s.speaker_id)
+                .cloned()
                 .unwrap_or_else(|| s.speaker_id.clone()),
             id: s.speaker_id,
         })

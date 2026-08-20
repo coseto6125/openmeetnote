@@ -39,6 +39,20 @@ impl MeetingState {
         self.accepts_document_work() || matches!(self, MeetingState::Completed)
     }
 
+    /// 可以為語者命名。
+    ///
+    /// 比 [`accepts_document_work`] 多了結算與結束：誰是誰通常要等散會、
+    /// 回頭讀逐字稿才確定得下來，錄音當下正忙著開會的人不會停下來命名。
+    /// 語者名稱本來就設計成可由使用者更正（§8），把更正的窗口關在錄音期間，
+    /// 等於把功能關在使用者需要它之前。
+    ///
+    /// `Failed` 也放行：斷在半句話的會議一樣看得出誰在講。
+    ///
+    /// [`accepts_document_work`]: MeetingState::accepts_document_work
+    pub fn accepts_speaker_naming(self) -> bool {
+        !matches!(self, MeetingState::Idle | MeetingState::Stopping)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             MeetingState::Idle => "idle",
@@ -107,6 +121,17 @@ pub enum Track {
     Mic,
     System,
 }
+
+/// 聲紋分不出是誰時，遠端發言掛在這個識別碼下。
+///
+/// 不能沿用 `s1`：那是聲紋登記的第一位（見 `stt::speakers`），兩者同名的話
+/// 「分不出來」會被靜默併進一個真實的人，逐字稿於是把話安到他頭上，而讀的
+/// 人看不出來。
+///
+/// 它不是一個人，是「遠端，但不確定是誰」。三個後果，畫面、匯出、摘要必須
+/// 一致（§8.1）：顯示成「遠端」而不是「語者 N」、不佔用「語者 N」的編號、
+/// 不接受命名。命名它等於把好幾位不同的未知發言者併成一位真人。
+pub const UNKNOWN_REMOTE: &str = "remote";
 
 impl Track {
     pub fn as_str(self) -> &'static str {

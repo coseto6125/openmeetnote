@@ -67,8 +67,12 @@ impl Whisper {
                     start_ms: seg.start_timestamp() as u64 * 10,
                     end_ms: seg.end_timestamp() as u64 * 10,
                     no_speech: seg.no_speech_probability(),
+                    // lossy 而不是嚴格解碼：whisper 偶爾會在段落邊界切斷一個
+                    // 多位元組字元，嚴格版對整批回 Err，那一批的定稿就整個
+                    // 消失、只剩即時稿。壞掉的那一個字變成 U+FFFD 是小得多的
+                    // 損失。整場 52 檔的評測實測踩到 7 次。
                     text: seg
-                        .to_str()
+                        .to_str_lossy()
                         .map_err(|e| SttError::Decode(e.to_string()))?
                         .trim()
                         .to_owned(),
@@ -158,6 +162,144 @@ mod initial_prompt_probe {
             return None;
         }
         Some((model, crate::stt::load_wav_16k_mono(wav).expect("讀音訊")))
+    }
+
+    /// 上面那支用 near.wav —— 立法院質詢、全中文、專有名詞是機關與法案名。
+    /// 這個產品實際錄的會議在談主播分潤、Google Workspace、報價單，中英夾雜。
+    /// 同一個結論不保證跨得過去：streaming zipformer-ctc 就是在 near.wav 上
+    /// 贏過現行引擎、在真實會議上輸，因為它不會英文（BLUEPRINT §5.3 的排除表）。
+    ///
+    /// 所以同一個問題在自己的語料上再問一次。
+    ///
+    /// 目標詞是從那場會議的定稿逐字稿裡撈出來、確認真的出現過的 17 個。
+    /// 前文分四種：不帶、只放講到的、使用者詞表、詞表加業務名詞。第三與第四
+    /// 種是真實情境 —— 詞表會累積別場會議的詞，而使用者不會為每場會議改它。
+    // 一詞一行是 rustfmt 的預設，17 個詞排成 17 行反而看不出這是一份清單
+    #[rustfmt::skip]
+    const OURS: &[&str] = &[
+        "經紀人", "主播", "帳號", "管理員", "簽約", "分頁", "匯入", "趨勢圖",
+        "建檔", "群組", "薪資", "後台", "會議記錄", "統整", "匯出", "抽成",
+        "單獨窗口",
+    ];
+
+    /// 使用者詞表右邊那一欄。九個裡有五個是別場會議的。
+    const OUR_VOCAB: &str = "召委、西拉雅、雙橡園、拼板舟、達悟族、未稅、含稅、報價單、溢價";
+
+    /// 詞表之外還會進前文的業務名詞。這場沒講到的（報價單、權限管理、行事曆）
+    /// 刻意留著：詞表就是拿來收「哪場會用到還不知道」的詞。
+    const OUR_NOUNS: &str = "主播、經紀人、建檔、匯入、匯出、報價單、權限管理、行事曆、簽約、抽成、薪資、後台、帳號、群組、趨勢圖、單獨窗口、會議記錄";
+
+    /// 批次長度。整段送進去的話 whisper 會在尾端靜音上空轉出重複迴圈，那是
+    /// 批次長度的問題不是前文的問題，混進數字裡會蓋掉要量的差異。線上也是
+    /// 分批餵，前文每批都會重新套用一次。
+    const OURS_BATCH_S: usize = 28;
+
+    fn our_material() -> Option<(String, Vec<f32>)> {
+        let model = std::env::var("OMN_WHISPER_MODEL").unwrap_or_else(|_| {
+            "/home/enor/whisper-bench/models/ggml-large-v3-turbo-q5_0.bin".into()
+        });
+        let dir = std::env::var("OMN_PROBE_MEETING").ok()?;
+        if !std::path::Path::new(&model).exists() {
+            return None;
+        }
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension().is_some_and(|x| x == "wav")
+                    && p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("mic-"))
+            })
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            return None;
+        }
+        let mut samples = Vec::new();
+        for f in &files {
+            samples.extend(crate::stt::load_wav_16k_mono(f.to_str()?).ok()?);
+        }
+        Some((model, samples))
+    }
+
+    /// 同一個問題，換成自己的會議語料。
+    ///
+    /// 上一次量這件事得到「前文有用」的相反結論，破綻在對照組不對等：兩趟
+    /// 丟掉的批次數不同（16 對 0），多出來的目標詞來自多處理的那些音訊，
+    /// 不是辨識變準。所以這裡不放閘門，每個設定看到的批次完全相同。
+    #[test]
+    #[ignore = "需要真實會議錄音，設 OMN_PROBE_MEETING 指向 mic-*.wav 的目錄"]
+    fn probe_whether_an_initial_prompt_helps_our_own_meetings() {
+        let Some((model, samples)) = our_material() else {
+            eprintln!("略過：缺少模型或 OMN_PROBE_MEETING");
+            return;
+        };
+        let audio_s = samples.len() / 16_000;
+        eprintln!("音訊 {} 分 {} 秒", audio_s / 60, audio_s % 60);
+
+        let vocab_plus = format!("{OUR_VOCAB}、{OUR_NOUNS}。");
+        let ideal = format!("{}。", OURS.join("、"));
+        let vocab_only = format!("{OUR_VOCAB}。");
+        let configs: [(&str, Option<&str>); 4] = [
+            ("不帶提示", None),
+            ("只放講到的（17 詞）", Some(&ideal)),
+            ("使用者詞表（9 詞）", Some(&vocab_only)),
+            ("詞表＋業務名詞（26 詞）", Some(&vocab_plus)),
+        ];
+
+        let engine = Whisper::load(&model, 8).expect("載入模型");
+        let mut runs: Vec<(String, usize, Vec<usize>, Vec<usize>)> = Vec::new();
+        // 不足一秒的目錄會讓 div_ceil 回 0，下面的 buckets - 1 就負溢位
+        let buckets = audio_s.div_ceil(BUCKET_S * 3).max(1);
+        for (name, prompt) in configs {
+            let mut text = String::new();
+            let mut dens = vec![0usize; buckets];
+            for (i, batch) in samples.chunks(OURS_BATCH_S * 16_000).enumerate() {
+                let segs = engine.run(batch, prompt).expect("轉錄");
+                let out: String = segs.iter().map(|s| s.text.as_str()).collect();
+                let out = crate::stt::diff::to_traditional(&out, &Default::default());
+                let b = ((i * OURS_BATCH_S) / (BUCKET_S * 3)).min(buckets - 1);
+                dens[b] += out.chars().count();
+                text.push_str(&out);
+            }
+            let hits: Vec<usize> = OURS.iter().map(|w| text.matches(w).count()).collect();
+            eprintln!(
+                "{name:<24} {:>5} 字，目標詞 {} 次",
+                text.chars().count(),
+                hits.iter().sum::<usize>()
+            );
+            runs.push((name.to_owned(), text.chars().count(), hits, dens));
+        }
+
+        eprint!("{:<12}", "詞");
+        for (n, ..) in &runs {
+            eprint!("{n:>16}");
+        }
+        eprintln!();
+        for (i, w) in OURS.iter().enumerate() {
+            eprint!("{w:<12}");
+            for (.., h, _) in &runs {
+                eprint!("{:>16}", h[i]);
+            }
+            eprintln!();
+        }
+        eprint!("{:<12}", "合計");
+        for (.., h, _) in &runs {
+            eprint!("{:>16}", h.iter().sum::<usize>());
+        }
+        eprintln!();
+
+        let base = runs[0].3.clone();
+        for (name, .., dens) in runs.iter().skip(1) {
+            let collapsed: Vec<usize> = base
+                .iter()
+                .zip(dens)
+                .enumerate()
+                .filter(|(_, (b, g))| **b > 50 && **g * 2 < **b)
+                .map(|(i, _)| i)
+                .collect();
+            eprintln!("{name} 相對於不帶提示塌掉的時間桶：{collapsed:?}");
+        }
     }
 
     /// 掃過幾種詞表長度，看兩件事：有沒有整段被跳過，以及專有名詞轉得對不對。
