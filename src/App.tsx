@@ -18,6 +18,7 @@ import {
   applyBatch,
   emptyMeeting,
   fromProjection,
+  receiptDegrade,
   type Degrade,
   type MeetingModel,
 } from './meeting';
@@ -116,20 +117,38 @@ export default function App() {
       setLocalDegrade({ title: '無法開始錄音', body: r.note ?? '未知原因', tone: 'bad' });
       return;
     }
+    if (r.pending && r.note) {
+      setLocalDegrade({ title: '錄音已開始，但尚未存檔', body: r.note, tone: 'warn' });
+    }
     setMeetingId(await activeMeeting());
 
   };
 
   const newMeeting = async () => {
-    await commands.newMeeting();
+    // 上一場還沒寫完就不換。後端會拒絕並保留舊 Session，這裡照樣清畫面的話，
+    // 畫面說已經開了新會議，核心其實還在舊的那一場。
+    const r = await commands.newMeeting();
+    if (!r.accepted) {
+      setLocalDegrade({ title: '無法開新會議', body: r.note ?? '未知原因', tone: 'bad' });
+      return;
+    }
     setModel(emptyMeeting);
     setLocalDegrade(null);
     setMeetingId(null);
   };
 
-  const togglePause = () => {
-    if (model.state === 'recording') commands.pause();
-    else if (model.state === 'paused') commands.resume();
+  const togglePause = async () => {
+    // 這兩個也會產生事件，也就有「還沒存檔」這個答案。丟掉收據的話，使用者
+    // 按了暫停、畫面停了，而那次暫停沒有進日誌。
+    if (model.state === 'recording') {
+      setLocalDegrade(receiptDegrade(await commands.pause(), '暫停'));
+    } else if (model.state === 'paused') {
+      setLocalDegrade(receiptDegrade(await commands.resume(), '繼續錄音'));
+    }
+  };
+
+  const stopMeeting = async () => {
+    setLocalDegrade(receiptDegrade(await commands.stop(), '結束會議'));
   };
 
   const toggleTheme = () => {
@@ -207,10 +226,10 @@ export default function App() {
               開新會議
             </button>
           )}
-          <button className="btn" onClick={togglePause} disabled={!live}>
+          <button className="btn" onClick={() => void togglePause()} disabled={!live}>
             {model.state === 'paused' ? '繼續' : '暫停'}
           </button>
-          <button className="btn btn-danger" onClick={() => commands.stop()} disabled={!live}>
+          <button className="btn btn-danger" onClick={() => void stopMeeting()} disabled={!live}>
             結束會議
           </button>
         </div>

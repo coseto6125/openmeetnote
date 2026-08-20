@@ -650,8 +650,11 @@ pub(crate) fn speaker_names(
         }
     }
     let mut remote = 0u32;
-    speakers
+    let mut names: std::collections::HashMap<String, String> = speakers
         .iter()
+        // 被併掉的那幾列不佔編號，也不自己取名字：它們底下的片段從此
+        // 算在合併對象頭上，下面那一輪再把 id 指過去
+        .filter(|s| crate::store::resolve_merge(speakers, &s.speaker_id) == s.speaker_id)
         .map(|s| {
             let track = track_of
                 .get(s.speaker_id.as_str())
@@ -673,7 +676,18 @@ pub(crate) fn speaker_names(
                 });
             (s.speaker_id.clone(), name)
         })
-        .collect()
+        .collect();
+    // 合併不改寫片段，所以片段上仍是原本那個 id。查得到它，那句話才有名字。
+    for s in speakers {
+        let root = crate::store::resolve_merge(speakers, &s.speaker_id);
+        if root == s.speaker_id {
+            continue;
+        }
+        if let Some(name) = names.get(root).cloned() {
+            names.insert(s.speaker_id.clone(), name);
+        }
+    }
+    names
 }
 
 /// 匯出文件的分區。§10 規定匯出至少要有哪幾塊，這個 enum 就是那份清單。
@@ -1191,6 +1205,7 @@ mod tests {
             proposed_name: None,
             confirmed_name: Some("<script>alert(1)</script>".into()),
             status: "confirmed".into(),
+            merged_into: None,
         }];
         let c = RenderContext {
             transcript: std::slice::from_ref(&seg),
@@ -1227,6 +1242,7 @@ mod tests {
             proposed_name: None,
             confirmed_name: confirmed.map(str::to_owned),
             status: "confirmed".into(),
+            merged_into: None,
         };
         let transcript = vec![
             seg("me", crate::model::Track::Mic),
@@ -1275,6 +1291,7 @@ mod tests {
             proposed_name: None,
             confirmed_name: None,
             status: "proposed".into(),
+            merged_into: None,
         };
         speaker_names(
             &[speaker(UNKNOWN_REMOTE, 1), speaker("s1", 2)],
@@ -1303,6 +1320,7 @@ mod tests {
                 proposed_name: None,
                 confirmed_name: Some("Alice".into()),
                 status: "confirmed".into(),
+                merged_into: None,
             }],
             &[crate::store::StoredSegment {
                 segment_id: 1,
@@ -1317,6 +1335,153 @@ mod tests {
             }],
         );
         assert_eq!(names[UNKNOWN_REMOTE], "遠端");
+    }
+
+    /// 合併之後，被併掉的那個 id 要答出合併對象的名字。
+    ///
+    /// 片段上留著的仍是當時聽到的 id（合併不改寫過去），查不到名字的話
+    /// 那幾句話在匯出檔與歷史分頁上會變成「未指派」。
+    #[test]
+    fn test_a_merged_speaker_answers_with_the_name_of_whoever_absorbed_it() {
+        let names = speaker_names(&merged_roster(), &two_remote_segments());
+        assert_eq!(names["s2"], "沈立群");
+        assert_eq!(
+            names["s1"], "沈立群",
+            "被併掉的 id 查不到名字，那句話會變成「未指派」"
+        );
+    }
+
+    /// 被併掉的那一列不佔編號。佔了的話，同一場會議看起來就多一個人。
+    #[test]
+    fn test_a_merged_speaker_does_not_consume_a_number() {
+        let mut roster = merged_roster();
+        roster[1].confirmed_name = None;
+        let names = speaker_names(&roster, &two_remote_segments());
+        assert_eq!(names["s2"], "語者 1", "被併掉的 s1 佔掉了一個編號");
+        assert_eq!(names["s1"], "語者 1");
+    }
+
+    /// 鏈是使用者做得出來的：A 併進 B，之後 B 併進 C。三列要收斂成同一位。
+    ///
+    /// 收斂不了的話，A 那幾句話會掛在一個名單上已經不存在的人底下。
+    #[test]
+    fn test_a_chain_of_merges_resolves_to_the_last_person() {
+        let row = |id: &str, ordinal, name: Option<&str>, merged: Option<&str>| {
+            crate::store::StoredSpeaker {
+                speaker_id: id.into(),
+                ordinal,
+                proposed_name: None,
+                confirmed_name: name.map(str::to_owned),
+                status: if merged.is_some() {
+                    "merged"
+                } else {
+                    "proposed"
+                }
+                .into(),
+                merged_into: merged.map(str::to_owned),
+            }
+        };
+        let speakers = vec![
+            row("s1", 1, None, Some("s2")),
+            row("s2", 2, None, Some("s3")),
+            row("s3", 3, Some("沈立群"), None),
+        ];
+        for id in ["s1", "s2", "s3"] {
+            assert_eq!(crate::store::resolve_merge(&speakers, id), "s3");
+        }
+        let names = speaker_names(&speakers, &two_remote_segments());
+        assert_eq!(names["s1"], "沈立群");
+        assert_eq!(names["s2"], "沈立群");
+        assert_eq!(names["s3"], "沈立群");
+    }
+
+    /// 循環不會吊死讀取路徑，也不會讓那幾句話沒有名字。
+    ///
+    /// 命令那一層擋掉了 A→B→A，但讀取路徑也吃得到別的來源寫進去的日誌。
+    ///
+    /// 三步循環外加一列無關的人，是先前那版「走固定圈數」真正失手的形狀：
+    /// 名單長度 4、循環長度 3，四步之後每一列都停在別人身上，於是三列全部
+    /// 被當成已合併而失去名字（前端那邊是無限遞迴）。兩步循環配兩列剛好
+    /// 繞回原點，所以它測不出這件事。
+    #[test]
+    fn test_a_cycle_of_aliases_still_names_everyone_in_it() {
+        let row = |id: &str, ordinal, merged: Option<&str>| crate::store::StoredSpeaker {
+            speaker_id: id.into(),
+            ordinal,
+            proposed_name: None,
+            confirmed_name: None,
+            status: if merged.is_some() {
+                "merged"
+            } else {
+                "proposed"
+            }
+            .into(),
+            merged_into: merged.map(str::to_owned),
+        };
+        for speakers in [
+            vec![row("s1", 1, Some("s2")), row("s2", 2, Some("s1"))],
+            vec![
+                row("s1", 1, Some("s2")),
+                row("s2", 2, Some("s3")),
+                row("s3", 3, Some("s1")),
+                row("s4", 4, None),
+            ],
+            vec![row("s1", 1, Some("s1")), row("s2", 2, None)],
+        ] {
+            for sp in &speakers {
+                assert_eq!(
+                    crate::store::resolve_merge(&speakers, &sp.speaker_id),
+                    sp.speaker_id,
+                    "循環裡的 {} 解析到了別人身上",
+                    sp.speaker_id
+                );
+            }
+            let names = speaker_names(&speakers, &two_remote_segments());
+            assert_eq!(
+                names.len(),
+                speakers.len(),
+                "循環讓某一列沒有名字，那幾句話會變成「未指派」"
+            );
+        }
+    }
+
+    /// s1 已經併進 s2，而 s2 有名字。
+    fn merged_roster() -> Vec<crate::store::StoredSpeaker> {
+        let row = |id: &str, ordinal, name: Option<&str>, merged: Option<&str>| {
+            crate::store::StoredSpeaker {
+                speaker_id: id.into(),
+                ordinal,
+                proposed_name: None,
+                confirmed_name: name.map(str::to_owned),
+                status: if merged.is_some() {
+                    "merged"
+                } else {
+                    "proposed"
+                }
+                .into(),
+                merged_into: merged.map(str::to_owned),
+            }
+        };
+        vec![
+            row("s1", 1, None, Some("s2")),
+            row("s2", 2, Some("沈立群"), None),
+        ]
+    }
+
+    fn two_remote_segments() -> Vec<crate::store::StoredSegment> {
+        use crate::model::Track;
+        let seg = |id: u64, speaker: &str| crate::store::StoredSegment {
+            segment_id: id,
+            revision: 1,
+            origin: crate::model::Origin::Provider,
+            speaker_id: Some(speaker.into()),
+            text: "說了一句話".into(),
+            track: Track::System,
+            meeting_start_ms: id * 1000,
+            meeting_end_ms: id * 1000 + 900,
+            user_edited: false,
+        };
+        vec![seg(1, "s1"), seg(2, "s2")]
     }
 
     #[test]

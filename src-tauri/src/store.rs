@@ -433,6 +433,48 @@ pub struct StoredSpeaker {
     pub proposed_name: Option<String>,
     pub confirmed_name: Option<String>,
     pub status: String,
+    /// 這一列被併進了誰。合併不改寫片段，所以片段上留著的仍是當時聽到的
+    /// 那個 id；要知道現在該算在誰頭上，讀的時候順著這個欄位走一次。
+    pub merged_into: Option<String>,
+}
+
+/// 順著 `merged_into` 走到還是自己的那一位。
+///
+/// 合併只寫在 speakers 這一列上，片段上留著的是當時聽到的 id，所以每一條
+/// 讀取路徑都要自己走這一步。走不到（那一列不在名單裡）就回原本的 id：
+/// 名字會退回預設稱呼，比讓那句話變成「未指派」好。
+///
+/// 循環的答案是「當作沒有別名」，每一列保有自己的名字。停在鏈上的某一點
+/// 是錯的：先前這裡走固定圈數，停在哪裡取決於名單有多長，於是 A→B→C→A
+/// 這種循環會讓 A 解析成 B、B 解析成 C、C 解析成 A —— 三個都不是自己，
+/// Rust 這邊三列全部失去名字，TypeScript 那邊直接無限遞迴。
+///
+/// 循環不是理論上的顧慮。命令那一層擋得住，但讀取路徑也吃得到別的來源
+/// 寫進去的日誌，而整份逐字稿打不開是最不能出的錯。
+pub fn resolve_merge<'a>(speakers: &'a [StoredSpeaker], id: &'a str) -> &'a str {
+    let mut cur = id;
+    let mut seen: Vec<&str> = Vec::new();
+    loop {
+        let next = speakers
+            .iter()
+            .find(|s| s.speaker_id == cur)
+            .and_then(|s| s.merged_into.as_deref())
+            // 指向名單上沒有的人就停在這裡。走不到的別名等於沒有別名，讓這
+            // 一列照常有自己的名字，比讓它底下那幾句話變成「未指派」好。
+            .filter(|next| speakers.iter().any(|s| s.speaker_id == *next));
+        let Some(next) = next else { return cur };
+        // 走回走過的地方就是一個環。整組別名當成沒有：從環上任何一位問起都
+        // 答自己，於是每一列都保住自己的名字。
+        //
+        // 這裡不能改用「走 N 步就停」：環長與名單長度無關。A→B→C→A 再加一位
+        // 無關的 D，走四步會停在 B，而 B 答 C、C 答 A —— Rust 這邊三個人同時
+        // 失去名字，前端則是 speakerDisplayName 互相遞迴到爆棧。
+        if next == id || seen.contains(&next) {
+            return id;
+        }
+        seen.push(cur);
+        cur = next;
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -957,8 +999,10 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut stmt = self.conn.prepare(
-            "SELECT id, ordinal, proposed_name, confirmed_name, status
-             FROM speakers WHERE meeting_id = ?1 AND status <> 'merged' ORDER BY ordinal",
+            // 併掉的那幾列也要拿出來。片段上的 speaker_id 沒有被改寫，
+            // 濾掉它們畫面就查不到那些片段是誰講的，只剩「未指派」。
+            "SELECT id, ordinal, proposed_name, confirmed_name, status, merged_into
+             FROM speakers WHERE meeting_id = ?1 ORDER BY ordinal",
         )?;
         let speakers = stmt
             .query_map(params![meeting], |r| {
@@ -968,6 +1012,7 @@ impl Store {
                     proposed_name: r.get(2)?,
                     confirmed_name: r.get(3)?,
                     status: r.get(4)?,
+                    merged_into: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1139,6 +1184,7 @@ impl Store {
                             proposed_name: None,
                             confirmed_name: None,
                             status: "unconfirmed".into(),
+                            merged_into: None,
                         }
                     });
                     entry.ordinal = *ordinal;
@@ -1155,10 +1201,12 @@ impl Store {
                     }
                 }
                 DomainEvent::SpeakerMerged {
-                    from_speaker_id, ..
+                    from_speaker_id,
+                    into_speaker_id,
                 } => {
                     if let Some(s) = by_id.get_mut(from_speaker_id) {
                         s.status = "merged".into();
+                        s.merged_into = Some(into_speaker_id.clone());
                     }
                 }
                 DomainEvent::SpeakerSplit {
@@ -1174,6 +1222,7 @@ impl Store {
                             proposed_name: None,
                             confirmed_name: None,
                             status: "unconfirmed".into(),
+                            merged_into: None,
                         }
                     });
                 }
@@ -1181,10 +1230,12 @@ impl Store {
             }
         }
 
+        // 併掉的那幾列留在名單裡，理由同 `meeting_detail`：片段上的
+        // speaker_id 沒有被改寫，濾掉它們就查不到那些片段算誰的。要不要
+        // 顯示是 `document::speaker_names` 的事。
         let mut out: Vec<StoredSpeaker> = order
             .into_iter()
             .filter_map(|id| by_id.remove(&id))
-            .filter(|s| s.status != "merged")
             .collect();
         out.sort_by_key(|s| s.ordinal);
         Ok(out)
@@ -1848,12 +1899,10 @@ fn project(
                 params![meeting, from_speaker_id, into_speaker_id],
             )?;
             expect_touched(seq, &format!("語者 {from_speaker_id}"), n)?;
-            // 底下的片段改派可以是 0 列：這位語者可能還沒說過話
-            tx.execute(
-                "UPDATE transcript_segment_revisions SET speaker_id = ?3
-                 WHERE meeting_id = ?1 AND speaker_id = ?2",
-                params![meeting, from_speaker_id, into_speaker_id],
-            )?;
+            // 片段不改派。改派會回溯改寫早於這次合併的快照：一份已經匯出的
+            // 紀錄，會因為之後的一個操作而改口說是別人講的。§8.1 要的是
+            // 「引用仍指向原始片段」，所以合併只留在 speakers 這一列上，
+            // 讀取時再依游標套用。
         }
         DomainEvent::SpeakerSplit {
             new_speaker_id,
@@ -2714,8 +2763,13 @@ mod tests {
         assert_eq!(raw, 1, "實體刪除會讓已匯出文件的引用指向虛空");
     }
 
+    /// 合併不改寫片段。
+    ///
+    /// 改寫的話，早於這次合併的快照會回溯改口說是別人講的：一份已經匯出的
+    /// 紀錄，因為之後的一個操作而變成另一份。§8.1 要的是「引用仍指向原始
+    /// 片段」，所以合併只留在 speakers 那一列上，讀取時再套用。
     #[test]
-    fn merging_a_speaker_reassigns_every_segment_it_owned() {
+    fn a_merge_leaves_the_segments_speaker_id_alone() {
         let (mut s, m) = store();
         s.append(
             m,
@@ -2755,8 +2809,73 @@ mod tests {
         )
         .unwrap();
         let d = s.meeting(m).unwrap();
-        assert_eq!(d.segments[0].speaker_id.as_deref(), Some("s2"));
-        assert_eq!(d.speakers.len(), 1, "已合併的語者不該再出現在名單裡");
+        assert_eq!(
+            d.segments[0].speaker_id.as_deref(),
+            Some("s1"),
+            "片段被改派了：早於合併的快照會跟著改口"
+        );
+        let merged = d
+            .speakers
+            .iter()
+            .find(|x| x.speaker_id == "s1")
+            .expect("被併掉的那一列要留在名單裡：片段上還帶著它的 id");
+        assert_eq!(merged.merged_into.as_deref(), Some("s2"));
+        assert_eq!(merged.status, "merged");
+    }
+
+    /// 早於合併的游標讀出來的，仍然是合併之前那份名單。
+    ///
+    /// 這是把合併做成讀取時別名的唯一理由：同一份逐字稿，用舊游標讀是兩個
+    /// 人，用現在的游標讀是一個人，而兩者都正確。
+    #[test]
+    fn a_snapshot_taken_before_a_merge_still_says_who_spoke() {
+        let (mut s, m) = store();
+        let mut ev = |e| s.append(m, &[(e, tl(0))]).unwrap();
+        ev(DomainEvent::SpeakerProposed {
+            speaker_id: "s1".into(),
+            ordinal: 1,
+            proposed_name: None,
+            provider_labels: vec![],
+        });
+        ev(DomainEvent::SpeakerProposed {
+            speaker_id: "s2".into(),
+            ordinal: 2,
+            proposed_name: None,
+            provider_labels: vec![],
+        });
+        ev(DomainEvent::TranscriptSegmentFinalized {
+            segment: seg(1, 1, "一", Origin::Provider),
+        });
+        let before_merge = 3;
+        ev(DomainEvent::SpeakerMerged {
+            from_speaker_id: "s1".into(),
+            into_speaker_id: "s2".into(),
+        });
+        let after_merge = 4;
+
+        let name_at = |seq: u64| {
+            let speakers = s.speakers_through(m, seq).unwrap();
+            let segments = s.segments_through(m, seq).unwrap();
+            crate::document::speaker_names(&speakers, &segments)
+        };
+
+        let before = name_at(before_merge);
+        assert_ne!(
+            before.get("s1"),
+            before.get("s2"),
+            "合併之前他們是兩個人，舊快照必須維持那個樣子"
+        );
+
+        let after = name_at(after_merge);
+        assert_eq!(
+            after.get("s1"),
+            after.get("s2"),
+            "合併之後，片段上的舊 id 要指向同一個人"
+        );
+        assert!(
+            after.contains_key("s1"),
+            "被併掉的 id 查不到名字，那句話會變成「未指派」"
+        );
     }
 
     #[test]

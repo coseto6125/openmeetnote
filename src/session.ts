@@ -61,6 +61,12 @@ export type SessionEvent =
     }
   | { kind: 'speakerConfirmed'; seq: number; speakerId: string; name: string }
   | {
+      kind: 'speakerMerged';
+      seq: number;
+      fromSpeakerId: string;
+      intoSpeakerId: string;
+    }
+  | {
       kind: 'snapshotCreated';
       seq: number;
       version: number;
@@ -114,6 +120,13 @@ export interface SessionEventBatch {
 
 export interface CommandReceipt {
   accepted: boolean;
+  /**
+   * 命令做了，但還沒寫進本機資料庫。
+   *
+   * 這一筆排在佇列裡等重試，所以畫面要當它已經發生：清掉輸入框，改用警示
+   * 說它還沒存。當成「沒送出」讓使用者再送一次，重試成功後就會有兩筆。
+   */
+  pending: boolean;
   seq: number | null;
   note: string | null;
 }
@@ -133,6 +146,8 @@ export interface ProjectedSpeaker {
   proposedName: string | null;
   confirmedName: string | null;
   track: 'mic' | 'system';
+  /** 被併進了誰。合併不改寫片段，片段上留著的仍是當時聽到的 id。 */
+  mergedInto: string | null;
 }
 
 export interface SessionProjection {
@@ -164,6 +179,9 @@ export const commands = {
   addNote: (text: string) => invoke<CommandReceipt>('add_note', { text }),
   confirmSpeaker: (speakerId: string, name: string) =>
     invoke<CommandReceipt>('confirm_speaker', { speakerId, name }),
+  /** 兩位語者其實是同一個人。來源那一列從名單上消失，片段的 id 不變。 */
+  mergeSpeaker: (fromSpeakerId: string, intoSpeakerId: string) =>
+    invoke<CommandReceipt>('merge_speaker', { fromSpeakerId, intoSpeakerId }),
   editTranscript: (segmentId: number, text: string) =>
     invoke<CommandReceipt>('edit_transcript', { segmentId, text }),
   /** 本輪 Prompt 決定這一版文件的方向。留空代表讓 Agent Loop 依證據自行規劃。 */
@@ -228,6 +246,7 @@ export interface MeetingDetail {
     proposedName: string | null;
     confirmedName: string | null;
     status: string;
+    mergedInto: string | null;
   }[];
   runs: StoredRun[];
 }

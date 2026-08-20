@@ -3,6 +3,8 @@ import {
   applyBatch,
   emptyMeeting,
   fromProjection,
+  resolveMerge,
+  receiptDegrade,
   speakerDisplayName,
   UNKNOWN_REMOTE,
   type MeetingModel,
@@ -181,6 +183,7 @@ describe('sequence gap detection', () => {
           proposedName: null,
           confirmedName: '小明',
           track: 'system',
+          mergedInto: null,
         },
       ],
       notes: [{ noteId: 1, text: '筆記', meetingTimeMs: 800, capturedAudioMs: 800 }],
@@ -255,6 +258,36 @@ describe('local write failures', () => {
   });
 });
 
+describe('reading a receipt', () => {
+  const r = (accepted: boolean, pending: boolean, note: string | null) => ({
+    accepted,
+    pending,
+    note,
+  });
+
+  // 拒絕代表什麼都沒發生：輸入要留著，訊息要說「未送出」
+  test('a_rejection_is_reported_as_not_sent', () => {
+    expect(receiptDegrade(r(false, false, '磁碟已滿'), '筆記')).toEqual({
+      title: '筆記未送出',
+      body: '磁碟已滿',
+      tone: 'warn',
+    });
+  });
+
+  // 做了但還沒存：訊息不能說成「未送出」，那會讓使用者再送一次而變成兩筆
+  test('a_pending_receipt_says_it_happened_but_is_not_saved', () => {
+    expect(receiptDegrade(r(true, true, '磁碟已滿'), '筆記')).toEqual({
+      title: '筆記尚未存檔',
+      body: '磁碟已滿',
+      tone: 'warn',
+    });
+  });
+
+  test('a_receipt_that_landed_says_nothing', () => {
+    expect(receiptDegrade(r(true, false, null), '筆記')).toBeNull();
+  });
+});
+
 describe('speakers', () => {
   const proposed = (seq: number, id: string, ordinal: number, track: 'mic' | 'system'): SessionEvent => ({
     kind: 'speakerProposed',
@@ -278,6 +311,19 @@ describe('speakers', () => {
       batchOf([{ kind: 'speakerConfirmed', seq: 2, speakerId: 's1', name: '小明' }], 1),
     );
     expect(m.speakers[0].confirmedName).toBe('小明');
+  });
+
+  // 那一列留在陣列裡，只是不再是一個人。移掉的話片段上帶著的舊 id 就查
+  // 不到人，畫面上那幾句話變成沒有名字。
+  test('a_merged_speaker_stays_in_the_list_and_records_where_it_went', () => {
+    let m = applyBatch(emptyMeeting, batchOf([proposed(1, 's1', 1, 'system')], 0));
+    m = applyBatch(m, batchOf([proposed(2, 's2', 2, 'system')], 1));
+    m = applyBatch(
+      m,
+      batchOf([{ kind: 'speakerMerged', seq: 3, fromSpeakerId: 's1', intoSpeakerId: 's2' }], 2),
+    );
+    expect(m.speakers).toHaveLength(2);
+    expect(m.speakers.find((x) => x.id === 's1')?.mergedInto).toBe('s2');
   });
 
   test('speakers_stay_ordered_by_first_appearance', () => {
@@ -469,6 +515,7 @@ describe('speaker display name', () => {
     track,
     proposedName: proposed as string | null,
     confirmedName: confirmed as string | null,
+    mergedInto: null as string | null,
   });
 
   test('confirmed_name_wins_over_proposed', () => {
@@ -508,6 +555,62 @@ describe('speaker display name', () => {
   test('a_name_stored_on_the_unidentified_remote_speaker_does_not_take_effect', () => {
     const all = [s(1, 'system', null, 'Alice' as never, UNKNOWN_REMOTE), s(2, 'system')];
     expect(all.map((x) => speakerDisplayName(x, all))).toEqual(['遠端', '語者 1']);
+  });
+
+  // 聲紋比對寧可錯拆也不錯併（§8.1），所以同一個人會多出一列。合併把它改
+  // 回來，但不改寫片段：片段上留著的仍是當時聽到的 id，查不到名字的話那
+  // 幾句話會變成「未指派」。
+  test('a_merged_speaker_answers_with_the_name_of_whoever_absorbed_it', () => {
+    const all = [s(1, 'system'), s(2, 'system', null, '沈立群' as never)];
+    all[0] = { ...all[0], mergedInto: 's2' };
+    expect(all.map((x) => speakerDisplayName(x, all))).toEqual(['沈立群', '沈立群']);
+  });
+
+  // 佔了編號的話，同一場會議看起來就多一個人
+  test('a_merged_speaker_does_not_consume_a_number', () => {
+    const all = [s(1, 'system'), s(2, 'system'), s(3, 'system')];
+    all[0] = { ...all[0], mergedInto: 's2' };
+    expect(all.map((x) => speakerDisplayName(x, all))).toEqual(['語者 1', '語者 1', '語者 2']);
+  });
+
+  // A 併進 B 再 B 併進 A 只要兩次點擊。後端擋掉了，但畫面吃得到別的來源
+  // 寫進來的資料 —— 這裡吊死的話整份逐字稿都畫不出來。
+  // 三步循環外加一列無關的人，是「走固定圈數」那版真正失手的形狀：名單長 4、
+  // 循環長 3，四步之後 s1→s2、s2→s3、s3→s1，`speakerDisplayName` 於是互相
+  // 遞迴到爆棧。兩步循環配兩列剛好繞回原點，測不出這件事。
+  test('a_cycle_of_aliases_resolves_every_row_to_itself', () => {
+    const cases: [string, string | null][][] = [
+      [
+        ['s1', 's2'],
+        ['s2', 's1'],
+      ],
+      [
+        ['s1', 's2'],
+        ['s2', 's3'],
+        ['s3', 's1'],
+        ['s4', null],
+      ],
+      [
+        ['s1', 's1'],
+        ['s2', null],
+      ],
+    ];
+    for (const rows of cases) {
+      const all = rows.map(([id, into], i) => ({
+        ...s(i + 1, 'system', null, null, id),
+        mergedInto: into,
+      }));
+      for (const x of all) expect(resolveMerge(all, x.id)).toBe(x.id);
+      expect(() => all.map((x) => speakerDisplayName(x, all))).not.toThrow();
+    }
+  });
+
+  // 別名指向名單上沒有的人時，那一列照常有自己的名字。整份逐字稿因為一個
+  // 走不到的別名而變成「未指派」，比名字不理想糟得多。
+  test('an_alias_pointing_nowhere_leaves_the_row_with_its_own_name', () => {
+    const all = [s(1, 'system'), s(2, 'system')];
+    all[0] = { ...all[0], mergedInto: '不存在的人' };
+    expect(all.map((x) => speakerDisplayName(x, all))).toEqual(['語者 1', '語者 2']);
   });
 
   test('numbering_is_stable_when_a_remote_speaker_gets_a_name', () => {

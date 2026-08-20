@@ -258,10 +258,12 @@ fn interleave_to_mono(list: &AudioBufferList, declared_channels: usize) -> Vec<f
         .iter()
         .map(|b| {
             let bytes = b.data();
-            bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
+            // as_chunks 而不是 chunks_exact(4)：每一項是 `&[u8; 4]`，長度由型別
+            // 保證，from_le_bytes 不必再索引一次。clippy 1.98 起把常數長度的
+            // chunks_exact 當成錯誤，而這個檔案只在 macOS 編譯，本機的 Linux
+            // clippy 看不到它。
+            let (quads, _) = bytes.as_chunks::<4>();
+            quads.iter().map(|c| f32::from_le_bytes(*c)).collect()
         })
         .collect();
 

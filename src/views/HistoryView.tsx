@@ -38,6 +38,7 @@ function speakerNames(detail: MeetingDetail): Map<string, string> {
     track: trackOf.get(s.speakerId) ?? 'system',
     proposedName: s.proposedName,
     confirmedName: s.confirmedName,
+    mergedInto: s.mergedInto,
   }));
   return new Map(named.map((s) => [s.speakerId, speakerDisplayName(s, named)]));
 }

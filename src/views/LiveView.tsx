@@ -13,7 +13,7 @@ import {
   snapshotDocument,
   type DocumentBlock,
 } from '../session';
-import { speakerDisplayName, UNKNOWN_REMOTE } from '../meeting';
+import { receiptDegrade, resolveMerge, speakerDisplayName, UNKNOWN_REMOTE } from '../meeting';
 import type { Degrade, MeetingModel, Snapshot, Speaker } from '../meeting';
 import { Spine, type SpinePause } from '../components/Spine';
 import { DocumentView, type CitedSegment } from '../components/DocumentView';
@@ -49,6 +49,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
   // 讀摘要的時候要的是引用能跳回去，那由引用自己負責切換。
   const [pane, setPane] = useState<'transcript' | 'document'>('transcript');
   const [naming, setNaming] = useState<string | null>(null);
+  const [merging, setMerging] = useState<string | null>(null);
   // 受控輸入。非受控的話 blur 讀到的值取決於瀏覽器何時同步 DOM，
   // 而 HistoryView 的改名本來就是受控的，兩處不該有兩種寫法。
   const [nameDraft, setNameDraft] = useState('');
@@ -73,8 +74,18 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
 
   /* ── 衍生資料 ─────────────────────────────────────────── */
 
+  // 併掉的 id 也要問得到人。合併不改寫片段，片段上帶著的仍是當時聽到的那個
+  // id，直接比對就查不到，畫面上的顏色與軌道會退回預設值。
   const speakerOf = useCallback(
-    (id: string) => model.speakers.find((s) => s.id === id),
+    (id: string) => {
+      const root = resolveMerge(model.speakers, id);
+      return model.speakers.find((s) => s.id === root);
+    },
+    [model.speakers],
+  );
+  /** 還是一個人的那幾列。被併掉的留在 `model.speakers` 裡供查詢，但不上名單。 */
+  const roster = useMemo(
+    () => model.speakers.filter((s) => resolveMerge(model.speakers, s.id) === s.id),
     [model.speakers],
   );
   const nameOf = useCallback(
@@ -103,7 +114,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
 
   // 暫定名稱來自 §8.3 的自我介紹推定，目前沒有生產者，因此這個清單通常是空的。
   // 保留這條路徑是為了讓 M3 接上時不必重寫確認流程。
-  const pending = model.speakers.filter(
+  const pending = roster.filter(
     (s) => s.proposedName && !s.confirmedName && !rejectedSpeakers.includes(s.id),
   );
 
@@ -171,9 +182,11 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
     };
   }, [model.activeVersion]);
 
-  const submitSnapshot = () => {
-    void commands.createSnapshot(promptDraft);
-    setPromptDraft('');
+  const submitSnapshot = async () => {
+    const r = await commands.createSnapshot(promptDraft);
+    setLocalDegrade(receiptDegrade(r, '摘要要求'));
+    // 被拒絕時留著要求：使用者剛打完那段話，清掉他就得重打
+    if (r.accepted) setPromptDraft('');
   };
 
   /** 失敗的版本用同一段要求再跑一次。
@@ -189,18 +202,38 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
     const text = noteDraft.trim();
     if (!text) return;
     const r = await commands.addNote(text);
+    setLocalDegrade(receiptDegrade(r, '筆記'));
     if (r.accepted) setNoteDraft('');
-    else if (r.note) setLocalDegrade({ title: '筆記未送出', body: r.note, tone: 'warn' });
+  };
+
+  /** 名單上有幾個人可以當合併對象。少於一個就沒有「併入」這個動作。 */
+  const mergeTargets = roster.filter((s) => s.id !== UNKNOWN_REMOTE).length - 1;
+
+  const submitMerge = async (from: string, into: string) => {
+    if (!into) {
+      setMerging(null);
+      return;
+    }
+    const r = await commands.mergeSpeaker(from, into);
+    setLocalDegrade(receiptDegrade(r, '語者合併'));
+    // 被拒絕就把選單留著：關掉的話使用者看不出自己選了誰、又要重找一次
+    if (r.accepted) setMerging(null);
+  };
+
+  const confirmName = async (speakerId: string, name: string) => {
+    const r = await commands.confirmSpeaker(speakerId, name);
+    setLocalDegrade(receiptDegrade(r, '語者名稱'));
+    return r.accepted;
   };
 
   const submitName = async (speakerId: string, raw: string) => {
-    setNaming(null);
     const name = raw.trim();
-    if (!name) return;
-    const r = await commands.confirmSpeaker(speakerId, name);
-    if (!r.accepted && r.note) {
-      setLocalDegrade({ title: '語者名稱未儲存', body: r.note, tone: 'warn' });
+    if (!name) {
+      setNaming(null);
+      return;
     }
+    // 被拒絕就把輸入框留著，連同他打的名字
+    if (await confirmName(speakerId, name)) setNaming(null);
   };
 
   const scrollToSegment = (id: string) => {
@@ -387,7 +420,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                 aria-label="本輪要求"
                 value={promptDraft}
                 onChange={(e) => setPromptDraft(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && submitSnapshot()}
+                onKeyDown={(e) => e.key === 'Enter' && void submitSnapshot()}
                 placeholder={
                   baseVersion
                     ? `要改什麼？會在 v${baseVersion.version} 的基礎上修訂`
@@ -398,7 +431,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
               />
             </label>
             {/* 結束之後仍可建立：最常見的流程就是開完會才要摘要 */}
-            <button className="btn btn-primary" onClick={submitSnapshot} disabled={!canSnapshot}>
+            <button className="btn btn-primary" onClick={() => void submitSnapshot()} disabled={!canSnapshot}>
               {baseVersion ? `修訂為 v${baseVersion.version + 1}` : '建立摘要快照'}
             </button>
           </div>
@@ -459,13 +492,13 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
           <section className="card">
             <div className="card-head">
               <span className="card-title">語者</span>
-              <span className="count num">{model.speakers.length}</span>
+              <span className="count num">{roster.length}</span>
               {pending.length > 0 && <span className="spk-pending">{pending.length} 待確認</span>}
             </div>
-            {model.speakers.length === 0 && (
+            {roster.length === 0 && (
               <p className="hint">還沒有人發言。語者會在第一次聽到聲音時出現。</p>
             )}
-            {model.speakers.map((s) => {
+            {roster.map((s) => {
               const isPending = pending.some((p) => p.id === s.id);
               return (
                 <div className="spk-row" key={s.id}>
@@ -482,7 +515,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                     <>
                       <button
                         className="mini mini-yes"
-                        onClick={() => void commands.confirmSpeaker(s.id, s.proposedName!)}
+                        onClick={() => void confirmName(s.id, s.proposedName!)}
                       >
                         是
                       </button>
@@ -520,6 +553,37 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                         }}
                       >
                         {s.confirmedName ? '改名' : '命名'}
+                      </button>
+                    ))}
+{/* 聲紋比對寧可錯拆也不錯併（§8.1），代價是同一個人可能多出一列。
+                      這裡是把它改回來的地方；合併只是別名，片段的 id 不變。 */}
+                  {!isPending &&
+                    naming !== s.id &&
+                    (merging === s.id ? (
+                      <select
+                        className="spk-input"
+                        autoFocus
+                        defaultValue=""
+                        onBlur={() => setMerging(null)}
+                        onChange={(e) => void submitMerge(s.id, e.target.value)}
+                      >
+                        <option value="">併入誰…</option>
+                        {roster
+                          .filter((x) => x.id !== s.id && x.id !== UNKNOWN_REMOTE)
+                          .map((x) => (
+                            <option key={x.id} value={x.id}>
+                              {displayName(x, model.speakers)}
+                            </option>
+                          ))}
+                      </select>
+                    ) : (
+                      <button
+                        className="mini"
+                        disabled={!canName || s.id === UNKNOWN_REMOTE || mergeTargets < 1}
+                        title="這一列其實是名單上的另一個人"
+                        onClick={() => setMerging(s.id)}
+                      >
+                        併入
                       </button>
                     ))}
                 </div>

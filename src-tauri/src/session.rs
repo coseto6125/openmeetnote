@@ -99,6 +99,13 @@ pub enum SessionEvent {
         speaker_id: String,
         name: String,
     },
+    /// 兩位語者其實是同一個人。來源那一列從名單上消失，但它的 id 留在片段
+    /// 上：合併是讀取時才套用的別名，不是對過去的改寫（§8.1）。
+    SpeakerMerged {
+        seq: u64,
+        from_speaker_id: String,
+        into_speaker_id: String,
+    },
     SnapshotCreated {
         seq: u64,
         version: u32,
@@ -162,6 +169,7 @@ impl SessionEvent {
             | SessionEvent::NoteAdded { seq, .. }
             | SessionEvent::SpeakerProposed { seq, .. }
             | SessionEvent::SpeakerConfirmed { seq, .. }
+            | SessionEvent::SpeakerMerged { seq, .. }
             | SessionEvent::SnapshotCreated { seq, .. }
             | SessionEvent::GenerationCompleted { seq, .. }
             | SessionEvent::GenerationFailed { seq, .. }
@@ -198,9 +206,18 @@ pub struct SessionEventBatch {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandReceipt {
+    /// 這個命令有沒有發生。false 代表什麼都沒改，畫面該把使用者的輸入留著。
     pub accepted: bool,
     pub seq: Option<u64>,
     pub note: Option<String>,
+    /// 發生了，但還沒進日誌。
+    ///
+    /// 命令是先改記憶體、再寫日誌的，而寫失敗的那一批會排回佇列等重試。
+    /// 只有「接受／拒絕」兩種答案時，這個中間狀態一定會講錯其中一邊：說
+    /// 接受，使用者相信一件可能不會發生的事；說拒絕，他會再送一次，而原本
+    /// 那一筆稍後重試成功 —— 於是有了兩筆。第三種答案是唯一誠實的說法：
+    /// 「記下了，但還沒存進去」。
+    pub pending: bool,
 }
 
 impl CommandReceipt {
@@ -209,6 +226,16 @@ impl CommandReceipt {
             accepted: true,
             seq: Some(seq),
             note: None,
+            pending: false,
+        }
+    }
+    /// 做了，但沒有產生事件，所以沒有「落地與否」這回事。
+    fn applied() -> Self {
+        Self {
+            accepted: true,
+            seq: None,
+            note: None,
+            pending: false,
         }
     }
     fn rejected(note: &str) -> Self {
@@ -216,6 +243,7 @@ impl CommandReceipt {
             accepted: false,
             seq: None,
             note: Some(note.to_owned()),
+            pending: false,
         }
     }
 }
@@ -258,6 +286,9 @@ pub struct ProjectedSpeaker {
     pub proposed_name: Option<String>,
     pub confirmed_name: Option<String>,
     pub track: Track,
+    /// 這一列被併進了誰。重新同步時少了它，畫面上被併掉的語者會整個
+    /// 復活成一位獨立的人。
+    pub merged_into: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -505,6 +536,9 @@ struct SpeakerRecord {
     proposed_name: Option<String>,
     confirmed_name: Option<String>,
     track: Track,
+    /// 被併進了誰。這一列不刪掉：片段上留著它的 id，刪了那些片段就查不到
+    /// 是誰講的，而且名單一縮，下一位語者會拿到別人已經在用的編號。
+    merged_into: Option<String>,
 }
 
 struct SegmentRecord {
@@ -555,6 +589,8 @@ pub struct Session {
     /// 日誌寫入失敗。發生後拒絕所有會產生新事件的命令：
     /// 繼續接受命令等於讓使用者以為內容有被保存。
     journal_error: Option<String>,
+    /// 已經確定寫進日誌的最大 seq。收據靠它分辨「已存」與「還沒存」。
+    durable_seq: u64,
     /// 這場會議的文件 id，第一次生成時由 Store 配發後記住。
     /// 號碼本身不在這裡產生 —— 見 `Store::allocate_run_ids`。
     document_id: Option<i64>,
@@ -599,6 +635,7 @@ impl Session {
             pending: Vec::new(),
             journal: Vec::new(),
             journal_error: None,
+            durable_seq: 0,
             document_id: None,
             run_ids: HashMap::new(),
             source,
@@ -628,6 +665,11 @@ impl Session {
     }
 
     /// 取走待寫入的日誌。呼叫端負責寫進 Store，失敗時用 `journal_failed` 回報。
+    /// 取走待寫入的日誌。呼叫端負責寫進 Store，失敗時用 `journal_failed` 回報。
+    ///
+    /// 這一批涵蓋到的最大 seq 就是 `self.seq`：`record` 是唯一配發 seq 的
+    /// 地方，也是唯一往 journal 推東西的地方，所以佇列裡最後一筆永遠帶著
+    /// 目前的 seq。`flush` 在同一次上鎖裡把兩者一起取走。
     fn take_journal(&mut self) -> Vec<(DomainEvent, Timeline)> {
         std::mem::take(&mut self.journal)
     }
@@ -637,8 +679,18 @@ impl Session {
     /// 不放回的話那批就永遠不在事件日誌裡了。磁碟滿了、防毒鎖檔這類問題
     /// 通常幾秒後就恢復，而事件日誌是唯一真實來源 —— 中間缺一段，之後從
     /// 日誌重建投影就少了那幾句話，而且 store 的 high_seq 會從此落後。
-    fn journal_failed(&mut self, reason: String, batch: Vec<(DomainEvent, Timeline)>) {
+    fn journal_failed(
+        &mut self,
+        meeting: MeetingId,
+        reason: String,
+        batch: Vec<(DomainEvent, Timeline)>,
+    ) {
         self.journal_error.get_or_insert(reason);
+        // 這一批屬於已經換掉的那一場。放回佇列的話，下一次 flush 會把它寫進
+        // 新會議底下 —— 兩場會議的內容就此混在一起。
+        if self.meeting_id != Some(meeting) {
+            return;
+        }
         // 放回開頭：事件的順序就是它的意義，重試不能把後來的排到前面
         let mut restored = batch;
         restored.append(&mut self.journal);
@@ -649,15 +701,16 @@ impl Session {
     ///
     /// 只有在積壓的事件全部寫進去之後才呼叫，否則畫面上的警示會在資料
     /// 其實還沒落地的時候就消失。
-    fn journal_recovered(&mut self) {
+    fn journal_recovered(&mut self, durable_seq: u64) {
         self.journal_error = None;
+        self.durable_seq = self.durable_seq.max(durable_seq);
     }
 
     /// 日誌寫不進去時，任何會產生新事件的命令都必須拒絕。
     fn journal_guard(&self) -> Option<CommandReceipt> {
         self.journal_error
             .as_ref()
-            .map(|e| CommandReceipt::rejected(&format!("內容無法寫入本機資料庫：{e}")))
+            .map(|e| CommandReceipt::rejected(&journal_note(e)))
     }
 
     /// xorshift：只用來讓 Fixture 的音量看起來像真的，不需要密碼學品質。
@@ -854,7 +907,10 @@ impl Session {
         if self.speakers.contains_key(speaker_id) {
             return;
         }
-        let ordinal = self.speakers.len() as u32 + 1;
+        // 從最大的編號往上長，不從人數。人數會因為任何一次刪除而縮回去，
+        // 下一位語者就拿到某位在場者已經持有的編號，兩個人在畫面上變成
+        // 同一個「語者 N」—— 而合併會是第一個讓名單變短的操作。
+        let ordinal = self.speakers.values().map(|s| s.ordinal).max().unwrap_or(0) + 1;
         self.speakers.insert(
             speaker_id.to_owned(),
             SpeakerRecord {
@@ -862,6 +918,7 @@ impl Session {
                 proposed_name: None,
                 confirmed_name: None,
                 track,
+                merged_into: None,
             },
         );
         let id = speaker_id.to_owned();
@@ -1190,6 +1247,7 @@ impl Session {
                         proposed_name: r.proposed_name.clone(),
                         confirmed_name: r.confirmed_name.clone(),
                         track: r.track,
+                        merged_into: r.merged_into.clone(),
                     })
                     .collect();
                 v.sort_by_key(|s| s.ordinal);
@@ -1330,6 +1388,68 @@ impl Session {
                 seq,
                 speaker_id: id,
                 name,
+            },
+        );
+        CommandReceipt::ok(seq)
+    }
+
+    /// 把一位語者併進另一位：他們其實是同一個人。
+    ///
+    /// 聲紋比對會把同一個人拆成兩位。口罩、離麥克風遠一點、感冒，都足以讓
+    /// 一段話的相似度掉到 `SAME_SPEAKER` 以下，而 `stt::speakers` 的 `judge`
+    /// 對夠長的片段就是「不夠像就是別人」。那個取捨（寧可錯拆也不錯併）只有
+    /// 在錯拆改得掉的時候才成立，這個命令就是改的那條路。
+    ///
+    /// 合併只寫在來源那一列上。片段不改派、id 不改寫：改寫會回溯改變早於
+    /// 這次合併的快照，一份已經匯出的紀錄因此改口說是別人講的。每條讀取
+    /// 路徑各自依游標套用別名（§8.1）。
+    pub fn merge_speaker(&mut self, from: &str, into: &str) -> CommandReceipt {
+        if !self.state.accepts_speaker_naming() {
+            return CommandReceipt::rejected("目前的會議狀態不接受語者合併");
+        }
+        // journal_guard 要在領域檢查之前，理由同 confirm_speaker
+        if let Some(r) = self.journal_guard() {
+            return r;
+        }
+        if from == into {
+            return CommandReceipt::rejected("不能把語者併進自己");
+        }
+        for id in [from, into] {
+            if !self.speakers.contains_key(id) {
+                return CommandReceipt::rejected("尚未聽到這位語者發言");
+            }
+        }
+        // 兩個方向都不行。把它併進某一位，它底下每一個分不出來的人就全部
+        // 變成那一位；把別人併進它，那個人就消失在一團未知裡（§8.1）。
+        if from == crate::model::UNKNOWN_REMOTE || into == crate::model::UNKNOWN_REMOTE {
+            return CommandReceipt::rejected("「遠端」不是單一語者，無法合併");
+        }
+        // 已經有出向別名的那一列不能再當來源或目標。這擋掉的是循環：A 併進 B
+        // 之後 B 併進 A，`into` 那一邊會撞上這條而被拒絕。
+        //
+        // 它擋不掉鏈：A→B 之後再把 B 併進 C 是允許的，因為 B 自己還沒有出向
+        // 別名。那是刻意的 —— 三列其實是同一個人時，使用者本來就該併得完。
+        // 解析端順著走到根，鏈多長都收斂到同一位。
+        for id in [from, into] {
+            if self.speakers[id].merged_into.is_some() {
+                return CommandReceipt::rejected("這位語者已經併進別人了");
+            }
+        }
+        // 來源的名字不帶走：使用者選的是「併進哪一位」，目標怎麼稱呼由目標
+        // 自己決定，否則合併會順手改掉一個他沒打算改的名字。
+        let (from, into) = (from.to_owned(), into.to_owned());
+        if let Some(rec) = self.speakers.get_mut(&from) {
+            rec.merged_into = Some(into.clone());
+        }
+        let seq = self.record(
+            DomainEvent::SpeakerMerged {
+                from_speaker_id: from.clone(),
+                into_speaker_id: into.clone(),
+            },
+            |seq| SessionEvent::SpeakerMerged {
+                seq,
+                from_speaker_id: from,
+                into_speaker_id: into,
             },
         );
         CommandReceipt::ok(seq)
@@ -1569,21 +1689,23 @@ impl Session {
 
     pub fn inject_fault(&mut self, kind: &str, ids: crate::store::RunIds) -> CommandReceipt {
         match kind {
+            // 這四個只改記憶體裡的健康狀態，不產生事件。借用目前的 seq 的話，
+            // 收據會宣稱「已經寫進日誌」，而它根本不在日誌裡，也不會重試。
             "micLost" => {
                 self.mic_health = Health::Lost;
-                CommandReceipt::ok(self.seq)
+                CommandReceipt::applied()
             }
             "micRestored" => {
                 self.mic_health = Health::Ok;
-                CommandReceipt::ok(self.seq)
+                CommandReceipt::applied()
             }
             "sttDown" => {
                 self.stt_health = Health::Degraded;
-                CommandReceipt::ok(self.seq)
+                CommandReceipt::applied()
             }
             "sttUp" => {
                 self.stt_health = Health::Ok;
-                CommandReceipt::ok(self.seq)
+                CommandReceipt::applied()
             }
             "generationFailed" => {
                 if !self.state.accepts_document_work() {
@@ -1655,6 +1777,13 @@ pub struct SessionHandle {
     /// 用獨立的鎖而不是把整段包進 `inner`：開裝置與載入模型要好幾秒，
     /// 期間 Session 的鎖必須是放開的，事件迴圈還在跑。
     starting: Mutex<()>,
+    /// 一次只有一個 flusher。
+    ///
+    /// 兩個 flusher 同時在途時，「水位推到 high_seq 代表它以下也都寫成功了」
+    /// 這個前提就不成立：A 拿走 1..10、B 拿走 11，B 先成功把水位推到 11，
+    /// A 之後才失敗 —— 收據於是說第 5 筆已經落地，而它並不在日誌裡。
+    /// 事件泵與命令是兩條各自呼叫 `flush` 的路，所以這是真的會發生的交錯。
+    flushing: Mutex<()>,
 }
 
 impl Default for SessionHandle {
@@ -1663,6 +1792,7 @@ impl Default for SessionHandle {
             inner: Mutex::new(Session::default()),
             epoch: Instant::now(),
             starting: Mutex::new(()),
+            flushing: Mutex::new(()),
         }
     }
 }
@@ -1698,15 +1828,16 @@ impl SessionHandle {
             inner: Mutex::new(session),
             epoch: Instant::now(),
             starting: Mutex::new(()),
+            flushing: Mutex::new(()),
         }
     }
 
     /// 換上全新的 Session。結束後開新會議走這條路，
     /// 而不是重置欄位：漏掉一個欄位就會把上一場的片段帶進新會議。
-    fn reset(&self) {
-        if let Ok(mut g) = self.inner.lock() {
-            *g = Session::default();
-        }
+    fn reset(&self) -> Result<(), PoisonedSession> {
+        let mut g = self.inner.lock().map_err(|_| PoisonedSession)?;
+        *g = Session::default();
+        Ok(())
     }
 }
 
@@ -1722,14 +1853,20 @@ const POISONED_NOTE: &str = "工作階段狀態已損毀，請重新啟動應用
 /// 全程只有這一個 append 呼叫點，事件的持久化順序因此等同 `record` 的順序。
 /// 寫入失敗會標記 Session，之後所有產生新事件的命令都被拒絕：讓使用者
 /// 以為內容有被保存，比直接說寫不進去糟得多。
-pub fn flush(session: &SessionHandle, store: &StoreHandle) {
-    let Ok(Some((meeting, batch))) =
-        session.with(|s| s.meeting_id().map(|m| (m, s.take_journal())))
+pub fn flush(session: &SessionHandle, store: &StoreHandle) -> Result<(), String> {
+    // 排隊，不要並行。理由寫在 `SessionHandle::flushing` 上。鎖中毒時 Err
+    // 裡面一樣握著 guard，排隊照樣成立。
+    let _one_at_a_time = session.flushing.lock();
+    let Ok(Some((meeting, high_seq, batch))) =
+        session.with(|s| s.meeting_id().map(|m| (m, s.seq, s.take_journal())))
     else {
-        return;
+        return Ok(());
     };
     if batch.is_empty() {
-        return;
+        // 佇列空的不代表這個命令的事件已經落地 —— 事件泵可能剛把它拿走。
+        // 這裡不宣稱任何事，由 `acknowledge` 去問 `durable_seq`：問不到就
+        // 保守說「還沒存」，而那句話會被下一次成功的寫入收掉。
+        return Ok(());
     }
     let result = match store.exclusive() {
         Ok(mut st) => st.append(meeting, &batch).map_err(|e| e.to_string()),
@@ -1738,23 +1875,68 @@ pub fn flush(session: &SessionHandle, store: &StoreHandle) {
     match result {
         // 積壓的事件都寫進去了才收掉警示
         Ok(_) => {
-            let _ = session.with(|s| s.journal_recovered());
+            let _ = session.with(|s| s.journal_recovered(high_seq));
+            Ok(())
         }
         Err(reason) => {
-            let _ = session.with(|s| s.journal_failed(reason, batch));
+            let _ = session.with(|s| s.journal_failed(meeting, reason.clone(), batch));
+            Err(reason)
         }
     }
 }
 
-fn command<F>(state: &State<SessionHandle>, store: &State<StoreHandle>, f: F) -> CommandReceipt
+/// 日誌寫不進去時對使用者說的那句話。
+///
+/// 收據、橫幅與後續命令的拒絕理由共用它。同一次失敗在三個地方講成三種說法，
+/// 使用者會以為是三件事，而其中兩件他找不到對應的動作。
+fn journal_note(reason: &str) -> String {
+    format!("內容無法寫入本機資料庫：{reason}")
+}
+
+/// 收據要等事件真的落地才敢說「接受」。
+///
+/// 命令是先改記憶體、再寫日誌的。中間失敗時那筆事件已經送到 UI，也已經排回
+/// 佇列等重寫，但它此刻並不在日誌裡 —— 使用者關掉程式就永遠不會在。回報成功
+/// 等於讓他相信一件沒發生的事，下次開啟才發現不見了。`journal_error` 只擋得住
+/// **後續**的命令，撞上失敗的那一個本來是報成功的。
+fn acknowledge(
+    state: &SessionHandle,
+    mut receipt: CommandReceipt,
+    flushed: Result<(), String>,
+) -> CommandReceipt {
+    // 被拒絕的命令沒有產生事件，也就沒有落地與否的問題
+    let Some(seq) = receipt.seq.filter(|_| receipt.accepted) else {
+        return receipt;
+    };
+    // 問的是「我這一筆的 seq 進去了沒」，不是「我剛才那次 flush 成不成功」。
+    // 後者答不了：事件泵可能搶先把這一批拿走，於是這裡的 flush 看見空佇列
+    // 而回報成功，真正的寫入卻在別的執行緒失敗。
+    let durable = state.with(|s| s.durable_seq).unwrap_or(0);
+    if durable >= seq {
+        return receipt;
+    }
+    let reason = flushed
+        .err()
+        .or_else(|| state.with(|s| s.journal_error.clone()).ok().flatten());
+    receipt.pending = true;
+    receipt.note = Some(match reason {
+        Some(e) => journal_note(&e),
+        None => "已記下，但還沒寫進本機資料庫".to_owned(),
+    });
+    receipt
+}
+
+/// 取 `&SessionHandle` 而不是 `&State<…>`：`State` 會自動解參考，呼叫端一個字
+/// 都不用改，而測試不必為了走這條路去組一個 Tauri 的執行環境。這條路徑決定
+/// 每個命令回報成功或失敗，先前它沒有任何測試蓋得到。
+fn command<F>(state: &SessionHandle, store: &StoreHandle, f: F) -> CommandReceipt
 where
     F: FnOnce(&mut Session) -> CommandReceipt,
 {
     let receipt = state
         .with(f)
         .unwrap_or_else(|_| CommandReceipt::rejected(POISONED_NOTE));
-    flush(state, store);
-    receipt
+    acknowledge(state, receipt, flush(state, store))
 }
 
 /// 依 Provider 設定挑出這一輪要用的 Planner。
@@ -2032,7 +2214,7 @@ pub fn spawn_pump(app: AppHandle) {
             }
             // 先落地再送 UI：畫面上出現的內容必須已經寫進資料庫，
             // 反過來的話崩潰之後畫面看過的東西會消失。
-            flush(&handle, &app.state::<StoreHandle>());
+            let _ = flush(&handle, &app.state::<StoreHandle>());
             // emit 在鎖外，避免 WebView 的序列化成本拖住命令處理。
             let _ = app.emit(EVENT_CHANNEL, batch);
         }
@@ -2127,6 +2309,19 @@ pub fn start_meeting(
     command(&state, &store, |s| s.start(meeting))
 }
 
+/// 兩位語者其實是同一個人。
+#[tauri::command]
+pub fn merge_speaker(
+    state: State<SessionHandle>,
+    store: State<StoreHandle>,
+    from_speaker_id: String,
+    into_speaker_id: String,
+) -> CommandReceipt {
+    command(&state, &store, |s| {
+        s.merge_speaker(&from_speaker_id, &into_speaker_id)
+    })
+}
+
 #[tauri::command]
 pub fn pause_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> CommandReceipt {
     command(&state, &store, |s| s.pause())
@@ -2174,20 +2369,8 @@ pub fn create_snapshot(
     prompt: Option<String>,
 ) -> CommandReceipt {
     let prompt = prompt.unwrap_or_default();
-    // 配發在這裡而不是 Session 裡：號碼是全域的，只能有一個配發者，
-    // 而 Session 看不到別場會議正在用哪些號碼
-    let ids = match store.exclusive().map(|mut st| st.allocate_run_ids()) {
-        Ok(Ok(ids)) => ids,
-        _ => return CommandReceipt::rejected("資料庫連線狀態已損毀"),
-    };
-    let outcome = state.with(|s| s.create_snapshot(&prompt, ids));
-    let (receipt, snapshot) = match outcome {
-        Ok(v) => v,
-        Err(_) => return CommandReceipt::rejected(POISONED_NOTE),
-    };
-    // 先讓 SnapshotCreated 落地，生成才有一個已持久化的游標可以依附
-    flush(&state, &store);
-    let Some(work) = snapshot else {
+    let (receipt, work) = open_snapshot(&state, &store, &prompt);
+    let Some(work) = work else {
         return receipt;
     };
     let version = work.version;
@@ -2254,10 +2437,59 @@ pub fn create_snapshot(
                     Some("生成工作異常結束".to_owned()),
                 )
             });
-            flush(&session, &store);
+            let _ = flush(&session, &store);
         }
     });
     receipt
+}
+
+/// 凍結一個快照游標，並確定它已經寫進資料庫。
+///
+/// 回傳的工作是 `Some` 才可以開始生成。`#[tauri::command]` 的參數形狀由
+/// Tauri 決定，這一段拆出來測試才進得去 —— 而它守的正是「游標沒落地就不
+/// 生成」這條規則。
+fn open_snapshot(
+    state: &SessionHandle,
+    store: &StoreHandle,
+    prompt: &str,
+) -> (CommandReceipt, Option<SnapshotWork>) {
+    // 配發在這裡而不是 Session 裡：號碼是全域的，只能有一個配發者，
+    // 而 Session 看不到別場會議正在用哪些號碼
+    let ids = match store.exclusive().map(|mut st| st.allocate_run_ids()) {
+        Ok(Ok(ids)) => ids,
+        _ => return (CommandReceipt::rejected("資料庫連線狀態已損毀"), None),
+    };
+    let outcome = state.with(|s| s.create_snapshot(prompt, ids));
+    let (receipt, snapshot) = match outcome {
+        Ok(v) => v,
+        Err(_) => return (CommandReceipt::rejected(POISONED_NOTE), None),
+    };
+    // 先讓 SnapshotCreated 落地，生成才有一個已持久化的游標可以依附
+    let receipt = acknowledge(state, receipt, flush(state, store));
+    let Some(work) = snapshot else {
+        return (receipt, None);
+    };
+    if receipt.accepted && !receipt.pending {
+        return (receipt, Some(work));
+    }
+    // 游標沒落地就不生成：成果會綁在一個資料庫裡不存在的 run 上。這一版
+    // 仍然必須有結局，否則畫面永遠停在「生成中」，而那個狀態沒有出口。
+    let reason = receipt
+        .note
+        .clone()
+        .unwrap_or_else(|| "快照沒有寫進資料庫".to_owned());
+    let _ = state.with(|s| {
+        s.finish_generation(
+            work.version,
+            Vec::new(),
+            serde_json::json!({}),
+            Some(reason),
+        )
+    });
+    // 這個結局本身也要試著落地。只留在記憶體的話，資料庫裡那一版停在
+    // running，而畫面說它失敗了 —— 重開之後又變成永遠生成中。
+    let _ = flush(state, store);
+    (receipt, None)
 }
 
 /// 一輪摘要生成的完整編排。
@@ -2327,7 +2559,7 @@ pub fn run_generation(
             // 量之前先排一次 journal：生成期間定稿的逐字稿可能還在記憶體裡
             // 等著寫，資料庫這時候查是查不到的，而它們馬上就會跟
             // GenerationCompleted 在同一次 flush 落地。
-            flush(session, store);
+            let _ = flush(session, store);
             let uncovered = store
                 .exclusive()
                 .ok()
@@ -2359,7 +2591,7 @@ pub fn run_generation(
             s.finish_generation(version, Vec::new(), serde_json::json!({}), Some(reason))
         }),
     };
-    flush(session, store);
+    let _ = flush(session, store);
 }
 
 /// 某個摘要版本的成果區塊。
@@ -2644,16 +2876,56 @@ where
 /// 結束後開新會議。沿用同一個 Session 會把上一場的片段與快照帶進來。
 #[tauri::command]
 pub fn new_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> CommandReceipt {
-    // 先讓舊 Session 把還在跑的生成收乾淨並落地，再換掉它。順序不能反：
-    // reset 之後那些 run 就沒有收尾的地方了。
-    let _ = state.with(|s| s.abandon_running_generations());
-    flush(&state, &store);
-    state.reset();
+    start_new_meeting(&state, &store)
+}
+
+/// `new_meeting` 的本體。`#[tauri::command]` 的參數形狀由 Tauri 決定，
+/// 拆出來測試才進得去。
+fn start_new_meeting(state: &SessionHandle, store: &StoreHandle) -> CommandReceipt {
+    // 先確定舊 Session 的積壓寫得出去，才動它。順序不能反：
+    // `abandon_running_generations` 會把還在跑的版本判死，而這個命令可能因為
+    // 寫不出去而被拒絕 —— 被拒絕的命令不該留下痕跡。先擋一次，那一步就只在
+    // 磁碟當下寫得動的時候才發生。
+    if let Some(r) = written_out(state, store) {
+        return r;
+    }
+    // 收尾還在跑的生成。不收的話，背景工作完成時 Session 已經換掉，找不到
+    // 自己的 run_id，事件永遠不會寫入，歷史頁那一版永遠顯示「生成中」。
+    if state.with(|s| s.abandon_running_generations()).is_err() {
+        return CommandReceipt::rejected(POISONED_NOTE);
+    }
+    // 收尾事件本身也要落地才能換：reset 會丟掉排回佇列等重寫的那批。
+    // 這一次失敗代表那些版本已經被判死而新會議沒開成 —— 事件還排著重試，
+    // 狀態不會憑空消失，但這個順序上的縫補不掉。
+    if let Some(r) = written_out(state, store) {
+        return r;
+    }
+    if state.reset().is_err() {
+        return CommandReceipt::rejected(POISONED_NOTE);
+    }
     CommandReceipt {
         accepted: true,
         seq: Some(0),
         note: None,
+        pending: false,
     }
+}
+
+/// 這個 Session 到目前為止的事件都進日誌了嗎？沒有的話回一張拒絕收據。
+///
+/// 問的是「到此為止的全部」，所以門檻是它現在的 seq。
+fn written_out(state: &SessionHandle, store: &StoreHandle) -> Option<CommandReceipt> {
+    let Ok(high_seq) = state.with(|s| s.seq) else {
+        return Some(CommandReceipt::rejected(POISONED_NOTE));
+    };
+    let flushed = flush(state, store);
+    let out = acknowledge(state, CommandReceipt::ok(high_seq), flushed);
+    out.pending.then(|| {
+        CommandReceipt::rejected(
+            &out.note
+                .unwrap_or_else(|| "上一場還沒寫進本機資料庫".to_owned()),
+        )
+    })
 }
 
 /// UI 偵測到事件缺號或重新載入時，用完整投影重建，而不是帶著破洞繼續套用增量。
@@ -3419,9 +3691,39 @@ mod tests {
         assert!(!batch.is_empty(), "測試前提不成立：應該要有待寫入的事件");
         let n = batch.len();
 
-        s.journal_failed("磁碟已滿".into(), batch);
+        let m = s.meeting_id().expect("recording() 應該有一場會議");
+        s.journal_failed(m, "磁碟已滿".into(), batch);
 
         assert_eq!(s.take_journal().len(), n, "失敗的那批事件被丟掉了");
+    }
+
+    /// 換過會議之後，舊的那一批不准倒進新會議。
+    ///
+    /// 寫入失敗的批次會排回佇列等重試。中間如果換了會議，那些事件會在下一次
+    /// flush 被寫到新會議底下 —— 兩場的內容混在一起，而且是靜悄悄地。
+    #[test]
+    fn test_a_failed_batch_is_not_requeued_into_a_different_meeting() {
+        let mut s = recording();
+        s.add_note("上一場的話");
+        let old_meeting = s.meeting_id().expect("recording() 應該有一場會議");
+        let batch = s.take_journal();
+        assert!(!batch.is_empty(), "測試前提不成立：應該要有待寫入的事件");
+
+        // 這個 Session 現在錄的是另一場了
+        let mut s = Session::default();
+        assert!(s.start(old_meeting + 1).accepted);
+        s.take_journal();
+
+        s.journal_failed(old_meeting, "磁碟已滿".into(), batch);
+
+        assert!(
+            s.take_journal().is_empty(),
+            "上一場的事件被排進新會議的佇列了"
+        );
+        assert!(
+            s.journal_error.is_some(),
+            "還是要留下警示：那一批確實沒寫進去"
+        );
     }
 
     /// 重試時順序不能亂：事件的順序就是它的意義
@@ -3432,7 +3734,8 @@ mod tests {
         let first = s.take_journal();
         s.add_note("後講的");
 
-        s.journal_failed("磁碟已滿".into(), first);
+        let m = s.meeting_id().expect("recording() 應該有一場會議");
+        s.journal_failed(m, "磁碟已滿".into(), first);
 
         let all = s.take_journal();
         let texts: Vec<&str> = all
@@ -3449,10 +3752,251 @@ mod tests {
     #[test]
     fn test_the_write_error_banner_clears_only_after_a_successful_flush() {
         let mut s = recording();
-        s.journal_failed("磁碟已滿".into(), Vec::new());
+        let m = s.meeting_id().unwrap_or_default();
+        s.journal_failed(m, "磁碟已滿".into(), Vec::new());
         assert!(s.journal_error.is_some());
-        s.journal_recovered();
+        s.journal_recovered(s.seq);
         assert!(s.journal_error.is_none());
+    }
+
+    /* ── 收據要說實話 ─────────────────────────────────────── */
+
+    /// 一場不在資料庫裡的會議。事件無處可落，`append` 撞上外鍵而失敗。
+    fn a_session_whose_writes_cannot_land() -> SessionHandle {
+        let mut s = Session::default();
+        assert!(s.start(4242).accepted);
+        // 丟掉 start 的事件，留下的批次只有待測的那一筆
+        s.take_journal();
+        SessionHandle::from_session(s)
+    }
+
+    /// 撞上寫入失敗的那一個命令要說「還沒存」，不是「已接受」也不是「沒送出」。
+    ///
+    /// `journal_error` 只擋得住**後續**的命令。第一個命令是先改記憶體、送 UI，
+    /// 才輪到寫入，於是它拿到一張「已接受」的收據，而內容不在日誌裡 —— 重開
+    /// 之後就不見了，而使用者當時看到的是成功。
+    ///
+    /// 反過來直接說「拒絕」也不行：那一筆還排在佇列裡等重試，使用者依拒絕
+    /// 再送一次，兩筆都會落地。
+    #[test]
+    fn test_the_command_that_hits_the_write_failure_says_it_is_not_saved_yet() {
+        let store = StoreHandle::temp().unwrap();
+        let session = a_session_whose_writes_cannot_land();
+
+        let r = command(&session, &store, |s| s.add_note("寫不進去的一筆"));
+
+        assert!(r.pending, "日誌沒落地，收據卻沒說");
+        assert!(r.accepted, "它確實被記下了，說沒送出會讓使用者再送一次");
+        assert!(
+            r.note.unwrap_or_default().contains("無法寫入"),
+            "理由要說出寫不進去，使用者才知道該去看磁碟"
+        );
+    }
+
+    /// 事件泵搶先把這一批拿走時，收據問的仍然是自己那個 seq。
+    ///
+    /// 先前 `flush` 看見空佇列就回報成功，於是命令拿到「已接受」，而真正的
+    /// 寫入在別的執行緒失敗 —— 收據說成功，事件不在日誌裡。
+    #[test]
+    fn test_a_receipt_asks_about_its_own_seq_not_about_whoever_flushed() {
+        let store = StoreHandle::temp().unwrap();
+        let session = a_session_whose_writes_cannot_land();
+        let receipt = session.with(|s| s.add_note("別人會搶走這一筆")).unwrap();
+        // 事件泵搶走了這一批：本命令的 flush 只會看到空佇列
+        let _ = session.with(|s| s.take_journal());
+
+        let out = acknowledge(&session, receipt, flush(&session, &store));
+
+        assert!(out.pending, "佇列空的被當成「已經落地」了");
+    }
+
+    /// 命令自己就被拒絕時，理由要留著它原本那一個。
+    #[test]
+    fn test_a_domain_rejection_keeps_its_own_reason() {
+        let store = StoreHandle::temp().unwrap();
+        let session = a_session_whose_writes_cannot_land();
+
+        let r = command(&session, &store, |s| s.add_note("   "));
+
+        assert!(!r.accepted);
+        assert_eq!(r.note.as_deref(), Some("筆記內容為空"));
+    }
+
+    /// 寫入正常時收據照常是接受的。拿寫入失敗當藉口把每個命令都拒掉，
+    /// 修的就不是同一個問題了。
+    #[test]
+    fn test_a_command_whose_event_lands_is_still_accepted() {
+        let store = StoreHandle::temp().unwrap();
+        let m = store.exclusive().unwrap().create_meeting("測試").unwrap();
+        let mut s = Session::default();
+        assert!(s.start(m).accepted);
+        let session = SessionHandle::from_session(s);
+
+        let r = command(&session, &store, |s| s.add_note("這一筆寫得進去"));
+
+        assert!(r.accepted, "{:?}", r.note);
+        assert!(!r.pending, "事件已經落地了，收據卻說還沒存");
+        assert!(session.with(|s| s.journal_error.clone()).unwrap().is_none());
+    }
+
+    /// 開新會議前的那一次 flush 失敗就不能換 Session。
+    ///
+    /// `reset` 會丟掉排回佇列等重寫的那批，上一場的結尾因此永遠不進日誌，
+    /// 而畫面上顯示的是新會議已經開好了。
+    #[test]
+    fn test_a_new_meeting_waits_until_the_previous_one_is_written_out() {
+        let store = StoreHandle::temp().unwrap();
+        let session = a_session_whose_writes_cannot_land();
+        let _ = session.with(|s| s.add_note("上一場的最後一句"));
+
+        let r = start_new_meeting(&session, &store);
+
+        assert!(!r.accepted, "寫不進去卻換掉了 Session，上一場的結尾就沒了");
+        assert_eq!(
+            session.with(|s| s.meeting_id()).unwrap(),
+            Some(4242),
+            "被拒絕的命令不該把 Session 換掉"
+        );
+    }
+
+    /// 游標沒寫進資料庫就不能開始生成，而那一版必須有結局。
+    ///
+    /// 開始生成的話，成果會綁在一個資料庫裡不存在的 run 上；不給結局的話，
+    /// 畫面永遠停在「生成中」，那個狀態沒有出口也沒有重試路徑。
+    #[test]
+    fn test_a_snapshot_whose_cursor_never_landed_does_not_start_generating() {
+        let store = StoreHandle::temp().unwrap();
+        let session = a_session_whose_writes_cannot_land();
+
+        let (receipt, work) = open_snapshot(&session, &store, "整理重點");
+
+        assert!(receipt.pending, "游標沒落地，收據卻沒說");
+        assert!(work.is_none(), "游標沒落地卻交出了可以開始生成的工作");
+        let p = session.with(|s| s.projection()).unwrap();
+        assert_eq!(
+            p.snapshots.last().map(|x| x.state),
+            Some("failed"),
+            "這一版沒有結局，畫面會永遠停在生成中"
+        );
+    }
+
+    /* ── 語者編號 ─────────────────────────────────────────── */
+
+    /// 編號從最大的往上長，不從人數。
+    ///
+    /// 人數會因為任何一次刪除而縮回去，下一位語者就拿到某位在場者已經持有的
+    /// 編號，兩個人在畫面上變成同一個「語者 N」。今天沒有任何路徑會讓名單
+    /// 變短，所以這是潛伏的；合併原本會是第一個。
+    #[test]
+    fn test_a_new_speaker_never_takes_an_ordinal_someone_still_holds() {
+        let mut s = recording();
+        s.ensure_speaker("s1", Track::Mic);
+        s.ensure_speaker("s2", Track::System);
+        s.ensure_speaker("s3", Track::System);
+        // 名單變短：從哪裡短的不重要，重要的是編號不能跟著退回去
+        s.speakers.remove("s1");
+
+        s.ensure_speaker("s4", Track::System);
+
+        let ordinals: Vec<u32> = s.speakers.values().map(|r| r.ordinal).collect();
+        let mut unique = ordinals.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ordinals.len(),
+            "有兩位語者拿到同一個編號：{ordinals:?}"
+        );
+    }
+
+    /* ── 語者合併 ─────────────────────────────────────────── */
+
+    fn two_named_speakers() -> Session {
+        let mut s = recording();
+        s.ensure_speaker("s1", Track::System);
+        s.ensure_speaker("s2", Track::System);
+        s.pending.clear();
+        s.take_journal();
+        s
+    }
+
+    /// 合併不刪掉來源那一列。
+    ///
+    /// 片段上留著它的 id（合併是讀取時才套用的別名），刪掉的話那幾句話就
+    /// 查不到是誰講的，而且名單一縮，下一位語者會拿到別人在用的編號。
+    #[test]
+    fn test_a_merge_keeps_the_row_and_records_where_it_went() {
+        let mut s = two_named_speakers();
+
+        assert!(s.merge_speaker("s1", "s2").accepted);
+
+        assert_eq!(
+            s.speakers["s1"].merged_into.as_deref(),
+            Some("s2"),
+            "來源那一列要記下自己併去哪裡"
+        );
+        assert!(
+            s.take_journal().iter().any(
+                |(e, _)| matches!(e, DomainEvent::SpeakerMerged { from_speaker_id, into_speaker_id }
+                    if from_speaker_id == "s1" && into_speaker_id == "s2")
+            ),
+            "合併沒有進日誌，重開之後就不存在了"
+        );
+    }
+
+    /// 「遠端」底下是好幾位分不出來的人，兩個方向都不能合併（§8.1）。
+    #[test]
+    fn test_the_unidentified_remote_speaker_cannot_be_merged_either_way() {
+        let mut s = two_named_speakers();
+        s.ensure_speaker(crate::model::UNKNOWN_REMOTE, Track::System);
+        s.take_journal();
+
+        let out = s.merge_speaker(crate::model::UNKNOWN_REMOTE, "s1");
+        assert!(!out.accepted, "把「遠端」併進某人，底下每個人都變成那一位");
+        let into = s.merge_speaker("s1", crate::model::UNKNOWN_REMOTE);
+        assert!(
+            !into.accepted,
+            "把某人併進「遠端」，那個人就消失在一團未知裡"
+        );
+        assert!(s.take_journal().is_empty(), "被拒絕的合併不該留下事件");
+    }
+
+    /// 併過的那一列不能再當來源或目標。擋在這裡，別名鏈就永遠是一步，
+    /// A→B 再 B→A 這種一鍵做得出來的循環也生不出來。
+    #[test]
+    fn test_a_speaker_that_was_already_merged_cannot_be_merged_again() {
+        let mut s = two_named_speakers();
+        s.ensure_speaker("s3", Track::System);
+        assert!(s.merge_speaker("s1", "s2").accepted);
+        s.take_journal();
+
+        assert!(!s.merge_speaker("s1", "s3").accepted, "來源已經併掉了");
+        assert!(!s.merge_speaker("s2", "s1").accepted, "目標已經併掉了");
+        assert!(s.take_journal().is_empty());
+    }
+
+    #[test]
+    fn test_a_speaker_cannot_be_merged_into_itself_or_into_a_stranger() {
+        let mut s = two_named_speakers();
+        assert!(!s.merge_speaker("s1", "s1").accepted);
+        assert!(!s.merge_speaker("s1", "沒聽過這個人").accepted);
+        assert!(s.take_journal().is_empty());
+    }
+
+    /// 重新同步要看得到合併。少了它，被併掉的語者會整個復活成一位獨立的人。
+    #[test]
+    fn test_a_resync_still_knows_which_speaker_was_merged_away() {
+        let mut s = two_named_speakers();
+        assert!(s.merge_speaker("s1", "s2").accepted);
+
+        let p = s.projection();
+
+        let merged = p
+            .speakers
+            .iter()
+            .find(|x| x.speaker_id == "s1")
+            .expect("被併掉的語者仍要在投影裡：片段上帶著它的 id");
+        assert_eq!(merged.merged_into.as_deref(), Some("s2"));
     }
 
     /// 暫停要真的傳到音訊來源，不能只改 session 的狀態。
@@ -3693,7 +4237,8 @@ mod tests {
     #[test]
     fn test_a_journal_failure_rejects_every_command_that_would_create_events() {
         let (mut s, _store, _m) = with_store();
-        s.journal_failed("磁碟已滿".into(), Vec::new());
+        let m = s.meeting_id().unwrap_or_default();
+        s.journal_failed(m, "磁碟已滿".into(), Vec::new());
         for r in [
             s.add_note("記一筆"),
             s.confirm_speaker("s1", "小明"),
@@ -3834,7 +4379,8 @@ mod tests {
         let (mut s, _store, _m) = with_store();
         s.tick(100);
         s.drain(0);
-        s.journal_failed("磁碟已滿".into(), Vec::new());
+        let m = s.meeting_id().unwrap_or_default();
+        s.journal_failed(m, "磁碟已滿".into(), Vec::new());
         // pending 是空的，但這個批次還是要送，否則畫面會停在「一切正常」
         let batch = s.drain(s.seq);
         assert_eq!(batch.journal_error.as_deref(), Some("磁碟已滿"));
@@ -3843,9 +4389,11 @@ mod tests {
     #[test]
     fn test_the_first_journal_failure_is_the_one_reported() {
         let (mut s, _store, _m) = with_store();
-        s.journal_failed("磁碟已滿".into(), Vec::new());
+        let m = s.meeting_id().unwrap_or_default();
+        s.journal_failed(m, "磁碟已滿".into(), Vec::new());
         // 後續失敗多半是前一個的連鎖反應，換掉原因會蓋掉真正的線索
-        s.journal_failed("資料庫連線狀態已損毀".into(), Vec::new());
+        let m = s.meeting_id().unwrap_or_default();
+        s.journal_failed(m, "資料庫連線狀態已損毀".into(), Vec::new());
         assert_eq!(s.drain(0).journal_error.as_deref(), Some("磁碟已滿"));
     }
 
