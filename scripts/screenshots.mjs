@@ -22,9 +22,9 @@ const VIEWPORT = { width: 1320, height: 860 };
 /* ── 示範會議 ─────────────────────────────────────────────────── */
 
 const SPEAKERS = [
-  { speakerId: 's1', ordinal: 1, proposedName: null, confirmedName: '我', track: 'mic' },
-  { speakerId: 's2', ordinal: 2, proposedName: '沈立群', confirmedName: '沈立群', track: 'system' },
-  { speakerId: 's3', ordinal: 3, proposedName: null, confirmedName: null, track: 'system' },
+  { speakerId: 's1', ordinal: 1, proposedName: null, confirmedName: '我', track: 'mic', mergedInto: null },
+  { speakerId: 's2', ordinal: 2, proposedName: '沈立群', confirmedName: '沈立群', track: 'system', mergedInto: null },
+  { speakerId: 's3', ordinal: 3, proposedName: null, confirmedName: null, track: 'system', mergedInto: null },
 ];
 
 const LINES = [
