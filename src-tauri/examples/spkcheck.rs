@@ -3,8 +3,19 @@
 //! 門檻是這個功能唯一的旋鈕，而它的取捨是不對稱的：分太多位使用者可以手動
 //! 合併，把兩個人併成一位卻會讓會議紀錄把話安到別人頭上。所以要挑的是
 //! 「寧可偏多」那一側的最小值，而不是看起來最漂亮的數字。
+//!
+//! # 兩種用法
+//!
+//! - 單一 wav：掃描門檻，看每個門檻各自分出幾位。
+//! - 多個 wav：回放模式。把它們接成一整場會議，切成跟正式流程一樣長的批次，
+//!   交給真正的 `SpeakerBook` 跑一遍，報告最後登記出幾位、各自被聽到幾次。
+//!   掃描看的是單一旋鈕，回放看的是整組規則在真實會議上的結果 —— 一場 25
+//!   分鐘的三人會議登記出 16 位，就是回放才問得出來的問題。
+
+use std::collections::BTreeMap;
 
 use openmeetnote_lib::stt::load_wav_16k_mono;
+use openmeetnote_lib::stt::speakers::SpeakerBook;
 use sherpa_rs::embedding_manager::EmbeddingManager;
 use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig};
 use sherpa_rs::speaker_id::{EmbeddingExtractor, ExtractorConfig};
@@ -53,9 +64,56 @@ fn utterances(vad_model: &str, samples: &[f32], min_silence: f32) -> Vec<(f32, V
     out
 }
 
+/// 正式流程送進定稿的批次長度，回放要照著切。
+///
+/// 語者只在批次內比對 VAD 切點，批次邊界會把一段發言切成兩半，讓兩邊都變短。
+/// 整段 wav 一次餵進去測不出這件事，而它正是短片段誤登記的來源。
+const BATCH_MS: u64 = 10_000;
+
+/// 用真正的 `SpeakerBook` 把整場會議跑一遍，看規則實際登記出幾位。
+fn replay(wavs: &[String], bench: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut samples = Vec::new();
+    for w in wavs {
+        samples.extend(load_wav_16k_mono(w)?);
+    }
+    let mut book = SpeakerBook::load(
+        &format!("{bench}/silero_vad.onnx"),
+        &format!("{bench}/emb.onnx"),
+    )?;
+
+    let batch = (BATCH_MS * u64::from(SAMPLE_RATE) / 1000) as usize;
+    let mut heard: BTreeMap<String, usize> = BTreeMap::new();
+    let mut spans_total = 0usize;
+    for chunk in samples.chunks(batch) {
+        for span in book.split(chunk) {
+            *heard.entry(span.speaker).or_default() += 1;
+            spans_total += 1;
+        }
+    }
+
+    println!(
+        "回放 {} 檔、{:.1} 分鐘，批次 {BATCH_MS} ms",
+        wavs.len(),
+        samples.len() as f64 / f64::from(SAMPLE_RATE) / 60.0
+    );
+    println!("切出 {spans_total} 段發言，登記 {} 位語者", heard.len());
+    let mut by_count: Vec<_> = heard.into_iter().collect();
+    by_count.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (name, n) in &by_count {
+        println!("  {name}: {n} 段");
+    }
+    let once = by_count.iter().filter(|(_, n)| *n == 1).count();
+    println!("只出現一次的有 {once} 位（多半是誤登記）");
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let wav = std::env::args().nth(1).expect("用法：spkcheck <wav>");
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let bench = "/home/enor/whisper-bench";
+    if args.len() > 1 {
+        return replay(&args, bench);
+    }
+    let wav = args.into_iter().next().expect("用法：spkcheck <wav>...");
     let samples = load_wav_16k_mono(&wav)?;
     let min_silence: f32 = std::env::var("MIN_SILENCE")
         .ok()

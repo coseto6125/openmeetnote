@@ -1297,7 +1297,7 @@ impl Session {
     }
 
     pub fn confirm_speaker(&mut self, speaker_id: &str, name: &str) -> CommandReceipt {
-        if !self.state.accepts_document_work() {
+        if !self.state.accepts_speaker_naming() {
             return CommandReceipt::rejected("目前的會議狀態不接受語者確認");
         }
         if name.trim().is_empty() {
@@ -1311,6 +1311,11 @@ impl Session {
         // 沒被提出過的語者不能確認：投影裡沒有那一列，確認會無聲消失
         if !self.speakers.contains_key(speaker_id) {
             return CommandReceipt::rejected("尚未聽到這位語者發言");
+        }
+        // 這個識別碼底下是「分不出是誰」的每一句，可能來自好幾個人。給它一個
+        // 名字，那些人就全部變成同一位，而逐字稿看起來完全正常（§8.1）。
+        if speaker_id == crate::model::UNKNOWN_REMOTE {
+            return CommandReceipt::rejected("「遠端」不是單一語者，無法命名");
         }
         let (id, name) = (speaker_id.to_owned(), name.trim().to_owned());
         if let Some(rec) = self.speakers.get_mut(&id) {
@@ -3874,6 +3879,31 @@ mod tests {
         assert_eq!(d.speakers[0].speaker_id, "s1");
         assert_eq!(d.speakers[0].confirmed_name.as_deref(), Some("小明"));
         assert_eq!(d.speakers[0].ordinal, 1);
+    }
+
+    #[test]
+    fn test_a_speaker_can_still_be_named_after_the_meeting_ends() {
+        // 誰是誰通常要等散會、對著逐字稿回想才認得出來。命名綁在
+        // accepts_document_work 上時，那個時候已經不能改了。
+        let mut s = scripted(vec![vec![final_(1, "我先講")]]);
+        s.tick(100);
+        stop_and_settle(&mut s);
+        assert_eq!(s.state, MeetingState::Completed);
+        assert!(
+            s.confirm_speaker("s1", "小明").accepted,
+            "會議結束後應該還能為語者命名"
+        );
+    }
+
+    #[test]
+    fn test_the_unidentified_remote_speaker_cannot_be_named() {
+        // 這個識別碼底下是「分不出是誰」的每一句，可能來自好幾個人。命名
+        // 它，那些人在逐字稿、匯出與摘要裡就全部變成同一位。
+        let mut s = scripted(vec![vec![final_(1, "我先講")]]);
+        s.tick(100);
+        stop_and_settle(&mut s);
+        let r = s.confirm_speaker(crate::model::UNKNOWN_REMOTE, "小明");
+        assert!(!r.accepted, "「遠端」不該接受命名");
     }
 
     #[test]

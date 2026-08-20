@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use openmeetnote_lib::stt::{
     diff::{self, Corrections},
-    load_wav_16k_mono,
+    live, load_wav_16k_mono,
     paraformer::Paraformer,
     whisper::Whisper,
 };
@@ -167,4 +167,53 @@ fn test_vocabulary_corrections_survive_the_full_pipeline() {
     let out = diff::to_traditional(simplified, &corrections);
     assert!(out.contains("召委"), "詞表沒有套用到轉繁之後的文字：{out}");
     assert!(!out.contains("招委"));
+}
+
+#[test]
+fn test_the_two_loops_can_share_one_punctuation_model() {
+    // 定稿與即時稿共用同一個標點實例，省下重複載入的三百多 MB。共用就有鎖，
+    // 而這兩條執行緒的呼叫頻率差二十倍（即時稿每 800 ms、定稿每十幾秒），
+    // 所以要確認的是併發呼叫既不死鎖也不互相汙染輸出。
+    let Some(dir) = assets() else {
+        eprintln!("略過：找不到測試素材目錄");
+        return;
+    };
+    let Some(model) = require(
+        &dir,
+        "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12/model.onnx",
+    ) else {
+        eprintln!("略過：缺少標點模型");
+        return;
+    };
+    let Some(punct) = live::load_punct(model.to_str()) else {
+        panic!("標點模型載入失敗");
+    };
+
+    // 兩條各自跑，句子不同：輸出串到一起就是汙染了。
+    let handles: Vec<_> = ["今天要談報價單的部分", "主播跟經紀人的歸屬"]
+        .into_iter()
+        .map(|line| {
+            let punct = punct.clone();
+            std::thread::spawn(move || {
+                (0..20)
+                    .map(|_| punct.apply(line))
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|h| h.join().expect("標點執行緒 panic"))
+        .collect();
+
+    for (out, line) in results.iter().zip(["報價單", "經紀人"]) {
+        assert_eq!(out.len(), 1, "同一句話在併發下出現多種結果：{out:?}");
+        let got = out.iter().next().unwrap();
+        assert!(got.contains(line), "輸出不是這條執行緒送進去的句子：{got}");
+        assert!(
+            got.contains('，') || got.contains('。') || got.contains('？'),
+            "沒有加上任何標點：{got}"
+        );
+    }
 }
