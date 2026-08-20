@@ -36,6 +36,8 @@ export interface Speaker {
   track: 'mic' | 'system';
   proposedName: string | null;
   confirmedName: string | null;
+  /** 被併進了誰。合併不改寫片段，片段上留著的仍是當時聽到的 id。 */
+  mergedInto: string | null;
 }
 
 export interface Note {
@@ -220,6 +222,7 @@ function applyEvent(m: MeetingModel, ev: SessionEvent, batch: SessionEventBatch)
                 track: ev.track,
                 proposedName: ev.proposedName,
                 confirmedName: null,
+                mergedInto: null,
               },
             ].sort((a, b) => a.ordinal - b.ordinal),
           };
@@ -229,6 +232,16 @@ function applyEvent(m: MeetingModel, ev: SessionEvent, batch: SessionEventBatch)
         ...m,
         speakers: m.speakers.map((s) =>
           s.id === ev.speakerId ? { ...s, confirmedName: ev.name } : s,
+        ),
+      };
+
+    // 那一列留在陣列裡，只是不再是一個人。片段上還帶著它的 id，移掉的話
+    // 那幾句話會查不到是誰講的。
+    case 'speakerMerged':
+      return {
+        ...m,
+        speakers: m.speakers.map((s) =>
+          s.id === ev.fromSpeakerId ? { ...s, mergedInto: ev.intoSpeakerId } : s,
         ),
       };
 
@@ -370,6 +383,27 @@ export interface NamedSpeaker {
   track: 'mic' | 'system';
   proposedName: string | null;
   confirmedName: string | null;
+  mergedInto: string | null;
+}
+
+/**
+ * 順著 `mergedInto` 走到還是自己的那一位（後端 `store::resolve_merge` 的同一條
+ * 規則）。合併只寫在語者那一列上，片段留著當時聽到的 id，所以每一條顯示路徑
+ * 都要自己走這一步。
+ *
+ * 指向名單上沒有的人就停在原地：走不到的別名等於沒有別名，讓那一列照常有
+ * 自己的名字，比讓它底下那幾句話變成「未指派」好。
+ */
+export function resolveMerge(all: NamedSpeaker[], id: string): string {
+  let cur = id;
+  // 圈數上限就是防呆。合併是使用者操作，A 併進 B 再 B 併進 A 只要兩次點擊；
+  // 後端已經擋掉，這裡吊死的話整份逐字稿都畫不出來。
+  for (let i = 0; i < all.length; i++) {
+    const next = all.find((s) => s.id === cur)?.mergedInto;
+    if (!next || !all.some((s) => s.id === next)) return cur;
+    cur = next;
+  }
+  return cur;
 }
 
 /**
@@ -386,13 +420,24 @@ export function speakerDisplayName(s: NamedSpeaker, all: NamedSpeaker[]): string
   // 排在確認名之前，不是之後。這個識別碼底下可能有好幾個人，讓其中一個名字
   // 蓋住全部就是把他們併成一位；後端已經擋掉命名，這裡擋的是既有資料裡
   // 已經被命名過的那些。
+  // 被併掉的那一列不自己取名字，也不佔編號：它底下的片段從此算在合併
+  // 對象頭上，稱呼由對象決定
+  const root = resolveMerge(all, s.id);
+  if (root !== s.id) {
+    const into = all.find((x) => x.id === root);
+    if (into) return speakerDisplayName(into, all);
+  }
   if (s.id === UNKNOWN_REMOTE) return '遠端';
   if (s.confirmedName) return s.confirmedName;
   if (s.proposedName) return s.proposedName;
   // 軌道先驗只到「本機 vs 遠端」，不能再往「遠端只有一人」推（§8.1）
   if (s.track === 'mic') return '我';
   const nth = all.filter(
-    (x) => x.track === 'system' && x.id !== UNKNOWN_REMOTE && x.ordinal <= s.ordinal,
+    (x) =>
+      x.track === 'system' &&
+      x.id !== UNKNOWN_REMOTE &&
+      resolveMerge(all, x.id) === x.id &&
+      x.ordinal <= s.ordinal,
   ).length;
   return `語者 ${nth}`;
 }
@@ -420,6 +465,7 @@ export function fromProjection(m: MeetingModel, p: SessionProjection): MeetingMo
       track: s.track,
       proposedName: s.proposedName,
       confirmedName: s.confirmedName,
+      mergedInto: s.mergedInto,
     })),
     notes: p.notes.map((n) => ({
       id: n.noteId,

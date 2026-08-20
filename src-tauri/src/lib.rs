@@ -53,6 +53,7 @@ pub fn run() {
             session::resume_meeting,
             session::add_note,
             session::confirm_speaker,
+            session::merge_speaker,
             session::edit_transcript,
             session::create_snapshot,
             session::stop_meeting,

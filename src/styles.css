@@ -1379,6 +1379,11 @@ svg { display: block; }
   font-size: 12px;
 }
 
+/* 合併對象的下拉。名字比「輸入名稱」這四個字長，沿用同樣的寬度會截掉。 */
+select.spk-input {
+  width: 112px;
+}
+
 /* 本輪 Prompt：與筆記輸入框同一列，但不搶走它的寬度 —— 記筆記是錄音期間
    高頻的動作，指定生成方向是低頻的。 */
 .prompt-field { flex: 0 1 min(320px, 40%); }

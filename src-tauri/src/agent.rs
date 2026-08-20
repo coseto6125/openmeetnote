@@ -147,20 +147,38 @@ pub fn build_index(
     meeting: MeetingId,
     through_event_seq: u64,
 ) -> Result<EvidenceIndex> {
-    let segments = store.segments_through(meeting, through_event_seq)?;
+    let mut segments = store.segments_through(meeting, through_event_seq)?;
     let notes = store.notes_through(meeting, through_event_seq)?;
     // 跟匯出共用同一份規則。自己算的話，未命名的語者會以內部識別碼進 prompt，
     // 模型於是在摘要裡寫出 `remote` 跟 `s2`。
     let stored = store.speakers_through(meeting, through_event_seq)?;
+    // 名字先算，再收斂 id。順序反過來的話，被併掉那一列的軌道會蓋到合併
+    // 對象頭上，同一位語者在摘要 prompt 裡叫「我」、在匯出檔裡叫「語者 2」。
     let names = crate::document::speaker_names(&stored, &segments);
+    // 合併只寫在 speakers 那一列上，片段留著當時聽到的 id。索引是讀取端的
+    // 一份投影，在這裡把 id 收斂到合併後的那一位，模型才不會拿到同一個人的
+    // 兩個代號、把他當成兩個人。`segment_id` 與 `revision` 不動，引用照樣
+    // 落回原始片段（§8.1）。
+    for seg in segments.iter_mut() {
+        let Some(id) = seg.speaker_id.clone() else {
+            continue;
+        };
+        let root = crate::store::resolve_merge(&stored, &id);
+        if root != id.as_str() {
+            seg.speaker_id = Some(root.to_owned());
+        }
+    }
     let speakers = stored
-        .into_iter()
+        .iter()
+        // 併掉的那幾列不進名單：片段的 id 上面已經收斂過，留著只會讓模型
+        // 看到兩筆同名的人
+        .filter(|s| crate::store::resolve_merge(&stored, &s.speaker_id) == s.speaker_id)
         .map(|s| SpeakerName {
             display: names
                 .get(&s.speaker_id)
                 .cloned()
                 .unwrap_or_else(|| s.speaker_id.clone()),
-            id: s.speaker_id,
+            id: s.speaker_id.clone(),
         })
         .collect();
 
@@ -2021,6 +2039,74 @@ mod tests {
         assert!(r.degraded.is_empty());
         assert!(r.blocks.is_empty());
         assert!(r.rejected_blocks > 0);
+    }
+
+    /// 合併之後，索引裡只剩一個人，而片段的 id 收斂到他身上。
+    ///
+    /// 名單留著兩筆的話，模型看到兩個同名的人；片段的 id 不收斂的話，模型
+    /// 看到一個名單上沒有的代號，然後在摘要裡直接寫出 `s2`。
+    #[test]
+    fn a_merged_speaker_reaches_the_model_as_one_person() {
+        let (mut s, m, _) = seeded();
+        let seqs = s
+            .append(
+                m,
+                &[
+                    (
+                        DomainEvent::SpeakerProposed {
+                            speaker_id: "s1".into(),
+                            ordinal: 1,
+                            proposed_name: None,
+                            provider_labels: vec![],
+                        },
+                        Timeline::new(12_000, 12_000),
+                    ),
+                    (
+                        DomainEvent::SpeakerProposed {
+                            speaker_id: "s2".into(),
+                            ordinal: 2,
+                            proposed_name: None,
+                            provider_labels: vec![],
+                        },
+                        Timeline::new(12_100, 12_100),
+                    ),
+                    (
+                        DomainEvent::SpeakerConfirmed {
+                            speaker_id: "s2".into(),
+                            name: "沈立群".into(),
+                        },
+                        Timeline::new(12_200, 12_200),
+                    ),
+                    (
+                        DomainEvent::SpeakerMerged {
+                            from_speaker_id: "s1".into(),
+                            into_speaker_id: "s2".into(),
+                        },
+                        Timeline::new(12_300, 12_300),
+                    ),
+                ],
+            )
+            .unwrap();
+        let cursor = *seqs.last().unwrap();
+
+        let index = build_index(&s, m, cursor).unwrap();
+
+        assert_eq!(
+            index.speakers.len(),
+            1,
+            "名單上還有兩筆，模型會把同一個人當成兩個人：{:?}",
+            index.speakers
+        );
+        assert_eq!(index.speakers[0].id, "s2");
+        assert_eq!(index.speakers[0].display, "沈立群");
+        // seeded() 的每一段都掛在 s1 底下，它已經併進 s2
+        assert!(
+            index
+                .segments
+                .iter()
+                .all(|x| x.speaker_id.as_deref() == Some("s2")),
+            "片段還帶著併掉的 id，模型會拿到一個名單上查不到的代號"
+        );
     }
 
     #[test]
