@@ -229,6 +229,15 @@ impl CommandReceipt {
             pending: false,
         }
     }
+    /// 做了，但沒有產生事件，所以沒有「落地與否」這回事。
+    fn applied() -> Self {
+        Self {
+            accepted: true,
+            seq: None,
+            note: None,
+            pending: false,
+        }
+    }
     fn rejected(note: &str) -> Self {
         Self {
             accepted: false,
@@ -670,8 +679,18 @@ impl Session {
     /// 不放回的話那批就永遠不在事件日誌裡了。磁碟滿了、防毒鎖檔這類問題
     /// 通常幾秒後就恢復，而事件日誌是唯一真實來源 —— 中間缺一段，之後從
     /// 日誌重建投影就少了那幾句話，而且 store 的 high_seq 會從此落後。
-    fn journal_failed(&mut self, reason: String, batch: Vec<(DomainEvent, Timeline)>) {
+    fn journal_failed(
+        &mut self,
+        meeting: MeetingId,
+        reason: String,
+        batch: Vec<(DomainEvent, Timeline)>,
+    ) {
         self.journal_error.get_or_insert(reason);
+        // 這一批屬於已經換掉的那一場。放回佇列的話，下一次 flush 會把它寫進
+        // 新會議底下 —— 兩場會議的內容就此混在一起。
+        if self.meeting_id != Some(meeting) {
+            return;
+        }
         // 放回開頭：事件的順序就是它的意義，重試不能把後來的排到前面
         let mut restored = batch;
         restored.append(&mut self.journal);
@@ -1670,21 +1689,23 @@ impl Session {
 
     pub fn inject_fault(&mut self, kind: &str, ids: crate::store::RunIds) -> CommandReceipt {
         match kind {
+            // 這四個只改記憶體裡的健康狀態，不產生事件。借用目前的 seq 的話，
+            // 收據會宣稱「已經寫進日誌」，而它根本不在日誌裡，也不會重試。
             "micLost" => {
                 self.mic_health = Health::Lost;
-                CommandReceipt::ok(self.seq)
+                CommandReceipt::applied()
             }
             "micRestored" => {
                 self.mic_health = Health::Ok;
-                CommandReceipt::ok(self.seq)
+                CommandReceipt::applied()
             }
             "sttDown" => {
                 self.stt_health = Health::Degraded;
-                CommandReceipt::ok(self.seq)
+                CommandReceipt::applied()
             }
             "sttUp" => {
                 self.stt_health = Health::Ok;
-                CommandReceipt::ok(self.seq)
+                CommandReceipt::applied()
             }
             "generationFailed" => {
                 if !self.state.accepts_document_work() {
@@ -1756,6 +1777,13 @@ pub struct SessionHandle {
     /// 用獨立的鎖而不是把整段包進 `inner`：開裝置與載入模型要好幾秒，
     /// 期間 Session 的鎖必須是放開的，事件迴圈還在跑。
     starting: Mutex<()>,
+    /// 一次只有一個 flusher。
+    ///
+    /// 兩個 flusher 同時在途時，「水位推到 high_seq 代表它以下也都寫成功了」
+    /// 這個前提就不成立：A 拿走 1..10、B 拿走 11，B 先成功把水位推到 11，
+    /// A 之後才失敗 —— 收據於是說第 5 筆已經落地，而它並不在日誌裡。
+    /// 事件泵與命令是兩條各自呼叫 `flush` 的路，所以這是真的會發生的交錯。
+    flushing: Mutex<()>,
 }
 
 impl Default for SessionHandle {
@@ -1764,6 +1792,7 @@ impl Default for SessionHandle {
             inner: Mutex::new(Session::default()),
             epoch: Instant::now(),
             starting: Mutex::new(()),
+            flushing: Mutex::new(()),
         }
     }
 }
@@ -1799,15 +1828,16 @@ impl SessionHandle {
             inner: Mutex::new(session),
             epoch: Instant::now(),
             starting: Mutex::new(()),
+            flushing: Mutex::new(()),
         }
     }
 
     /// 換上全新的 Session。結束後開新會議走這條路，
     /// 而不是重置欄位：漏掉一個欄位就會把上一場的片段帶進新會議。
-    fn reset(&self) {
-        if let Ok(mut g) = self.inner.lock() {
-            *g = Session::default();
-        }
+    fn reset(&self) -> Result<(), PoisonedSession> {
+        let mut g = self.inner.lock().map_err(|_| PoisonedSession)?;
+        *g = Session::default();
+        Ok(())
     }
 }
 
@@ -1824,6 +1854,9 @@ const POISONED_NOTE: &str = "工作階段狀態已損毀，請重新啟動應用
 /// 寫入失敗會標記 Session，之後所有產生新事件的命令都被拒絕：讓使用者
 /// 以為內容有被保存，比直接說寫不進去糟得多。
 pub fn flush(session: &SessionHandle, store: &StoreHandle) -> Result<(), String> {
+    // 排隊，不要並行。理由寫在 `SessionHandle::flushing` 上。鎖中毒時 Err
+    // 裡面一樣握著 guard，排隊照樣成立。
+    let _one_at_a_time = session.flushing.lock();
     let Ok(Some((meeting, high_seq, batch))) =
         session.with(|s| s.meeting_id().map(|m| (m, s.seq, s.take_journal())))
     else {
@@ -1846,7 +1879,7 @@ pub fn flush(session: &SessionHandle, store: &StoreHandle) -> Result<(), String>
             Ok(())
         }
         Err(reason) => {
-            let _ = session.with(|s| s.journal_failed(reason.clone(), batch));
+            let _ = session.with(|s| s.journal_failed(meeting, reason.clone(), batch));
             Err(reason)
         }
     }
@@ -2453,6 +2486,9 @@ fn open_snapshot(
             Some(reason),
         )
     });
+    // 這個結局本身也要試著落地。只留在記憶體的話，資料庫裡那一版停在
+    // running，而畫面說它失敗了 —— 重開之後又變成永遠生成中。
+    let _ = flush(state, store);
     (receipt, None)
 }
 
@@ -2846,28 +2882,50 @@ pub fn new_meeting(state: State<SessionHandle>, store: State<StoreHandle>) -> Co
 /// `new_meeting` 的本體。`#[tauri::command]` 的參數形狀由 Tauri 決定，
 /// 拆出來測試才進得去。
 fn start_new_meeting(state: &SessionHandle, store: &StoreHandle) -> CommandReceipt {
-    // 先讓舊 Session 把還在跑的生成收乾淨並落地，再換掉它。順序不能反：
-    // reset 之後那些 run 就沒有收尾的地方了。
-    let _ = state.with(|s| s.abandon_running_generations());
-    // 寫不進去就不換：reset 會丟掉排回佇列等重寫的那批，上一場的結尾
-    // 因此永遠不會進日誌，而使用者看到的是新會議開好了
-    // 問的是上一場的全部，所以拿它目前的 seq 當門檻
-    let high_seq = state.with(|s| s.seq).unwrap_or(0);
-    let flushed = flush(state, store);
-    let out = acknowledge(state, CommandReceipt::ok(high_seq), flushed);
-    if out.pending {
-        return CommandReceipt::rejected(
-            &out.note
-                .unwrap_or_else(|| "上一場還沒寫進本機資料庫".to_owned()),
-        );
+    // 先確定舊 Session 的積壓寫得出去，才動它。順序不能反：
+    // `abandon_running_generations` 會把還在跑的版本判死，而這個命令可能因為
+    // 寫不出去而被拒絕 —— 被拒絕的命令不該留下痕跡。先擋一次，那一步就只在
+    // 磁碟當下寫得動的時候才發生。
+    if let Some(r) = written_out(state, store) {
+        return r;
     }
-    state.reset();
+    // 收尾還在跑的生成。不收的話，背景工作完成時 Session 已經換掉，找不到
+    // 自己的 run_id，事件永遠不會寫入，歷史頁那一版永遠顯示「生成中」。
+    if state.with(|s| s.abandon_running_generations()).is_err() {
+        return CommandReceipt::rejected(POISONED_NOTE);
+    }
+    // 收尾事件本身也要落地才能換：reset 會丟掉排回佇列等重寫的那批。
+    // 這一次失敗代表那些版本已經被判死而新會議沒開成 —— 事件還排著重試，
+    // 狀態不會憑空消失，但這個順序上的縫補不掉。
+    if let Some(r) = written_out(state, store) {
+        return r;
+    }
+    if state.reset().is_err() {
+        return CommandReceipt::rejected(POISONED_NOTE);
+    }
     CommandReceipt {
         accepted: true,
         seq: Some(0),
         note: None,
         pending: false,
     }
+}
+
+/// 這個 Session 到目前為止的事件都進日誌了嗎？沒有的話回一張拒絕收據。
+///
+/// 問的是「到此為止的全部」，所以門檻是它現在的 seq。
+fn written_out(state: &SessionHandle, store: &StoreHandle) -> Option<CommandReceipt> {
+    let Ok(high_seq) = state.with(|s| s.seq) else {
+        return Some(CommandReceipt::rejected(POISONED_NOTE));
+    };
+    let flushed = flush(state, store);
+    let out = acknowledge(state, CommandReceipt::ok(high_seq), flushed);
+    out.pending.then(|| {
+        CommandReceipt::rejected(
+            &out.note
+                .unwrap_or_else(|| "上一場還沒寫進本機資料庫".to_owned()),
+        )
+    })
 }
 
 /// UI 偵測到事件缺號或重新載入時，用完整投影重建，而不是帶著破洞繼續套用增量。
@@ -3633,9 +3691,39 @@ mod tests {
         assert!(!batch.is_empty(), "測試前提不成立：應該要有待寫入的事件");
         let n = batch.len();
 
-        s.journal_failed("磁碟已滿".into(), batch);
+        let m = s.meeting_id().expect("recording() 應該有一場會議");
+        s.journal_failed(m, "磁碟已滿".into(), batch);
 
         assert_eq!(s.take_journal().len(), n, "失敗的那批事件被丟掉了");
+    }
+
+    /// 換過會議之後，舊的那一批不准倒進新會議。
+    ///
+    /// 寫入失敗的批次會排回佇列等重試。中間如果換了會議，那些事件會在下一次
+    /// flush 被寫到新會議底下 —— 兩場的內容混在一起，而且是靜悄悄地。
+    #[test]
+    fn test_a_failed_batch_is_not_requeued_into_a_different_meeting() {
+        let mut s = recording();
+        s.add_note("上一場的話");
+        let old_meeting = s.meeting_id().expect("recording() 應該有一場會議");
+        let batch = s.take_journal();
+        assert!(!batch.is_empty(), "測試前提不成立：應該要有待寫入的事件");
+
+        // 這個 Session 現在錄的是另一場了
+        let mut s = Session::default();
+        assert!(s.start(old_meeting + 1).accepted);
+        s.take_journal();
+
+        s.journal_failed(old_meeting, "磁碟已滿".into(), batch);
+
+        assert!(
+            s.take_journal().is_empty(),
+            "上一場的事件被排進新會議的佇列了"
+        );
+        assert!(
+            s.journal_error.is_some(),
+            "還是要留下警示：那一批確實沒寫進去"
+        );
     }
 
     /// 重試時順序不能亂：事件的順序就是它的意義
@@ -3646,7 +3734,8 @@ mod tests {
         let first = s.take_journal();
         s.add_note("後講的");
 
-        s.journal_failed("磁碟已滿".into(), first);
+        let m = s.meeting_id().expect("recording() 應該有一場會議");
+        s.journal_failed(m, "磁碟已滿".into(), first);
 
         let all = s.take_journal();
         let texts: Vec<&str> = all
@@ -3663,7 +3752,8 @@ mod tests {
     #[test]
     fn test_the_write_error_banner_clears_only_after_a_successful_flush() {
         let mut s = recording();
-        s.journal_failed("磁碟已滿".into(), Vec::new());
+        let m = s.meeting_id().unwrap_or_default();
+        s.journal_failed(m, "磁碟已滿".into(), Vec::new());
         assert!(s.journal_error.is_some());
         s.journal_recovered(s.seq);
         assert!(s.journal_error.is_none());
@@ -4147,7 +4237,8 @@ mod tests {
     #[test]
     fn test_a_journal_failure_rejects_every_command_that_would_create_events() {
         let (mut s, _store, _m) = with_store();
-        s.journal_failed("磁碟已滿".into(), Vec::new());
+        let m = s.meeting_id().unwrap_or_default();
+        s.journal_failed(m, "磁碟已滿".into(), Vec::new());
         for r in [
             s.add_note("記一筆"),
             s.confirm_speaker("s1", "小明"),
@@ -4288,7 +4379,8 @@ mod tests {
         let (mut s, _store, _m) = with_store();
         s.tick(100);
         s.drain(0);
-        s.journal_failed("磁碟已滿".into(), Vec::new());
+        let m = s.meeting_id().unwrap_or_default();
+        s.journal_failed(m, "磁碟已滿".into(), Vec::new());
         // pending 是空的，但這個批次還是要送，否則畫面會停在「一切正常」
         let batch = s.drain(s.seq);
         assert_eq!(batch.journal_error.as_deref(), Some("磁碟已滿"));
@@ -4297,9 +4389,11 @@ mod tests {
     #[test]
     fn test_the_first_journal_failure_is_the_one_reported() {
         let (mut s, _store, _m) = with_store();
-        s.journal_failed("磁碟已滿".into(), Vec::new());
+        let m = s.meeting_id().unwrap_or_default();
+        s.journal_failed(m, "磁碟已滿".into(), Vec::new());
         // 後續失敗多半是前一個的連鎖反應，換掉原因會蓋掉真正的線索
-        s.journal_failed("資料庫連線狀態已損毀".into(), Vec::new());
+        let m = s.meeting_id().unwrap_or_default();
+        s.journal_failed(m, "資料庫連線狀態已損毀".into(), Vec::new());
         assert_eq!(s.drain(0).journal_error.as_deref(), Some("磁碟已滿"));
     }
 

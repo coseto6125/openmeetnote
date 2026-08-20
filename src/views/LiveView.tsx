@@ -13,7 +13,7 @@ import {
   snapshotDocument,
   type DocumentBlock,
 } from '../session';
-import { resolveMerge, speakerDisplayName, UNKNOWN_REMOTE } from '../meeting';
+import { receiptDegrade, resolveMerge, speakerDisplayName, UNKNOWN_REMOTE } from '../meeting';
 import type { Degrade, MeetingModel, Snapshot, Speaker } from '../meeting';
 import { Spine, type SpinePause } from '../components/Spine';
 import { DocumentView, type CitedSegment } from '../components/DocumentView';
@@ -182,9 +182,11 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
     };
   }, [model.activeVersion]);
 
-  const submitSnapshot = () => {
-    void commands.createSnapshot(promptDraft);
-    setPromptDraft('');
+  const submitSnapshot = async () => {
+    const r = await commands.createSnapshot(promptDraft);
+    setLocalDegrade(receiptDegrade(r, '摘要要求'));
+    // 被拒絕時留著要求：使用者剛打完那段話，清掉他就得重打
+    if (r.accepted) setPromptDraft('');
   };
 
   /** 失敗的版本用同一段要求再跑一次。
@@ -200,42 +202,38 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
     const text = noteDraft.trim();
     if (!text) return;
     const r = await commands.addNote(text);
-    if (!r.accepted) {
-      if (r.note) setLocalDegrade({ title: '筆記未送出', body: r.note, tone: 'warn' });
-      return;
-    }
-    // 清掉輸入框，即使還沒存檔：這一筆已經記下也排著重試，留著輸入等於邀請
-    // 使用者再送一次，然後得到兩筆
-    setNoteDraft('');
-    if (r.pending && r.note) {
-      setLocalDegrade({ title: '筆記尚未存檔', body: r.note, tone: 'warn' });
-    }
+    setLocalDegrade(receiptDegrade(r, '筆記'));
+    if (r.accepted) setNoteDraft('');
   };
 
   /** 名單上有幾個人可以當合併對象。少於一個就沒有「併入」這個動作。 */
   const mergeTargets = roster.filter((s) => s.id !== UNKNOWN_REMOTE).length - 1;
 
   const submitMerge = async (from: string, into: string) => {
-    setMerging(null);
-    if (!into) return;
-    const r = await commands.mergeSpeaker(from, into);
-    if (!r.accepted && r.note) {
-      setLocalDegrade({ title: '語者未合併', body: r.note, tone: 'warn' });
-    } else if (r.pending && r.note) {
-      setLocalDegrade({ title: '合併尚未存檔', body: r.note, tone: 'warn' });
+    if (!into) {
+      setMerging(null);
+      return;
     }
+    const r = await commands.mergeSpeaker(from, into);
+    setLocalDegrade(receiptDegrade(r, '語者合併'));
+    // 被拒絕就把選單留著：關掉的話使用者看不出自己選了誰、又要重找一次
+    if (r.accepted) setMerging(null);
+  };
+
+  const confirmName = async (speakerId: string, name: string) => {
+    const r = await commands.confirmSpeaker(speakerId, name);
+    setLocalDegrade(receiptDegrade(r, '語者名稱'));
+    return r.accepted;
   };
 
   const submitName = async (speakerId: string, raw: string) => {
-    setNaming(null);
     const name = raw.trim();
-    if (!name) return;
-    const r = await commands.confirmSpeaker(speakerId, name);
-    if (!r.accepted && r.note) {
-      setLocalDegrade({ title: '語者名稱未儲存', body: r.note, tone: 'warn' });
-    } else if (r.pending && r.note) {
-      setLocalDegrade({ title: '語者名稱尚未存檔', body: r.note, tone: 'warn' });
+    if (!name) {
+      setNaming(null);
+      return;
     }
+    // 被拒絕就把輸入框留著，連同他打的名字
+    if (await confirmName(speakerId, name)) setNaming(null);
   };
 
   const scrollToSegment = (id: string) => {
@@ -422,7 +420,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                 aria-label="本輪要求"
                 value={promptDraft}
                 onChange={(e) => setPromptDraft(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && submitSnapshot()}
+                onKeyDown={(e) => e.key === 'Enter' && void submitSnapshot()}
                 placeholder={
                   baseVersion
                     ? `要改什麼？會在 v${baseVersion.version} 的基礎上修訂`
@@ -433,7 +431,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
               />
             </label>
             {/* 結束之後仍可建立：最常見的流程就是開完會才要摘要 */}
-            <button className="btn btn-primary" onClick={submitSnapshot} disabled={!canSnapshot}>
+            <button className="btn btn-primary" onClick={() => void submitSnapshot()} disabled={!canSnapshot}>
               {baseVersion ? `修訂為 v${baseVersion.version + 1}` : '建立摘要快照'}
             </button>
           </div>
@@ -517,7 +515,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                     <>
                       <button
                         className="mini mini-yes"
-                        onClick={() => void commands.confirmSpeaker(s.id, s.proposedName!)}
+                        onClick={() => void confirmName(s.id, s.proposedName!)}
                       >
                         是
                       </button>

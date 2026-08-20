@@ -3,6 +3,8 @@ import {
   applyBatch,
   emptyMeeting,
   fromProjection,
+  resolveMerge,
+  receiptDegrade,
   speakerDisplayName,
   UNKNOWN_REMOTE,
   type MeetingModel,
@@ -253,6 +255,36 @@ describe('local write failures', () => {
     m = applyBatch(m, { ...batchOf([note(3, 2, '三')], 2), journalError: '磁碟已滿' });
     expect(m.desynced).toBe(true);
     expect(m.journalError).toBe('磁碟已滿');
+  });
+});
+
+describe('reading a receipt', () => {
+  const r = (accepted: boolean, pending: boolean, note: string | null) => ({
+    accepted,
+    pending,
+    note,
+  });
+
+  // 拒絕代表什麼都沒發生：輸入要留著，訊息要說「未送出」
+  test('a_rejection_is_reported_as_not_sent', () => {
+    expect(receiptDegrade(r(false, false, '磁碟已滿'), '筆記')).toEqual({
+      title: '筆記未送出',
+      body: '磁碟已滿',
+      tone: 'warn',
+    });
+  });
+
+  // 做了但還沒存：訊息不能說成「未送出」，那會讓使用者再送一次而變成兩筆
+  test('a_pending_receipt_says_it_happened_but_is_not_saved', () => {
+    expect(receiptDegrade(r(true, true, '磁碟已滿'), '筆記')).toEqual({
+      title: '筆記尚未存檔',
+      body: '磁碟已滿',
+      tone: 'warn',
+    });
+  });
+
+  test('a_receipt_that_landed_says_nothing', () => {
+    expect(receiptDegrade(r(true, false, null), '筆記')).toBeNull();
   });
 });
 
@@ -543,11 +575,34 @@ describe('speaker display name', () => {
 
   // A 併進 B 再 B 併進 A 只要兩次點擊。後端擋掉了，但畫面吃得到別的來源
   // 寫進來的資料 —— 這裡吊死的話整份逐字稿都畫不出來。
-  test('a_cycle_between_two_aliases_does_not_hang_the_transcript', () => {
-    const all = [s(1, 'system'), s(2, 'system')];
-    all[0] = { ...all[0], mergedInto: 's2' };
-    all[1] = { ...all[1], mergedInto: 's1' };
-    expect(() => all.map((x) => speakerDisplayName(x, all))).not.toThrow();
+  // 三步循環外加一列無關的人，是「走固定圈數」那版真正失手的形狀：名單長 4、
+  // 循環長 3，四步之後 s1→s2、s2→s3、s3→s1，`speakerDisplayName` 於是互相
+  // 遞迴到爆棧。兩步循環配兩列剛好繞回原點，測不出這件事。
+  test('a_cycle_of_aliases_resolves_every_row_to_itself', () => {
+    const cases: [string, string | null][][] = [
+      [
+        ['s1', 's2'],
+        ['s2', 's1'],
+      ],
+      [
+        ['s1', 's2'],
+        ['s2', 's3'],
+        ['s3', 's1'],
+        ['s4', null],
+      ],
+      [
+        ['s1', 's1'],
+        ['s2', null],
+      ],
+    ];
+    for (const rows of cases) {
+      const all = rows.map(([id, into], i) => ({
+        ...s(i + 1, 'system', null, null, id),
+        mergedInto: into,
+      }));
+      for (const x of all) expect(resolveMerge(all, x.id)).toBe(x.id);
+      expect(() => all.map((x) => speakerDisplayName(x, all))).not.toThrow();
+    }
   });
 
   // 別名指向名單上沒有的人時，那一列照常有自己的名字。整份逐字稿因為一個

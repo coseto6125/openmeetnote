@@ -392,18 +392,22 @@ export interface NamedSpeaker {
  * 都要自己走這一步。
  *
  * 指向名單上沒有的人就停在原地：走不到的別名等於沒有別名，讓那一列照常有
- * 自己的名字，比讓它底下那幾句話變成「未指派」好。
+ * 自己的名字，比讓它底下那幾句話變成「未指派」好。循環同理，回原本的 id。
  */
 export function resolveMerge(all: NamedSpeaker[], id: string): string {
   let cur = id;
-  // 圈數上限就是防呆。合併是使用者操作，A 併進 B 再 B 併進 A 只要兩次點擊；
-  // 後端已經擋掉，這裡吊死的話整份逐字稿都畫不出來。
-  for (let i = 0; i < all.length; i++) {
+  const seen = new Set<string>();
+  for (;;) {
     const next = all.find((s) => s.id === cur)?.mergedInto;
     if (!next || !all.some((s) => s.id === next)) return cur;
+    // 走回走過的地方就是循環：當作沒有別名，每一列保有自己的名字。停在鏈上
+    // 的某一點是錯的 —— 先前這裡走固定圈數，停在哪裡取決於名單有多長，
+    // A→B→C→A 於是解析成 A→B、B→C、C→A，三個都不是自己，
+    // `speakerDisplayName` 就這樣互相遞迴到爆棧。
+    if (next === id || seen.has(next)) return id;
+    seen.add(cur);
     cur = next;
   }
-  return cur;
 }
 
 /**
@@ -440,6 +444,26 @@ export function speakerDisplayName(s: NamedSpeaker, all: NamedSpeaker[]): string
       x.ordinal <= s.ordinal,
   ).length;
   return `語者 ${nth}`;
+}
+
+/**
+ * 一張收據該讓畫面說什麼。`null` 代表不必說。
+ *
+ * 三種答案各有一個動作，而每個呼叫端自己判斷一次就會漏掉其中一種：拒絕代表
+ * 什麼都沒發生，使用者的輸入要留著；`pending` 代表發生了但還沒存，輸入要清掉
+ * （留著等於邀請他再送一次，重試成功後就有兩筆），但必須說出來；都不是就安靜。
+ */
+export function receiptDegrade(
+  r: { accepted: boolean; pending: boolean; note: string | null },
+  subject: string,
+): Degrade | null {
+  if (!r.accepted) {
+    return r.note ? { title: `${subject}未送出`, body: r.note, tone: 'warn' } : null;
+  }
+  if (r.pending && r.note) {
+    return { title: `${subject}尚未存檔`, body: r.note, tone: 'warn' };
+  }
+  return null;
 }
 
 export function fromProjection(m: MeetingModel, p: SessionProjection): MeetingModel {

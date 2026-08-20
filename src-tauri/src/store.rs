@@ -444,12 +444,17 @@ pub struct StoredSpeaker {
 /// 讀取路徑都要自己走這一步。走不到（那一列不在名單裡）就回原本的 id：
 /// 名字會退回預設稱呼，比讓那句話變成「未指派」好。
 ///
-/// 迴圈防護不是理論上的顧慮。合併是使用者操作，A 併進 B 再 B 併進 A 只要
-/// 兩次點擊 —— 命令那一層已經擋掉，但讀取路徑也吃得到別的來源寫進去的
-/// 日誌，這裡吊死就是整份逐字稿打不開。
+/// 循環的答案是「當作沒有別名」，每一列保有自己的名字。停在鏈上的某一點
+/// 是錯的：先前這裡走固定圈數，停在哪裡取決於名單有多長，於是 A→B→C→A
+/// 這種循環會讓 A 解析成 B、B 解析成 C、C 解析成 A —— 三個都不是自己，
+/// Rust 這邊三列全部失去名字，TypeScript 那邊直接無限遞迴。
+///
+/// 循環不是理論上的顧慮。命令那一層擋得住，但讀取路徑也吃得到別的來源
+/// 寫進去的日誌，而整份逐字稿打不開是最不能出的錯。
 pub fn resolve_merge<'a>(speakers: &'a [StoredSpeaker], id: &'a str) -> &'a str {
     let mut cur = id;
-    for _ in 0..speakers.len() {
+    let mut seen: Vec<&str> = Vec::new();
+    loop {
         let next = speakers
             .iter()
             .find(|s| s.speaker_id == cur)
@@ -457,12 +462,19 @@ pub fn resolve_merge<'a>(speakers: &'a [StoredSpeaker], id: &'a str) -> &'a str 
             // 指向名單上沒有的人就停在這裡。走不到的別名等於沒有別名，讓這
             // 一列照常有自己的名字，比讓它底下那幾句話變成「未指派」好。
             .filter(|next| speakers.iter().any(|s| s.speaker_id == *next));
-        match next {
-            Some(next) => cur = next,
-            None => return cur,
+        let Some(next) = next else { return cur };
+        // 走回走過的地方就是一個環。整組別名當成沒有：從環上任何一位問起都
+        // 答自己，於是每一列都保住自己的名字。
+        //
+        // 這裡不能改用「走 N 步就停」：環長與名單長度無關。A→B→C→A 再加一位
+        // 無關的 D，走四步會停在 B，而 B 答 C、C 答 A —— Rust 這邊三個人同時
+        // 失去名字，前端則是 speakerDisplayName 互相遞迴到爆棧。
+        if next == id || seen.contains(&next) {
+            return id;
         }
+        seen.push(cur);
+        cur = next;
     }
-    cur
 }
 
 #[derive(Debug, Clone, Serialize)]
