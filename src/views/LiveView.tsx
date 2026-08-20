@@ -200,8 +200,16 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
     const text = noteDraft.trim();
     if (!text) return;
     const r = await commands.addNote(text);
-    if (r.accepted) setNoteDraft('');
-    else if (r.note) setLocalDegrade({ title: '筆記未送出', body: r.note, tone: 'warn' });
+    if (!r.accepted) {
+      if (r.note) setLocalDegrade({ title: '筆記未送出', body: r.note, tone: 'warn' });
+      return;
+    }
+    // 清掉輸入框，即使還沒存檔：這一筆已經記下也排著重試，留著輸入等於邀請
+    // 使用者再送一次，然後得到兩筆
+    setNoteDraft('');
+    if (r.pending && r.note) {
+      setLocalDegrade({ title: '筆記尚未存檔', body: r.note, tone: 'warn' });
+    }
   };
 
   /** 名單上有幾個人可以當合併對象。少於一個就沒有「併入」這個動作。 */
@@ -213,6 +221,8 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
     const r = await commands.mergeSpeaker(from, into);
     if (!r.accepted && r.note) {
       setLocalDegrade({ title: '語者未合併', body: r.note, tone: 'warn' });
+    } else if (r.pending && r.note) {
+      setLocalDegrade({ title: '合併尚未存檔', body: r.note, tone: 'warn' });
     }
   };
 
@@ -223,6 +233,8 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
     const r = await commands.confirmSpeaker(speakerId, name);
     if (!r.accepted && r.note) {
       setLocalDegrade({ title: '語者名稱未儲存', body: r.note, tone: 'warn' });
+    } else if (r.pending && r.note) {
+      setLocalDegrade({ title: '語者名稱尚未存檔', body: r.note, tone: 'warn' });
     }
   };
 

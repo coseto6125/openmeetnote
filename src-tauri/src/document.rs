@@ -1361,6 +1361,62 @@ mod tests {
         assert_eq!(names["s1"], "語者 1");
     }
 
+    /// 鏈是使用者做得出來的：A 併進 B，之後 B 併進 C。三列要收斂成同一位。
+    ///
+    /// 收斂不了的話，A 那幾句話會掛在一個名單上已經不存在的人底下。
+    #[test]
+    fn test_a_chain_of_merges_resolves_to_the_last_person() {
+        let row = |id: &str, ordinal, name: Option<&str>, merged: Option<&str>| {
+            crate::store::StoredSpeaker {
+                speaker_id: id.into(),
+                ordinal,
+                proposed_name: None,
+                confirmed_name: name.map(str::to_owned),
+                status: if merged.is_some() {
+                    "merged"
+                } else {
+                    "proposed"
+                }
+                .into(),
+                merged_into: merged.map(str::to_owned),
+            }
+        };
+        let speakers = vec![
+            row("s1", 1, None, Some("s2")),
+            row("s2", 2, None, Some("s3")),
+            row("s3", 3, Some("沈立群"), None),
+        ];
+        for id in ["s1", "s2", "s3"] {
+            assert_eq!(crate::store::resolve_merge(&speakers, id), "s3");
+        }
+        let names = speaker_names(&speakers, &two_remote_segments());
+        assert_eq!(names["s1"], "沈立群");
+        assert_eq!(names["s2"], "沈立群");
+        assert_eq!(names["s3"], "沈立群");
+    }
+
+    /// 循環不會吊死讀取路徑，也不會讓那幾句話沒有名字。
+    ///
+    /// 命令那一層擋掉了 A→B→A，但讀取路徑也吃得到別的來源寫進去的日誌。
+    #[test]
+    fn test_a_cycle_between_two_aliases_still_names_everyone() {
+        let row = |id: &str, ordinal, merged: &str| crate::store::StoredSpeaker {
+            speaker_id: id.into(),
+            ordinal,
+            proposed_name: None,
+            confirmed_name: None,
+            status: "merged".into(),
+            merged_into: Some(merged.to_owned()),
+        };
+        let speakers = vec![row("s1", 1, "s2"), row("s2", 2, "s1")];
+        let names = speaker_names(&speakers, &two_remote_segments());
+        assert_eq!(
+            names.len(),
+            2,
+            "循環讓某一列沒有名字，那幾句話會變成「未指派」"
+        );
+    }
+
     /// s1 已經併進 s2，而 s2 有名字。
     fn merged_roster() -> Vec<crate::store::StoredSpeaker> {
         let row = |id: &str, ordinal, name: Option<&str>, merged: Option<&str>| {

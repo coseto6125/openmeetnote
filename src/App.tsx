@@ -116,12 +116,21 @@ export default function App() {
       setLocalDegrade({ title: '無法開始錄音', body: r.note ?? '未知原因', tone: 'bad' });
       return;
     }
+    if (r.pending && r.note) {
+      setLocalDegrade({ title: '錄音已開始，但尚未存檔', body: r.note, tone: 'warn' });
+    }
     setMeetingId(await activeMeeting());
 
   };
 
   const newMeeting = async () => {
-    await commands.newMeeting();
+    // 上一場還沒寫完就不換。後端會拒絕並保留舊 Session，這裡照樣清畫面的話，
+    // 畫面說已經開了新會議，核心其實還在舊的那一場。
+    const r = await commands.newMeeting();
+    if (!r.accepted) {
+      setLocalDegrade({ title: '無法開新會議', body: r.note ?? '未知原因', tone: 'bad' });
+      return;
+    }
     setModel(emptyMeeting);
     setLocalDegrade(null);
     setMeetingId(null);

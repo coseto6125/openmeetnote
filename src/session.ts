@@ -120,6 +120,13 @@ export interface SessionEventBatch {
 
 export interface CommandReceipt {
   accepted: boolean;
+  /**
+   * 命令做了，但還沒寫進本機資料庫。
+   *
+   * 這一筆排在佇列裡等重試，所以畫面要當它已經發生：清掉輸入框，改用警示
+   * 說它還沒存。當成「沒送出」讓使用者再送一次，重試成功後就會有兩筆。
+   */
+  pending: boolean;
   seq: number | null;
   note: string | null;
 }

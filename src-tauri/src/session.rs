@@ -206,9 +206,18 @@ pub struct SessionEventBatch {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandReceipt {
+    /// 這個命令有沒有發生。false 代表什麼都沒改，畫面該把使用者的輸入留著。
     pub accepted: bool,
     pub seq: Option<u64>,
     pub note: Option<String>,
+    /// 發生了，但還沒進日誌。
+    ///
+    /// 命令是先改記憶體、再寫日誌的，而寫失敗的那一批會排回佇列等重試。
+    /// 只有「接受／拒絕」兩種答案時，這個中間狀態一定會講錯其中一邊：說
+    /// 接受，使用者相信一件可能不會發生的事；說拒絕，他會再送一次，而原本
+    /// 那一筆稍後重試成功 —— 於是有了兩筆。第三種答案是唯一誠實的說法：
+    /// 「記下了，但還沒存進去」。
+    pub pending: bool,
 }
 
 impl CommandReceipt {
@@ -217,6 +226,7 @@ impl CommandReceipt {
             accepted: true,
             seq: Some(seq),
             note: None,
+            pending: false,
         }
     }
     fn rejected(note: &str) -> Self {
@@ -224,6 +234,7 @@ impl CommandReceipt {
             accepted: false,
             seq: None,
             note: Some(note.to_owned()),
+            pending: false,
         }
     }
 }
@@ -569,6 +580,8 @@ pub struct Session {
     /// 日誌寫入失敗。發生後拒絕所有會產生新事件的命令：
     /// 繼續接受命令等於讓使用者以為內容有被保存。
     journal_error: Option<String>,
+    /// 已經確定寫進日誌的最大 seq。收據靠它分辨「已存」與「還沒存」。
+    durable_seq: u64,
     /// 這場會議的文件 id，第一次生成時由 Store 配發後記住。
     /// 號碼本身不在這裡產生 —— 見 `Store::allocate_run_ids`。
     document_id: Option<i64>,
@@ -613,6 +626,7 @@ impl Session {
             pending: Vec::new(),
             journal: Vec::new(),
             journal_error: None,
+            durable_seq: 0,
             document_id: None,
             run_ids: HashMap::new(),
             source,
@@ -642,6 +656,11 @@ impl Session {
     }
 
     /// 取走待寫入的日誌。呼叫端負責寫進 Store，失敗時用 `journal_failed` 回報。
+    /// 取走待寫入的日誌。呼叫端負責寫進 Store，失敗時用 `journal_failed` 回報。
+    ///
+    /// 這一批涵蓋到的最大 seq 就是 `self.seq`：`record` 是唯一配發 seq 的
+    /// 地方，也是唯一往 journal 推東西的地方，所以佇列裡最後一筆永遠帶著
+    /// 目前的 seq。`flush` 在同一次上鎖裡把兩者一起取走。
     fn take_journal(&mut self) -> Vec<(DomainEvent, Timeline)> {
         std::mem::take(&mut self.journal)
     }
@@ -663,8 +682,9 @@ impl Session {
     ///
     /// 只有在積壓的事件全部寫進去之後才呼叫，否則畫面上的警示會在資料
     /// 其實還沒落地的時候就消失。
-    fn journal_recovered(&mut self) {
+    fn journal_recovered(&mut self, durable_seq: u64) {
         self.journal_error = None;
+        self.durable_seq = self.durable_seq.max(durable_seq);
     }
 
     /// 日誌寫不進去時，任何會產生新事件的命令都必須拒絕。
@@ -1385,8 +1405,12 @@ impl Session {
         if from == crate::model::UNKNOWN_REMOTE || into == crate::model::UNKNOWN_REMOTE {
             return CommandReceipt::rejected("「遠端」不是單一語者，無法合併");
         }
-        // 已經併掉的那一列不能再當來源或目標。擋在這裡，別名鏈就永遠是一步，
-        // 而 A→B 之後再 B→A 這種一鍵就做得出來的循環也生不出來。
+        // 已經有出向別名的那一列不能再當來源或目標。這擋掉的是循環：A 併進 B
+        // 之後 B 併進 A，`into` 那一邊會撞上這條而被拒絕。
+        //
+        // 它擋不掉鏈：A→B 之後再把 B 併進 C 是允許的，因為 B 自己還沒有出向
+        // 別名。那是刻意的 —— 三列其實是同一個人時，使用者本來就該併得完。
+        // 解析端順著走到根，鏈多長都收斂到同一位。
         for id in [from, into] {
             if self.speakers[id].merged_into.is_some() {
                 return CommandReceipt::rejected("這位語者已經併進別人了");
@@ -1800,12 +1824,15 @@ const POISONED_NOTE: &str = "工作階段狀態已損毀，請重新啟動應用
 /// 寫入失敗會標記 Session，之後所有產生新事件的命令都被拒絕：讓使用者
 /// 以為內容有被保存，比直接說寫不進去糟得多。
 pub fn flush(session: &SessionHandle, store: &StoreHandle) -> Result<(), String> {
-    let Ok(Some((meeting, batch))) =
-        session.with(|s| s.meeting_id().map(|m| (m, s.take_journal())))
+    let Ok(Some((meeting, high_seq, batch))) =
+        session.with(|s| s.meeting_id().map(|m| (m, s.seq, s.take_journal())))
     else {
         return Ok(());
     };
     if batch.is_empty() {
+        // 佇列空的不代表這個命令的事件已經落地 —— 事件泵可能剛把它拿走。
+        // 這裡不宣稱任何事，由 `acknowledge` 去問 `durable_seq`：問不到就
+        // 保守說「還沒存」，而那句話會被下一次成功的寫入收掉。
         return Ok(());
     }
     let result = match store.exclusive() {
@@ -1815,7 +1842,7 @@ pub fn flush(session: &SessionHandle, store: &StoreHandle) -> Result<(), String>
     match result {
         // 積壓的事件都寫進去了才收掉警示
         Ok(_) => {
-            let _ = session.with(|s| s.journal_recovered());
+            let _ = session.with(|s| s.journal_recovered(high_seq));
             Ok(())
         }
         Err(reason) => {
@@ -1839,14 +1866,31 @@ fn journal_note(reason: &str) -> String {
 /// 佇列等重寫，但它此刻並不在日誌裡 —— 使用者關掉程式就永遠不會在。回報成功
 /// 等於讓他相信一件沒發生的事，下次開啟才發現不見了。`journal_error` 只擋得住
 /// **後續**的命令，撞上失敗的那一個本來是報成功的。
-fn settle(receipt: CommandReceipt, flushed: Result<(), String>) -> CommandReceipt {
-    match flushed {
-        Ok(()) => receipt,
-        // 命令自己就被拒絕時保留原本的理由：它沒有產生任何事件，寫入失敗
-        // 講的是別人積壓的那批，拿來當它的拒絕理由只會指錯方向
-        Err(_) if !receipt.accepted => receipt,
-        Err(reason) => CommandReceipt::rejected(&journal_note(&reason)),
+fn acknowledge(
+    state: &SessionHandle,
+    mut receipt: CommandReceipt,
+    flushed: Result<(), String>,
+) -> CommandReceipt {
+    // 被拒絕的命令沒有產生事件，也就沒有落地與否的問題
+    let Some(seq) = receipt.seq.filter(|_| receipt.accepted) else {
+        return receipt;
+    };
+    // 問的是「我這一筆的 seq 進去了沒」，不是「我剛才那次 flush 成不成功」。
+    // 後者答不了：事件泵可能搶先把這一批拿走，於是這裡的 flush 看見空佇列
+    // 而回報成功，真正的寫入卻在別的執行緒失敗。
+    let durable = state.with(|s| s.durable_seq).unwrap_or(0);
+    if durable >= seq {
+        return receipt;
     }
+    let reason = flushed
+        .err()
+        .or_else(|| state.with(|s| s.journal_error.clone()).ok().flatten());
+    receipt.pending = true;
+    receipt.note = Some(match reason {
+        Some(e) => journal_note(&e),
+        None => "已記下，但還沒寫進本機資料庫".to_owned(),
+    });
+    receipt
 }
 
 /// 取 `&SessionHandle` 而不是 `&State<…>`：`State` 會自動解參考，呼叫端一個字
@@ -1859,7 +1903,7 @@ where
     let receipt = state
         .with(f)
         .unwrap_or_else(|_| CommandReceipt::rejected(POISONED_NOTE));
-    settle(receipt, flush(state, store))
+    acknowledge(state, receipt, flush(state, store))
 }
 
 /// 依 Provider 設定挑出這一輪要用的 Planner。
@@ -2388,11 +2432,11 @@ fn open_snapshot(
         Err(_) => return (CommandReceipt::rejected(POISONED_NOTE), None),
     };
     // 先讓 SnapshotCreated 落地，生成才有一個已持久化的游標可以依附
-    let receipt = settle(receipt, flush(state, store));
+    let receipt = acknowledge(state, receipt, flush(state, store));
     let Some(work) = snapshot else {
         return (receipt, None);
     };
-    if receipt.accepted {
+    if receipt.accepted && !receipt.pending {
         return (receipt, Some(work));
     }
     // 游標沒落地就不生成：成果會綁在一個資料庫裡不存在的 run 上。這一版
@@ -2807,14 +2851,22 @@ fn start_new_meeting(state: &SessionHandle, store: &StoreHandle) -> CommandRecei
     let _ = state.with(|s| s.abandon_running_generations());
     // 寫不進去就不換：reset 會丟掉排回佇列等重寫的那批，上一場的結尾
     // 因此永遠不會進日誌，而使用者看到的是新會議開好了
-    if let Err(e) = flush(state, store) {
-        return CommandReceipt::rejected(&journal_note(&e));
+    // 問的是上一場的全部，所以拿它目前的 seq 當門檻
+    let high_seq = state.with(|s| s.seq).unwrap_or(0);
+    let flushed = flush(state, store);
+    let out = acknowledge(state, CommandReceipt::ok(high_seq), flushed);
+    if out.pending {
+        return CommandReceipt::rejected(
+            &out.note
+                .unwrap_or_else(|| "上一場還沒寫進本機資料庫".to_owned()),
+        );
     }
     state.reset();
     CommandReceipt {
         accepted: true,
         seq: Some(0),
         note: None,
+        pending: false,
     }
 }
 
@@ -3613,7 +3665,7 @@ mod tests {
         let mut s = recording();
         s.journal_failed("磁碟已滿".into(), Vec::new());
         assert!(s.journal_error.is_some());
-        s.journal_recovered();
+        s.journal_recovered(s.seq);
         assert!(s.journal_error.is_none());
     }
 
@@ -3628,23 +3680,44 @@ mod tests {
         SessionHandle::from_session(s)
     }
 
-    /// 撞上寫入失敗的那一個命令也必須被拒絕。
+    /// 撞上寫入失敗的那一個命令要說「還沒存」，不是「已接受」也不是「沒送出」。
     ///
     /// `journal_error` 只擋得住**後續**的命令。第一個命令是先改記憶體、送 UI，
     /// 才輪到寫入，於是它拿到一張「已接受」的收據，而內容不在日誌裡 —— 重開
     /// 之後就不見了，而使用者當時看到的是成功。
+    ///
+    /// 反過來直接說「拒絕」也不行：那一筆還排在佇列裡等重試，使用者依拒絕
+    /// 再送一次，兩筆都會落地。
     #[test]
-    fn test_the_command_that_hits_the_write_failure_is_not_reported_as_accepted() {
+    fn test_the_command_that_hits_the_write_failure_says_it_is_not_saved_yet() {
         let store = StoreHandle::temp().unwrap();
         let session = a_session_whose_writes_cannot_land();
 
         let r = command(&session, &store, |s| s.add_note("寫不進去的一筆"));
 
-        assert!(!r.accepted, "日誌沒落地，收據卻說接受了");
+        assert!(r.pending, "日誌沒落地，收據卻沒說");
+        assert!(r.accepted, "它確實被記下了，說沒送出會讓使用者再送一次");
         assert!(
             r.note.unwrap_or_default().contains("無法寫入"),
-            "拒絕理由要說出寫不進去，使用者才知道該去看磁碟"
+            "理由要說出寫不進去，使用者才知道該去看磁碟"
         );
+    }
+
+    /// 事件泵搶先把這一批拿走時，收據問的仍然是自己那個 seq。
+    ///
+    /// 先前 `flush` 看見空佇列就回報成功，於是命令拿到「已接受」，而真正的
+    /// 寫入在別的執行緒失敗 —— 收據說成功，事件不在日誌裡。
+    #[test]
+    fn test_a_receipt_asks_about_its_own_seq_not_about_whoever_flushed() {
+        let store = StoreHandle::temp().unwrap();
+        let session = a_session_whose_writes_cannot_land();
+        let receipt = session.with(|s| s.add_note("別人會搶走這一筆")).unwrap();
+        // 事件泵搶走了這一批：本命令的 flush 只會看到空佇列
+        let _ = session.with(|s| s.take_journal());
+
+        let out = acknowledge(&session, receipt, flush(&session, &store));
+
+        assert!(out.pending, "佇列空的被當成「已經落地」了");
     }
 
     /// 命令自己就被拒絕時，理由要留著它原本那一個。
@@ -3672,6 +3745,7 @@ mod tests {
         let r = command(&session, &store, |s| s.add_note("這一筆寫得進去"));
 
         assert!(r.accepted, "{:?}", r.note);
+        assert!(!r.pending, "事件已經落地了，收據卻說還沒存");
         assert!(session.with(|s| s.journal_error.clone()).unwrap().is_none());
     }
 
@@ -3706,7 +3780,7 @@ mod tests {
 
         let (receipt, work) = open_snapshot(&session, &store, "整理重點");
 
-        assert!(!receipt.accepted, "游標沒落地，收據卻說接受了");
+        assert!(receipt.pending, "游標沒落地，收據卻沒說");
         assert!(work.is_none(), "游標沒落地卻交出了可以開始生成的工作");
         let p = session.with(|s| s.projection()).unwrap();
         assert_eq!(
