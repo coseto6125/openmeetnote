@@ -179,7 +179,7 @@ export const commands = {
   addNote: (text: string) => invoke<CommandReceipt>('add_note', { text }),
   confirmSpeaker: (speakerId: string, name: string) =>
     invoke<CommandReceipt>('confirm_speaker', { speakerId, name }),
-  /** 兩位語者其實是同一個人。來源那一列從名單上消失，片段的 id 不變。 */
+  /** 兩位語者其實是同一個人。來源那一列留在名單裡、只標上 mergedInto，畫面顯示時才略過；片段的 id 不變。 */
   mergeSpeaker: (fromSpeakerId: string, intoSpeakerId: string) =>
     invoke<CommandReceipt>('merge_speaker', { fromSpeakerId, intoSpeakerId }),
   editTranscript: (segmentId: number, text: string) =>

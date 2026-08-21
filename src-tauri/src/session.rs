@@ -99,8 +99,9 @@ pub enum SessionEvent {
         speaker_id: String,
         name: String,
     },
-    /// 兩位語者其實是同一個人。來源那一列從名單上消失，但它的 id 留在片段
-    /// 上：合併是讀取時才套用的別名，不是對過去的改寫（§8.1）。
+    /// 兩位語者其實是同一個人。來源那一列留在名單上，只標上 merged_into，
+    /// 畫面顯示時才略過；它的 id 留在片段上：合併是讀取時才套用的別名，
+    /// 不是對過去的改寫（§8.1）。
     SpeakerMerged {
         seq: u64,
         from_speaker_id: String,
@@ -664,7 +665,6 @@ impl Session {
         seq
     }
 
-    /// 取走待寫入的日誌。呼叫端負責寫進 Store，失敗時用 `journal_failed` 回報。
     /// 取走待寫入的日誌。呼叫端負責寫進 Store，失敗時用 `journal_failed` 回報。
     ///
     /// 這一批涵蓋到的最大 seq 就是 `self.seq`：`record` 是唯一配發 seq 的
@@ -2903,12 +2903,7 @@ fn start_new_meeting(state: &SessionHandle, store: &StoreHandle) -> CommandRecei
     if state.reset().is_err() {
         return CommandReceipt::rejected(POISONED_NOTE);
     }
-    CommandReceipt {
-        accepted: true,
-        seq: Some(0),
-        note: None,
-        pending: false,
-    }
+    CommandReceipt::ok(0)
 }
 
 /// 這個 Session 到目前為止的事件都進日誌了嗎？沒有的話回一張拒絕收據。

@@ -555,7 +555,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                         {s.confirmedName ? '改名' : '命名'}
                       </button>
                     ))}
-{/* 聲紋比對寧可錯拆也不錯併（§8.1），代價是同一個人可能多出一列。
+                  {/* 聲紋比對寧可錯拆也不錯併（§8.1），代價是同一個人可能多出一列。
                       這裡是把它改回來的地方；合併只是別名，片段的 id 不變。 */}
                   {!isPending &&
                     naming !== s.id &&
