@@ -80,15 +80,13 @@ impl Segmenter {
         let mut acc = vec![[0f32; 3]; total_frames];
         let mut cov = vec![0u32; total_frames];
 
+        // 範圍恆含 0，所以 starts 不為空；不足一窗的短批次也會跑一次補零的窗。
         let mut starts: Vec<usize> = (0..=samples.len().saturating_sub(WINDOW_SAMPLES))
             .step_by(HOP_SAMPLES)
             .collect();
         let last_start = samples.len().saturating_sub(WINDOW_SAMPLES);
-        if samples.len() > WINDOW_SAMPLES && *starts.last().unwrap_or(&0) != last_start {
+        if samples.len() > WINDOW_SAMPLES && *starts.last().unwrap() != last_start {
             starts.push(last_start); // 補上尾端不足一步長的殘窗
-        }
-        if starts.is_empty() {
-            starts.push(0); // 不足一個窗：補零跑一次，短批次也有切點可用
         }
 
         for &s in &starts {
