@@ -816,16 +816,18 @@ fn final_loop(
     // 只有系統音訊軌需要辨識語者：麥克風軌一定是使用者本人，那是不需要
     // 模型就成立的先驗，再去比對聲紋只會製造把自己認成別人的機會。
     let mut speakers =
-        speaker_model.and_then(|(_seg, emb)| match SpeakerBook::load(vad_model, emb) {
-            Ok(b) => {
-                log(&format!("語者辨識已載入：{emb}"));
-                Some(b)
-            }
-            Err(e) => {
-                log(&format!("語者分離載入失敗，遠端將歸為同一位語者：{e}"));
-                None
-            }
-        });
+        speaker_model.and_then(
+            |(seg, emb)| match SpeakerBook::load(vad_model, emb, Some(seg)) {
+                Ok(b) => {
+                    log(&format!("語者辨識已載入：{emb}"));
+                    Some(b)
+                }
+                Err(e) => {
+                    log(&format!("語者分離載入失敗，遠端將歸為同一位語者：{e}"));
+                    None
+                }
+            },
+        );
 
     // 每軌一個 VAD：兩軌的語音活動彼此獨立，共用會把遠端的說話算成本機也在說話。
     let mut vads: HashMap<Track, SileroVad> = HashMap::new();

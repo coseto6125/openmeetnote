@@ -844,12 +844,6 @@ macOS 那條路徑的兩個來源是刻意分開的：ScreenCaptureKit 從 macOS
 
 以下選項必須透過 PoC 或使用者選擇決定，現階段不寫死：
 
-- 遠端語者分辨要不要換回 pyannote segmentation。目前走聲紋比對（VAD 切段 +
-  embedding 對應），切點來自靜音而不是語者變化，快速對答時兩人之間沒有足夠停頓
-  就會混在一段裡。segmentation 的品質明顯較好（同一段音訊切出 22 段對 9 段，
-  連重疊發言都抓得到），但 `sherpa-onnx-c-api.dll` 在 Windows 上執行 diarization
-  會固定崩在同一個位移（0xc0000005 @ 0x7b5c7），Linux 同版本 .so 無事 ——
-  那是預編二進位的問題，Rust 側補不了。待上游修復。
 - 第一批 LLM Provider 與 OpenAI-compatible 支援範圍。
 - Diarization 在串流階段或會後進行二次校正。
 - 原始音訊預設保留期限與自動清理策略。
@@ -862,6 +856,7 @@ macOS 那條路徑的兩個來源是刻意分開的：ScreenCaptureKit 從 macOS
 | 專案授權 | MIT。第三方元件各自保留其授權，記在 `docs/THIRD_PARTY.md` | 2026-08-05 |
 | 帶 patch 的相依套件如何發布 | 收進 `src-tauri/vendor/`，不開 fork。兩份都與 crates.io 上的版本逐位元組相同，`diff` 就看得到改了什麼，而且 `git clone` 之後不必再設定任何東西 | 2026-08-05 |
 | Mermaid runtime | 不內嵌（§10.2） | 2026-08-05 |
+| 遠端語者的切點來源 | pyannote segmentation 3.0 用 `ort` 直接跑 ONNX 當切點（`src/stt/segment.rs`），聲紋比對只負責身分；模型缺席或載入失敗退回 VAD 靜音切點。刻意不走 `sherpa-onnx-c-api.dll` 的 diarization 管線——它在 Windows 固定崩潰（0xc0000005 @ 0x7b5c7），而 diarization 附帶的分群本來就用不到。實測：90 秒快問快答靜音切點整場漏登記一位，語者切點正確抓出兩位；CPU RTFx ≈ 60（含聲紋與 VAD 全流程）。已知邊界：三人會議仍登記五位是聲紋門檻層的既有問題，與切點無關 | 2026-08-23 |
 
 ## 19. Minutes 參考邊界
 

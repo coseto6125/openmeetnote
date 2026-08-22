@@ -30,6 +30,13 @@ hound = "3.5.1"
 strsim = "0.11.1"
 zhconv = "0.4.1"
 tempfile = "3.27.0"
+# 語者切點用 pyannote segmentation 的直接 ONNX 推論。不走 sherpa-onnx 的
+# diarization C API：那顆預編 DLL 在 Windows 上固定崩潰（§18），而這裡只
+# 需要「音訊 → 每幀語者活動度」這一步，自己跑模型反而三個平台行為一致。
+ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+    "std",
+    "download-binaries",
+] }
 # 使用者資料目錄。日誌一定要寫得進去，而安裝版的程式目錄是唯讀的；
 # 「該寫哪裡」是每個平台各自的慣例，不是一條可以自己拼出來的路徑。
 dirs = "6"

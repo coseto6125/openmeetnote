@@ -3,17 +3,18 @@
 //! 系統音訊軌可能坐著好幾個人，而 `track` 只分得出「本機 vs 遠端」。這裡對
 //! 每一段發言抽聲紋，跟已經聽過的人比對：像就歸給同一位，不像就是新的人。
 //!
-//! # 為什麼不用 pyannote segmentation
+//! # 切點跟著語者變化走（pyannote segmentation）
 //!
-//! segmentation 的分離品質明顯較好（120 秒三人協商切出 22 段，連重疊發言都
-//! 抓得到，聲紋比對只切得出 9 段），但 `sherpa-onnx-c-api.dll` 在 Windows 上
-//! 執行 diarization 會固定崩在同一個位移（0xc0000005 @ 0x7b5c7），Linux 的
-//! 同版本 .so 卻沒事。那是預編二進位本身的問題，Rust 這側補不了 —— 已經在
-//! `vendor/sherpa-rs` 補掉 null 解參考與資源洩漏兩個上游 bug，崩潰依舊。
+//! 切點品質的差距早就量過：120 秒三人協商，segmentation 切出 22 段、連重疊
+//! 發言都抓得到，VAD 只靠停頓只切得出 9 段。實測差距落在快問快答——90 秒
+//! 對答用靜音切點整場只登記一位，語者切點正確抓出兩位。
 //!
-//! 所以走聲紋這條：切點來自 VAD 而不是語者變化，快速對答時兩人之間沒有足夠
-//! 停頓就會混在一段裡，代價是分辨力較粗。等 DLL 修好可以換回去，`split` 的
-//! 介面不會變。
+//! 所以 [`load`] 收一條分割模型的路徑，內部用 `ort` 直接跑 ONNX（見
+//! [`super::segment`]），不碰 `sherpa-onnx-c-api.dll` 的 diarization 管線：
+//! 它在 Windows 上固定崩在同一個位移（0xc0000005 @ 0x7b5c7），是預編二進位
+//! 本身的問題，Rust 這側補不了。分割模型只回答「哪裡換人說話」，誰是誰仍由
+//! 底下的聲紋比對決定。模型缺席或載入失敗就退回 VAD 靜音切點，`split` 的
+//! 介面與回傳不變，這條路必須永遠有答案。
 //!
 //! # 線上而非會後
 //!
@@ -41,6 +42,7 @@ use std::sync::{Mutex, OnceLock};
 use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig};
 use sherpa_rs::speaker_id::{EmbeddingExtractor, ExtractorConfig};
 
+use super::segment::Segmenter;
 use super::Result;
 use crate::audio::SAMPLE_RATE;
 
@@ -191,11 +193,16 @@ fn nearest(known: &[Voice], embedding: &[f32]) -> Option<(usize, f32)> {
 
 pub struct SpeakerBook {
     vad_model: String,
+    /// 有分割模型就用語者變化當切點；載入失敗或沒給就退回靜音切點。
+    segmenter: Option<Segmenter>,
 }
 
 impl SpeakerBook {
     /// 準備語者辨識。第一次呼叫會載入模型，之後共用同一份對應表。
-    pub fn load(vad_model: &str, embedding: &str) -> Result<Self> {
+    ///
+    /// `segmentation` 是 pyannote segmentation 的 ONNX 路徑，可缺：模型不在
+    /// 或壞了都只是退回舊的靜音切點，逐字稿與語者分離照常運作。
+    pub fn load(vad_model: &str, embedding: &str, segmentation: Option<&str>) -> Result<Self> {
         if BOOK.get().is_none() {
             let extractor = EmbeddingExtractor::new(ExtractorConfig {
                 model: embedding.to_owned(),
@@ -209,8 +216,19 @@ impl SpeakerBook {
                 known: Vec::new(),
             }));
         }
+        let segmenter = match segmentation {
+            Some(path) => match Segmenter::load(path) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("語者切點模型載入失敗，改用靜音切點：{e}");
+                    None
+                }
+            },
+            None => None,
+        };
         Ok(Self {
             vad_model: vad_model.to_owned(),
+            segmenter,
         })
     }
 
@@ -219,6 +237,25 @@ impl SpeakerBook {
     /// 回傳空的代表這批分不出來，呼叫端應沿用軌道的預設語者 —— 這條路徑
     /// 必須永遠可用，語者分不出來只是少了一個資訊，不該讓逐字稿跟著沒有。
     pub fn split(&mut self, samples: &[f32]) -> Vec<SpeakerSpan> {
+        // 分割模型給的切點跟著語者變化走，靜音切點辦不到的快問快答就靠它。
+        // 切出來的每一段照舊交給 attribute() 憑聲紋決定是誰，模型只負責切，
+        // 不負責認。整段沒人開口或推論失敗時落回 VAD 路徑，這條路必須永遠
+        // 有答案（見本函式上方的約定）。
+        if let Some(seg) = self.segmenter.as_mut() {
+            match seg.turns(samples) {
+                Ok(turns) if !turns.is_empty() => {
+                    return turns
+                        .iter()
+                        .filter_map(|t| {
+                            self.attribute(&samples[t.start_sample..t.end_sample], t.start_sample)
+                        })
+                        .collect();
+                }
+                Err(e) => eprintln!("語者切點推論失敗，改用靜音切點：{e}"),
+                _ => {}
+            }
+        }
+
         let Ok(mut vad) = SileroVad::new(
             SileroVadConfig {
                 model: self.vad_model.clone(),
