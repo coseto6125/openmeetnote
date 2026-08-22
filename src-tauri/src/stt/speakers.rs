@@ -220,7 +220,7 @@ impl SpeakerBook {
             Some(path) => match Segmenter::load(path) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    eprintln!("語者切點模型載入失敗，改用靜音切點：{e}");
+                    super::live::log(&format!("語者切點模型載入失敗，改用靜音切點：{e}"));
                     None
                 }
             },
@@ -251,7 +251,7 @@ impl SpeakerBook {
                         })
                         .collect();
                 }
-                Err(e) => eprintln!("語者切點推論失敗，改用靜音切點：{e}"),
+                Err(e) => super::live::log(&format!("語者切點推論失敗，改用靜音切點：{e}")),
                 _ => {}
             }
         }

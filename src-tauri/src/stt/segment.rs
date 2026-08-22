@@ -73,7 +73,7 @@ impl Segmenter {
     }
 
     /// 整段音訊的逐幀活動度：重疊滑窗平均之後再過中位數濾波。
-    pub fn activity(&mut self, samples: &[f32]) -> Result<Vec<[f32; 3]>> {
+    fn activity(&mut self, samples: &[f32]) -> Result<Vec<[f32; 3]>> {
         // 時間軸以絕對位置對齊，不用窗序號累加：步長不是幀長的整數倍，
         // 用窗序號算基底會讓誤差隨窗數線性漂移。
         let total_frames = (samples.len() as f64 / SAMPLES_PER_FRAME).ceil() as usize + 1;
@@ -131,11 +131,17 @@ impl Segmenter {
             .session
             .run(ort::inputs!["x" => input])
             .map_err(|e| SttError::Decode(format!("分割模型推論失敗：{e}")))?;
-        // rc.10 的 try_extract_tensor 回 (形狀, 資料) 兩件東西；形狀是 i64
+        // rc.10 的 try_extract_tensor 回 (形狀, 資料) 兩件東西；形狀是 i64。
+        // 形狀檢查不能只放在 debug_assert：release 換錯模型會在切片上炸出
+        // 難查的 panic，這裡直接回 Decode 把模型名帶進錯誤訊息。
         let (shape, data) = outputs[0]
             .try_extract_tensor::<f32>()
             .map_err(|e| SttError::Decode(format!("分割模型輸出解讀失敗：{e}")))?;
-        debug_assert_eq!(shape[2], NUM_CLASSES as i64);
+        if shape.len() != 3 || shape[2] != NUM_CLASSES as i64 {
+            return Err(SttError::Decode(format!(
+                "分割模型輸出形狀不符預期 [N, 幀, {NUM_CLASSES}]，實得 {shape:?}"
+            )));
+        }
 
         let frames = shape[1] as usize;
         let mut out = Vec::with_capacity(frames);
@@ -271,25 +277,25 @@ mod tests {
     }
 
     #[test]
-    fn silence_decodes_to_no_speaker() {
+    fn test_silence_decodes_to_no_speaker() {
         let a = powerset_to_activity(&one_hot(0));
         assert!(a.iter().all(|&v| v < 1e-3), "{a:?}");
     }
 
     #[test]
-    fn single_speaker_class_activates_only_that_speaker() {
+    fn test_single_speaker_class_activates_only_that_speaker() {
         let a = powerset_to_activity(&one_hot(1)); // {A}
         assert!(a[0] > 0.999 && a[1] < 1e-3 && a[2] < 1e-3, "{a:?}");
     }
 
     #[test]
-    fn overlap_class_activates_both_speakers() {
+    fn test_overlap_class_activates_both_speakers() {
         let a = powerset_to_activity(&one_hot(4)); // {A,B}
         assert!(a[0] > 0.999 && a[1] > 0.999 && a[2] < 1e-3, "{a:?}");
     }
 
     #[test]
-    fn a_flicker_between_the_same_speaker_is_absorbed() {
+    fn test_a_flicker_between_the_same_speaker_is_absorbed() {
         // A 說 100 幀、B 抖了 10 幀、A 繼續 100 幀 → 只剩一段 A。
         // 抖動夾在同一位中間是模型雜訊，併回去；切成三段反而製造兩個假切點。
         let mut act = vec![[1.0, 0.0, 0.0]; 100];
@@ -306,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn a_short_interjection_between_two_speakers_survives() {
+    fn test_a_short_interjection_between_two_speakers_survives() {
         // A 說完、B 短短插一句、C 接手。前後不同人的短翻轉不是雜訊，
         // 併進隔壁等於把話安到錯的人頭上，所以保留原狀。
         let mut act = vec![[1.0, 0.0, 0.0]; 100];
@@ -321,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn silence_splits_turns_and_is_not_included() {
+    fn test_silence_splits_turns_and_is_not_included() {
         let mut act = vec![[1.0, 0.0, 0.0]; 100];
         act.extend(vec![[0.0; 3]; 50]); // 全靜音
         act.extend(vec![[0.0, 1.0, 0.0]; 100]);
@@ -345,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn median_filter_kills_a_single_frame_spike() {
+    fn test_median_filter_kills_a_single_frame_spike() {
         let mut act = vec![[0.0, 0.0, 0.0]; 3];
         act.push([9.0, 0.0, 0.0]);
         act.push([0.0, 0.0, 0.0]);
@@ -354,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn median_filter_keeps_a_sustained_level() {
+    fn test_median_filter_keeps_a_sustained_level() {
         let mut act = vec![[0.0, 0.0, 0.0]; 2];
         act.extend(vec![[1.0, 0.0, 0.0]; 10]);
         median_filter(&mut act, 0, MEDIAN_K);
