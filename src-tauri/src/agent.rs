@@ -155,24 +155,36 @@ pub fn build_index(
     // 名字先算，再收斂 id。順序反過來的話，被併掉那一列的軌道會蓋到合併
     // 對象頭上，同一位語者在摘要 prompt 裡叫「我」、在匯出檔裡叫「語者 2」。
     let names = crate::document::speaker_names(&stored, &segments);
+    // 每一列只走一次別名鏈：先建 id→根 的表，底下的片段收斂與名單過濾都查
+    // 這張表，不必每個片段各自把同一條鏈重走一遍。
+    let roots: std::collections::HashMap<&str, &str> = stored
+        .iter()
+        .map(|s| {
+            (
+                s.speaker_id.as_str(),
+                crate::store::resolve_merge(&stored, &s.speaker_id),
+            )
+        })
+        .collect();
     // 合併只寫在 speakers 那一列上，片段留著當時聽到的 id。索引是讀取端的
     // 一份投影，在這裡把 id 收斂到合併後的那一位，模型才不會拿到同一個人的
     // 兩個代號、把他當成兩個人。`segment_id` 與 `revision` 不動，引用照樣
     // 落回原始片段（§8.1）。
     for seg in segments.iter_mut() {
-        let Some(id) = seg.speaker_id.clone() else {
+        let Some(id) = seg.speaker_id.as_deref() else {
             continue;
         };
-        let root = crate::store::resolve_merge(&stored, &id);
-        if root != id.as_str() {
-            seg.speaker_id = Some(root.to_owned());
+        if let Some(root) = roots.get(id) {
+            if *root != id {
+                seg.speaker_id = Some((*root).to_owned());
+            }
         }
     }
     let speakers = stored
         .iter()
         // 併掉的那幾列不進名單：片段的 id 上面已經收斂過，留著只會讓模型
         // 看到兩筆同名的人
-        .filter(|s| crate::store::resolve_merge(&stored, &s.speaker_id) == s.speaker_id)
+        .filter(|s| roots.get(s.speaker_id.as_str()).copied() == Some(s.speaker_id.as_str()))
         .map(|s| SpeakerName {
             display: names
                 .get(&s.speaker_id)

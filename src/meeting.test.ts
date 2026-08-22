@@ -3,6 +3,7 @@ import {
   applyBatch,
   emptyMeeting,
   fromProjection,
+  isMergeRoot,
   resolveMerge,
   receiptDegrade,
   speakerDisplayName,
@@ -603,6 +604,29 @@ describe('speaker display name', () => {
       for (const x of all) expect(resolveMerge(all, x.id)).toBe(x.id);
       expect(() => all.map((x) => speakerDisplayName(x, all))).not.toThrow();
     }
+  });
+
+  // 名單過濾與預設稱呼的編號都靠「這一列還是不是一個人」，包成函式之後
+  // 呼叫端不必各自對 resolveMerge 的結果比對自己。
+  test('is_merge_root_true_only_for_rows_that_still_stand_for_themselves', () => {
+    const all = [s(1, 'system'), s(2, 'system')];
+    all[0] = { ...all[0], mergedInto: 's2' };
+    expect(isMergeRoot(all, 's2')).toBe(true);
+    expect(isMergeRoot(all, 's1')).toBe(false);
+    // 名單上沒有的 id 不該被當成任何人的根
+    expect(isMergeRoot(all, '沒聽過的人')).toBe(true);
+  });
+
+  test('a_dangling_or_cyclic_alias_counts_as_its_own_root', () => {
+    const dangling = [s(1, 'system'), s(2, 'system')];
+    dangling[0] = { ...dangling[0], mergedInto: '不存在的人' };
+    expect(dangling.map((x) => isMergeRoot(dangling, x.id))).toEqual([true, true]);
+
+    const cycle = [
+      { ...s(1, 'system'), mergedInto: 's2' },
+      { ...s(2, 'system'), mergedInto: 's1' },
+    ];
+    expect(cycle.map((x) => isMergeRoot(cycle, x.id))).toEqual([true, true]);
   });
 
   // 別名指向名單上沒有的人時，那一列照常有自己的名字。整份逐字稿因為一個
