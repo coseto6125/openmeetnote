@@ -76,9 +76,19 @@ fn replay(wavs: &[String], bench: &str) -> Result<(), Box<dyn std::error::Error>
     for w in wavs {
         samples.extend(load_wav_16k_mono(w)?);
     }
+    // bench 目錄放了分割模型就用語者變化切點，沒有就退回靜音切點；
+    // 兩種各跑一遍正好是這個工具要的對照。
+    let seg = std::env::var("OMN_SEG_MODEL").ok().or_else(|| {
+        let p = format!("{bench}/speaker-segmentation.onnx");
+        std::path::Path::new(&p).exists().then_some(p)
+    });
+    if seg.is_none() {
+        println!("（無分割模型，走靜音切點）");
+    }
     let mut book = SpeakerBook::load(
         &format!("{bench}/silero_vad.onnx"),
         &format!("{bench}/emb.onnx"),
+        seg.as_deref(),
     )?;
 
     let batch = (BATCH_MS * u64::from(SAMPLE_RATE) / 1000) as usize;

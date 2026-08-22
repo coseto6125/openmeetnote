@@ -10,6 +10,7 @@
 pub mod diff;
 pub mod live;
 pub mod paraformer;
+pub mod segment;
 pub mod speakers;
 pub mod whisper;
 

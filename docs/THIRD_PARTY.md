@@ -9,7 +9,7 @@ each under its own license.
 |---|---|---|
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | MIT | Final-transcript inference |
 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | Apache-2.0 | Live transcript, VAD, punctuation, speaker embedding |
-| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | MIT | Backend for sherpa-onnx |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | MIT | Backend for sherpa-onnx 與 `ort`（語者分割模型直接推論） |
 
 Speech models carry their own terms, set by whoever published them. They are
 not distributed with this project.
