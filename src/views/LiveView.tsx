@@ -53,6 +53,9 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
   // 受控輸入。非受控的話 blur 讀到的值取決於瀏覽器何時同步 DOM，
   // 而 HistoryView 的改名本來就是受控的，兩處不該有兩種寫法。
   const [nameDraft, setNameDraft] = useState('');
+  // 合併選單的受控值，每次選擇後歸零。非受控時 DOM 停在上一次的選擇，
+  // 被拒絕而留著的選單重選同一個人不再觸發 change，看起來像按了沒反應。
+  const [mergeIntoDraft, setMergeIntoDraft] = useState('');
   const streamRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
 
@@ -74,26 +77,41 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
 
   /* ── 衍生資料 ─────────────────────────────────────────── */
 
+  // 名單變動才重算一次：id→列、id→別名根、id→稱呼三張表。原本 speakerOf、
+  // roster、nameOf 各自解析合併別名，每個片段每次繪製都把同一條鏈重走一遍；
+  // 收進一張索引後畫面查表是常數時間。
+  const speakerIndex = useMemo(() => {
+    const byId = new Map<string, Speaker>();
+    const rootOf = new Map<string, string>();
+    const display = new Map<string, string>();
+    for (const s of model.speakers) {
+      byId.set(s.id, s);
+      rootOf.set(s.id, resolveMerge(model.speakers, s.id));
+    }
+    for (const s of model.speakers) {
+      // 被併掉的列照樣取得到稱呼：displayName 自己會走到合併對象
+      display.set(s.id, displayName(s, model.speakers));
+    }
+    return { byId, rootOf, display };
+  }, [model.speakers]);
+
   // 併掉的 id 也要問得到人。合併不改寫片段，片段上帶著的仍是當時聽到的那個
   // id，直接比對就查不到，畫面上的顏色與軌道會退回預設值。
   const speakerOf = useCallback(
     (id: string) => {
-      const root = resolveMerge(model.speakers, id);
-      return model.speakers.find((s) => s.id === root);
+      const root = speakerIndex.rootOf.get(id);
+      return root === undefined ? undefined : speakerIndex.byId.get(root);
     },
-    [model.speakers],
+    [speakerIndex],
   );
   /** 還是一個人的那幾列。被併掉的留在 `model.speakers` 裡供查詢，但不上名單。 */
   const roster = useMemo(
-    () => model.speakers.filter((s) => resolveMerge(model.speakers, s.id) === s.id),
-    [model.speakers],
+    () => model.speakers.filter((s) => speakerIndex.rootOf.get(s.id) === s.id),
+    [model.speakers, speakerIndex],
   );
   const nameOf = useCallback(
-    (id: string) => {
-      const s = speakerOf(id);
-      return s ? displayName(s, model.speakers) : id;
-    },
-    [speakerOf, model.speakers],
+    (id: string) => speakerIndex.display.get(id) ?? id,
+    [speakerIndex],
   );
 
   const finalCount = model.segments.filter((s) => s.stability === 'final').length;
@@ -555,7 +573,7 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                         {s.confirmedName ? '改名' : '命名'}
                       </button>
                     ))}
-{/* 聲紋比對寧可錯拆也不錯併（§8.1），代價是同一個人可能多出一列。
+                  {/* 聲紋比對寧可錯拆也不錯併（§8.1），代價是同一個人可能多出一列。
                       這裡是把它改回來的地方；合併只是別名，片段的 id 不變。 */}
                   {!isPending &&
                     naming !== s.id &&
@@ -563,9 +581,12 @@ export function LiveView({ model, setModel, localDegrade, setLocalDegrade }: Liv
                       <select
                         className="spk-input"
                         autoFocus
-                        defaultValue=""
+                        value={mergeIntoDraft}
                         onBlur={() => setMerging(null)}
-                        onChange={(e) => void submitMerge(s.id, e.target.value)}
+                        onChange={(e) => {
+                          setMergeIntoDraft('');
+                          void submitMerge(s.id, e.target.value);
+                        }}
                       >
                         <option value="">併入誰…</option>
                         {roster

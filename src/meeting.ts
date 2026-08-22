@@ -411,6 +411,15 @@ export function resolveMerge(all: NamedSpeaker[], id: string): string {
 }
 
 /**
+ * 這一列是不是還是一個人（別名鏈的根）。名單過濾與預設稱呼的編號都只算根
+ * 那一列；把 `resolveMerge(all, id) === id` 包成有名字的判斷，呼叫端不必各自
+ * 記住「解析回自己就是根」這個約定。
+ */
+export function isMergeRoot(all: NamedSpeaker[], id: string): boolean {
+  return resolveMerge(all, id) === id;
+}
+
+/**
  * §8.2 的名稱優先順序：確認名 > 暫定名 > 依軌道與出現序的預設稱呼。
  *
  * 預設稱呼裡的編號只數遠端語者。ordinal 是全域的出現序，麥克風軌會佔掉一格，
@@ -438,10 +447,7 @@ export function speakerDisplayName(s: NamedSpeaker, all: NamedSpeaker[]): string
   if (s.track === 'mic') return '我';
   const nth = all.filter(
     (x) =>
-      x.track === 'system' &&
-      x.id !== UNKNOWN_REMOTE &&
-      resolveMerge(all, x.id) === x.id &&
-      x.ordinal <= s.ordinal,
+      x.track === 'system' && x.id !== UNKNOWN_REMOTE && isMergeRoot(all, x.id) && x.ordinal <= s.ordinal,
   ).length;
   return `語者 ${nth}`;
 }

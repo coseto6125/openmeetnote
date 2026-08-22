@@ -99,8 +99,9 @@ pub enum SessionEvent {
         speaker_id: String,
         name: String,
     },
-    /// 兩位語者其實是同一個人。來源那一列從名單上消失，但它的 id 留在片段
-    /// 上：合併是讀取時才套用的別名，不是對過去的改寫（§8.1）。
+    /// 兩位語者其實是同一個人。來源那一列留在名單上，只標上 merged_into，
+    /// 畫面顯示時才略過；它的 id 留在片段上：合併是讀取時才套用的別名，
+    /// 不是對過去的改寫（§8.1）。
     SpeakerMerged {
         seq: u64,
         from_speaker_id: String,
@@ -664,7 +665,6 @@ impl Session {
         seq
     }
 
-    /// 取走待寫入的日誌。呼叫端負責寫進 Store，失敗時用 `journal_failed` 回報。
     /// 取走待寫入的日誌。呼叫端負責寫進 Store，失敗時用 `journal_failed` 回報。
     ///
     /// 這一批涵蓋到的最大 seq 就是 `self.seq`：`record` 是唯一配發 seq 的
@@ -1375,6 +1375,12 @@ impl Session {
         if speaker_id == crate::model::UNKNOWN_REMOTE {
             return CommandReceipt::rejected("「遠端」不是單一語者，無法命名");
         }
+        // 已經併進別人的那一列不能再命名。store 的投影會把 status 翻成
+        // confirmed 而 merged_into 還留著，片段的別名與名單狀態從此對不起來；
+        // merge_speaker 擋的是同一件事的另一個方向，說詞共用。
+        if self.speakers[speaker_id].merged_into.is_some() {
+            return CommandReceipt::rejected("這位語者已經併進別人了");
+        }
         let (id, name) = (speaker_id.to_owned(), name.trim().to_owned());
         if let Some(rec) = self.speakers.get_mut(&id) {
             rec.confirmed_name = Some(name.clone());
@@ -1784,6 +1790,14 @@ pub struct SessionHandle {
     /// A 之後才失敗 —— 收據於是說第 5 筆已經落地，而它並不在日誌裡。
     /// 事件泵與命令是兩條各自呼叫 `flush` 的路，所以這是真的會發生的交錯。
     flushing: Mutex<()>,
+    /// 一次只有一個換場；開快照也排在同一條隊上。
+    ///
+    /// `start_new_meeting` 的「收尾生成 → 確認寫出 → reset」若讓快照夾進來，
+    /// 那個快照就躲過了收尾：它在 abandon 之後才誕生，reset 換掉 Session 之後
+    /// 背景工作找不到自己的 run_id，資料庫裡那一版永遠停在 running。互斥之後
+    /// 快照只有兩種下場：整個在換場前完成（被正常收尾），或在換場後才開始
+    /// （對著空會議被拒絕）。
+    replacing: Mutex<()>,
 }
 
 impl Default for SessionHandle {
@@ -1793,6 +1807,7 @@ impl Default for SessionHandle {
             epoch: Instant::now(),
             starting: Mutex::new(()),
             flushing: Mutex::new(()),
+            replacing: Mutex::new(()),
         }
     }
 }
@@ -1829,6 +1844,7 @@ impl SessionHandle {
             epoch: Instant::now(),
             starting: Mutex::new(()),
             flushing: Mutex::new(()),
+            replacing: Mutex::new(()),
         }
     }
 
@@ -2453,6 +2469,8 @@ fn open_snapshot(
     store: &StoreHandle,
     prompt: &str,
 ) -> (CommandReceipt, Option<SnapshotWork>) {
+    // 整段與換場互斥；排同一條隊的理由寫在 `SessionHandle::replacing` 上。
+    let _not_during_a_swap = state.replacing.lock();
     // 配發在這裡而不是 Session 裡：號碼是全域的，只能有一個配發者，
     // 而 Session 看不到別場會議正在用哪些號碼
     let ids = match store.exclusive().map(|mut st| st.allocate_run_ids()) {
@@ -2889,6 +2907,13 @@ fn start_new_meeting(state: &SessionHandle, store: &StoreHandle) -> CommandRecei
     if let Some(r) = written_out(state, store) {
         return r;
     }
+    // 從這裡到 reset 全程擋住快照：夾進來的那一個會躲過上面的收尾，
+    // reset 之後永遠停在 running。理由寫在 `SessionHandle::replacing` 上；
+    // 鎖中毒時 Err 裡面一樣握著 guard，排隊照樣成立。
+    // 從這裡到 reset 全程擋住快照：夾進來的那一個會躲過上面的收尾，
+    // reset 之後永遠停在 running。理由寫在 `SessionHandle::replacing` 上；
+    // 鎖中毒時 Err 裡面一樣握著 guard，排隊照樣成立。
+    let _replacing = state.replacing.lock();
     // 收尾還在跑的生成。不收的話，背景工作完成時 Session 已經換掉，找不到
     // 自己的 run_id，事件永遠不會寫入，歷史頁那一版永遠顯示「生成中」。
     if state.with(|s| s.abandon_running_generations()).is_err() {
@@ -2903,12 +2928,7 @@ fn start_new_meeting(state: &SessionHandle, store: &StoreHandle) -> CommandRecei
     if state.reset().is_err() {
         return CommandReceipt::rejected(POISONED_NOTE);
     }
-    CommandReceipt {
-        accepted: true,
-        seq: Some(0),
-        note: None,
-        pending: false,
-    }
+    CommandReceipt::ok(0)
 }
 
 /// 這個 Session 到目前為止的事件都進日誌了嗎？沒有的話回一張拒絕收據。
@@ -3859,6 +3879,111 @@ mod tests {
         );
     }
 
+    /// 換場進行中，快照必須等。
+    ///
+    /// 壓力測試的交錯窗口太窄，排程運氣好就永遠撞不到；這裡直接持有
+    /// `replacing` 鎖模擬換場走到一半（閘門已過、還沒 reset），快照不得動工。
+    #[test]
+    fn test_open_snapshot_waits_while_a_meeting_swap_is_in_progress() {
+        use std::sync::Arc;
+
+        let store = Arc::new(StoreHandle::temp().unwrap());
+        let m = store.exclusive().unwrap().create_meeting("測試").unwrap();
+        let mut s = Session::default();
+        assert!(s.start(m).accepted);
+        let session = Arc::new(SessionHandle::from_session(s));
+
+        let swap_in_progress = session.replacing.lock().expect("鎖不應中毒");
+
+        let (store_t, session_t) = (store.clone(), session.clone());
+        let snapshotter = std::thread::spawn(move || open_snapshot(&session_t, &store_t, "排隊中"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !snapshotter.is_finished(),
+            "換場還沒結束，快照卻已經動工：replacing 沒有擋住它"
+        );
+        drop(swap_in_progress);
+
+        let (receipt, work) = snapshotter.join().unwrap();
+        assert!(receipt.accepted, "{:?}", receipt.note);
+        assert!(work.is_some(), "換場結束後快照應該正常完成");
+    }
+
+    /// 對稱的那一半：快照還在進行時，換場必須等。少了換場側的排隊，
+    /// 快照會落在 abandon 之後、reset 之前，躲過收尾。
+    #[test]
+    fn test_a_meeting_swap_waits_while_a_snapshot_is_in_progress() {
+        use std::sync::Arc;
+
+        let store = Arc::new(StoreHandle::temp().unwrap());
+        let m = store.exclusive().unwrap().create_meeting("測試").unwrap();
+        let mut s = Session::default();
+        assert!(s.start(m).accepted);
+        let session = Arc::new(SessionHandle::from_session(s));
+
+        let snapshot_in_progress = session.replacing.lock().expect("鎖不應中毒");
+
+        let (store_t, session_t) = (store.clone(), session.clone());
+        let swapper = std::thread::spawn(move || {
+            assert!(start_new_meeting(&session_t, &store_t).accepted);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !swapper.is_finished(),
+            "快照還沒收尾，換場卻已經動工：replacing 沒有擋住它"
+        );
+        drop(snapshot_in_progress);
+        swapper.join().unwrap();
+    }
+
+    /// 換場與開快照互斥的整體下場：夾在中間的快照躲過收尾，它的 run 在資料庫裡
+    /// 停在 running。兩條執行緒對著同一組把手互打，收攤後任何一場會議的
+    /// 任何一版都不得還在跑。
+    #[test]
+    fn test_a_snapshot_racing_a_meeting_swap_never_leaves_a_run_running() {
+        use std::sync::Arc;
+
+        let store = Arc::new(StoreHandle::temp().unwrap());
+        let m = store.exclusive().unwrap().create_meeting("測試").unwrap();
+        let mut s = Session::default();
+        assert!(s.start(m).accepted);
+        let session = Arc::new(SessionHandle::from_session(s));
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let (store_t, session_t) = (store.clone(), session.clone());
+        let swapper = std::thread::spawn(move || {
+            let mut swaps = 0;
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) && swaps < 200 {
+                let m = store_t
+                    .exclusive()
+                    .unwrap()
+                    .create_meeting("換一場")
+                    .unwrap();
+                assert!(start_new_meeting(&session_t, &store_t).accepted);
+                command(&session_t, &store_t, move |slf| slf.start(m));
+                swaps += 1;
+            }
+        });
+        for _ in 0..400 {
+            let _ = open_snapshot(&session, &store, "賽跑");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        swapper.join().unwrap();
+
+        let st = store.exclusive().unwrap();
+        let stuck: Vec<_> = (1..=m)
+            .flat_map(|mid| st.runs(mid).unwrap())
+            .filter(|r| r.status == "running")
+            .collect();
+        assert!(
+            stuck.is_empty(),
+            "有 {} 個 run 卡在 running：{:?}",
+            stuck.len(),
+            stuck.iter().map(|r| r.version_no).collect::<Vec<_>>()
+        );
+    }
+
     /// 游標沒寫進資料庫就不能開始生成，而那一版必須有結局。
     ///
     /// 開始生成的話，成果會綁在一個資料庫裡不存在的 run 上；不給結局的話，
@@ -3997,6 +4122,22 @@ mod tests {
             .find(|x| x.speaker_id == "s1")
             .expect("被併掉的語者仍要在投影裡：片段上帶著它的 id");
         assert_eq!(merged.merged_into.as_deref(), Some("s2"));
+    }
+
+    /// 併掉的語者不能再被命名。store 的投影會把那一列翻回 confirmed 而
+    /// merged_into 還留著，片段的別名與名單狀態從此對不起來；對象那一列
+    /// 照常可以命名。
+    #[test]
+    fn test_confirming_a_merged_speaker_is_rejected() {
+        let mut s = two_named_speakers();
+        assert!(s.merge_speaker("s1", "s2").accepted);
+
+        assert!(!s.confirm_speaker("s1", "沈立群").accepted);
+        assert_eq!(
+            s.speakers["s1"].confirmed_name, None,
+            "被拒絕的命令不留痕跡"
+        );
+        assert!(s.confirm_speaker("s2", "沈立群").accepted);
     }
 
     /// 暫停要真的傳到音訊來源，不能只改 session 的狀態。

@@ -1165,10 +1165,7 @@ impl Store {
 
         let mut by_id: HashMap<String, StoredSpeaker> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
-        for e in load_events(&self.conn, meeting)? {
-            if e.seq > through_event_seq {
-                break;
-            }
+        for e in load_speaker_events(&self.conn, meeting, through_event_seq)? {
             match &e.event {
                 DomainEvent::SpeakerProposed {
                     speaker_id,
@@ -1620,6 +1617,24 @@ fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<MeetingSummary> {
     })
 }
 
+fn parse_stored_event(
+    seq: u64,
+    timeline: Timeline,
+    created_at: String,
+    payload: String,
+) -> Result<StoredEvent> {
+    let event = serde_json::from_str(&payload).map_err(|e| StoreError::Corrupt {
+        seq,
+        reason: e.to_string(),
+    })?;
+    Ok(StoredEvent {
+        seq,
+        timeline,
+        created_at,
+        event,
+    })
+}
+
 fn load_events(conn: &Connection, meeting: MeetingId) -> Result<Vec<StoredEvent>> {
     let mut stmt = conn.prepare(
         "SELECT seq, meeting_time_ms, captured_audio_ms, created_at, payload
@@ -1636,16 +1651,41 @@ fn load_events(conn: &Connection, meeting: MeetingId) -> Result<Vec<StoredEvent>
     let mut out = Vec::new();
     for row in rows {
         let (seq, timeline, created_at, payload) = row?;
-        let event = serde_json::from_str(&payload).map_err(|e| StoreError::Corrupt {
-            seq,
-            reason: e.to_string(),
-        })?;
-        out.push(StoredEvent {
-            seq,
-            timeline,
-            created_at,
-            event,
-        });
+        out.push(parse_stored_event(seq, timeline, created_at, payload)?);
+    }
+    Ok(out)
+}
+
+/// 只載語者事件，且只到 `through`。
+///
+/// `speakers_through` 每次生成與匯出都會呼叫，而整份日誌裡語者事件只佔少數；
+/// 把其餘事件的 payload 解析擋在 SQL 的 kind 過濾之外，讀取成本就不再跟
+/// 整場會議的長度成正比。kind 的可能值見 [`DomainEvent::kind`]。
+fn load_speaker_events(
+    conn: &Connection,
+    meeting: MeetingId,
+    through_event_seq: u64,
+) -> Result<Vec<StoredEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, meeting_time_ms, captured_audio_ms, created_at, payload
+         FROM meeting_events
+         WHERE meeting_id = ?1 AND seq <= ?2
+           AND kind IN ('SpeakerProposed','SpeakerConfirmed','SpeakerRenamed',
+                        'SpeakerMerged','SpeakerSplit')
+         ORDER BY seq",
+    )?;
+    let rows = stmt.query_map(params![meeting, through_event_seq as i64], |r| {
+        Ok((
+            r.get::<_, i64>(0)? as u64,
+            Timeline::new(r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64),
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (seq, timeline, created_at, payload) = row?;
+        out.push(parse_stored_event(seq, timeline, created_at, payload)?);
     }
     Ok(out)
 }

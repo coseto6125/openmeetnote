@@ -650,11 +650,21 @@ pub(crate) fn speaker_names(
         }
     }
     let mut remote = 0u32;
+    // 每一列只走一次別名鏈，底下的過濾與指名都查這張表。
+    let roots: std::collections::HashMap<&str, &str> = speakers
+        .iter()
+        .map(|s| {
+            (
+                s.speaker_id.as_str(),
+                crate::store::resolve_merge(speakers, &s.speaker_id),
+            )
+        })
+        .collect();
     let mut names: std::collections::HashMap<String, String> = speakers
         .iter()
         // 被併掉的那幾列不佔編號，也不自己取名字：它們底下的片段從此
         // 算在合併對象頭上，下面那一輪再把 id 指過去
-        .filter(|s| crate::store::resolve_merge(speakers, &s.speaker_id) == s.speaker_id)
+        .filter(|s| roots.get(s.speaker_id.as_str()).copied() == Some(s.speaker_id.as_str()))
         .map(|s| {
             let track = track_of
                 .get(s.speaker_id.as_str())
@@ -679,7 +689,9 @@ pub(crate) fn speaker_names(
         .collect();
     // 合併不改寫片段，所以片段上仍是原本那個 id。查得到它，那句話才有名字。
     for s in speakers {
-        let root = crate::store::resolve_merge(speakers, &s.speaker_id);
+        let Some(root) = roots.get(s.speaker_id.as_str()).copied() else {
+            continue;
+        };
         if root == s.speaker_id {
             continue;
         }
