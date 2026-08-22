@@ -81,7 +81,7 @@ screencapturekit = "8"
 cpal = "0.18"
 # CoreAudio 給的是裝置原生取樣率（內建麥克風多半 48 kHz）。直接每三個取一個
 # 會把 8 kHz 以上摺回可聽範圍，齒音與子音正好在那裡。
-rubato = "4"
+rubato = "5"
 
 
 # whisper-rs-sys 在交叉編譯時不會開啟 x86 SIMD：GGML_NATIVE 偵測的是編譯主機
