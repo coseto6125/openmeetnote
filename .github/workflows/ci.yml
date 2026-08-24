@@ -71,6 +71,13 @@ jobs:
             ~/.cache/sherpa-rs
             ~/Library/Caches/sherpa-rs
             ~/AppData/Local/sherpa-rs
+            # ort-sys（pyannote 語者切點）同樣把預編庫下載到 target/ 外的
+            # ort.pyke.io/dfbin。clippy 只編譯不連結，所以 Check 格一直沒事；
+            # native 測試是第一個真的連結它的地方，熱快取下少了這個目錄，
+            # 就是「could not find native static library onnxruntime」。
+            ~/.cache/ort.pyke.io
+            ~/Library/Caches/ort.pyke.io
+            ~/AppData/Local/ort.pyke.io
       - name: Install Linux build deps
         run: |
           sudo apt-get update
@@ -120,6 +127,9 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            # src/audio/wasapi.rs 的單元測試只在 Windows 上存在，不打這個旗標
+            # 它們在任何地方都不會被執行
+            native: true
           # runner 本身就是 arm64，這一格可以真的把測試跑起來 ——
           # src/audio/macos.rs 的單元測試在 Linux 上連編譯都不存在
           - target: aarch64-apple-darwin
@@ -144,7 +154,16 @@ jobs:
             ~/.cache/sherpa-rs
             ~/Library/Caches/sherpa-rs
             ~/AppData/Local/sherpa-rs
-          key: ${{ matrix.target }}
+            # ort-sys（pyannote 語者切點）同樣把預編庫下載到 target/ 外的
+            # ort.pyke.io/dfbin。clippy 只編譯不連結，所以 Check 格一直沒事；
+            # native 測試是第一個真的連結它的地方，熱快取下少了這個目錄，
+            # 就是「could not find native static library onnxruntime」。
+            ~/.cache/ort.pyke.io
+            ~/Library/Caches/ort.pyke.io
+            ~/AppData/Local/ort.pyke.io
+          # key 升版一次：舊快取裡沒有 ort.pyke.io，直接命中會照樣連結失敗；
+          # 冷建置讓 build script 重新下載，存進來的新快取才帶著這個目錄。
+          key: v2-${{ matrix.target }}
       - name: Check
         run: >
           cargo clippy --manifest-path src-tauri/Cargo.toml -p openmeetnote
