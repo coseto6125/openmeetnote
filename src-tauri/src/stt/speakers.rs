@@ -81,7 +81,7 @@ const MIN_ENROLL_MS: u64 = 2_000;
 /// [`MIN_ENROLL_MS`]），之後要有另一筆方向吻合的獨立樣本，合計時長過了這道
 /// 線才承認名單多了一個人。單憑一段就登記的話，聲紋飄掉的那一段會在名單上
 /// 留下一個查無此人的幽靈，而且永不回收。
-const ENROLL_BANK_MS: u64 = 4_000;
+const ENROLL_BANK_MS: u64 = 2 * MIN_ENROLL_MS;
 
 /// 候選池上限。滿了就丟掉證據最少的候選：他若真是新的人，後面還有機會重新
 /// 累積；無限增長的池子只會讓比對越來越慢。
@@ -148,9 +148,9 @@ struct PendingVoice {
     /// 觀測到的聲紋平均方向，算法與 [`Voice::centroid`] 相同。
     centroid: Vec<f32>,
     sum: Vec<f32>,
-    /// 累積的長音訊時長。
+    /// 累積的證據時長。
     bank_ms: u64,
-    /// 收過幾段獨立的長音訊。
+    /// 收過幾筆獨立觀察（含短片段：短的可併入，不能開新候選）。
     turns: usize,
 }
 
@@ -191,7 +191,8 @@ enum Verdict {
     Likely(usize),
     /// 跟誰都不像，長度也夠，夠格當一位候選語者。
     New,
-    /// 分不出來，交給呼叫端沿用軌道預設。
+    /// 不像任何已知語者，也不夠長到能開新候選：可併入吻合的候選，
+    /// 不能自己成為一位。交給 [`confirm_pending`] 判定。
     Unknown,
 }
 
@@ -231,48 +232,71 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// 一群質心裡跟這段聲紋內積最高的那位。名單比對與候選池比對共用，
+/// 兩邊的挑選語義才不會各改各的。
+fn argmax_cosine<'a>(
+    centroids: impl Iterator<Item = (usize, &'a [f32])>,
+    embedding: &[f32],
+) -> Option<(usize, f32)> {
+    centroids
+        .map(|(i, c)| (i, cosine(c, embedding)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+}
+
 /// 名單裡最像這段聲紋的那位。
 fn nearest(known: &[Voice], embedding: &[f32]) -> Option<(usize, f32)> {
-    known
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i, cosine(&v.centroid, embedding)))
-        .max_by(|a, b| a.1.total_cmp(&b.1))
+    argmax_cosine(
+        known
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, v.centroid.as_slice())),
+        embedding,
+    )
 }
 
 /// 把一段比對不到名單的發言交給候選池，必要時晉升一位新語者。
 ///
 /// 吻合既有候選就併入（短的片段也能併：長度只限制「開新候選」，不限制
-/// 「累積證據」）；夠長才開新候選。哪位候選湊滿兩段獨立長音訊、合計證據
-/// 達 [`ENROLL_BANK_MS`]，就晉升成正式語者並回傳名字 —— 若剛吻合的這段
-/// 正是第二筆觀察，這段話直接歸給他。其餘情況回 `None`，那句話沿用軌道
-/// 的預設語者。
+/// 「累積證據」）；夠長才開新候選。哪位候選湊到兩筆獨立觀察、合計證據達
+/// [`ENROLL_BANK_MS`]（開頭那筆必是長音訊，第二筆可以是吻合它的短樣本），
+/// 就晉升成正式語者並回傳名字 —— 若剛吻合的這筆正是壓垮門檻的那筆，這段
+/// 話直接歸給他。其餘情況回 `None`，那句話沿用軌道的預設語者。
 fn confirm_pending(
     pool: &mut Vec<PendingVoice>,
     known: &mut Vec<Voice>,
     embedding: &[f32],
     ms: u64,
 ) -> Option<String> {
-    let hit = pool
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (i, cosine(&p.centroid, embedding)))
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .filter(|&(_, sim)| sim >= SAME_SPEAKER);
-    match hit {
-        Some((i, _)) => pool[i].absorb(embedding, ms),
-        None if ms >= MIN_ENROLL_MS => pool.push(PendingVoice::new(embedding.to_vec(), ms)),
+    let hit = argmax_cosine(
+        pool.iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.centroid.as_slice())),
+        embedding,
+    )
+    .filter(|&(_, sim)| sim >= SAME_SPEAKER);
+    let touched = match hit {
+        Some((i, _)) => {
+            pool[i].absorb(embedding, ms);
+            i
+        }
+        None if ms >= MIN_ENROLL_MS => {
+            pool.push(PendingVoice::new(embedding.to_vec(), ms));
+            pool.len() - 1
+        }
         None => return None,
-    }
+    };
     if pool.len() > MAX_PENDING {
-        // 滿了丟證據最少的：真的人後面還有機會重新累積
+        // 滿了丟掉這次沒動到的、證據最少的候選。剛開候選的那位不參與淘汰：
+        // 他若真是新的人，這筆第一次觀察得活到下一次吻合才有機會晉升。
         let weakest = pool
             .iter()
             .enumerate()
+            .filter(|&(i, _)| i != touched)
             .min_by_key(|(_, p)| p.bank_ms)
-            .map(|(i, _)| i)
-            .unwrap_or_default();
-        pool.remove(weakest);
+            .map(|(i, _)| i);
+        if let Some(i) = weakest {
+            pool.remove(i);
+        }
     }
     let pos = pool
         .iter()
@@ -568,6 +592,28 @@ mod tests {
             Some("s1")
         );
         assert!(pool.is_empty());
+        assert_eq!(known.len(), 1);
+    }
+
+    #[test]
+    fn test_a_fresh_candidate_survives_a_saturated_pool_and_still_promotes() {
+        // 池子被證據多的舊候選佔滿時，新人第一次開口開的候選不能被淘汰，
+        // 否則他的第二次觀察永遠找不到吻合對象，名單永遠收不了他
+        let mut pool: Vec<PendingVoice> = (0..MAX_PENDING)
+            .map(|_| PendingVoice::new(at(90.0), 6_000))
+            .collect();
+        let mut known = Vec::new();
+        assert!(confirm_pending(&mut pool, &mut known, &at(0.0), 2_500).is_none());
+        assert_eq!(pool.len(), MAX_PENDING);
+        assert!(
+            pool.iter().any(|p| cosine(&p.centroid, &at(0.0)) > 0.99),
+            "剛開的候選要活著"
+        );
+        // 第二筆吻合照常晉升
+        assert_eq!(
+            confirm_pending(&mut pool, &mut known, &at(3.0), 2_500).as_deref(),
+            Some("s1")
+        );
         assert_eq!(known.len(), 1);
     }
 
