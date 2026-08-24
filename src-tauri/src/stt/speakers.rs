@@ -29,9 +29,16 @@
 //! 本來就飄，跟誰都不像很正常。
 //!
 //! 所以現在先看長度，再看相似度（見 [`judge`]）。夠長的片段聲紋是穩的，可以
-//! 照相似度辦事：夠像就併入並修正那個人的聲紋中心，不夠像就是另一個人，登記
-//! 進名單。太短的片段不足以定義一個人，只拿來靠向最像的那位而不動他的中心，
-//! 連像都談不上就不標，那句話沿用軌道的預設語者。
+//! 照相似度辦事：夠像就併入並修正那個人的聲紋中心，不夠像也不立刻登記 —— 先
+//! 進候選池等第二次觀察（見 [`PendingVoice`]）。太短的片段不足以定義一個人，
+//! 只拿來靠向最像的那位而不動他的中心，連像都談不上就不標，那句話沿用軌道的
+//! 預設語者。
+//!
+//! 登記要一段夠長的觀察，加上另一筆方向吻合它的獨立樣本，合計時長過了
+//! [`ENROLL_BANK_MS`] 才成立。實測過聲紋在真實會議裡的表現：同一位語者的兩個
+//! 短片段可以只有 0.2 的相似度，而聲紋不穩的一段長話跟誰都不像 —— 單憑一段話
+//! 就在名單上鑄造一個人，等於讓運氣決定名單長什麼樣。寧可多等一句：真的人會
+//! 再開口，幽靈不會。
 //!
 //! 長度這道閘門要排在相似度前面。反過來的話，聲音跟既有語者有幾分像的人不管
 //! 講多久都會被歸給那位，永遠登記不進名單 —— 而「把話安到別人頭上」正是這裡
@@ -62,11 +69,23 @@ const NEW_SPEAKER: f32 = 0.35;
 /// 抽聲紋需要的最短音訊。太短的片段聲紋不穩定，比對結果形同亂數。
 const MIN_EMBED_MS: u64 = 1_000;
 
-/// 登記一位新語者需要的最短音訊。
+/// 開一位候選需要的最短音訊。
 ///
 /// 一秒的聲紋足以拿去比對，卻不足以定義一個人。比對不到又不夠長的片段回
 /// `None`，那句話沿用軌道的預設語者。
 const MIN_ENROLL_MS: u64 = 2_000;
+
+/// 晉升候選成正式語者需要的證據總量。
+///
+/// 取 [`MIN_ENROLL_MS`] 的兩倍：開頭必須是一段夠長的觀察（見
+/// [`MIN_ENROLL_MS`]），之後要有另一筆方向吻合的獨立樣本，合計時長過了這道
+/// 線才承認名單多了一個人。單憑一段就登記的話，聲紋飄掉的那一段會在名單上
+/// 留下一個查無此人的幽靈，而且永不回收。
+const ENROLL_BANK_MS: u64 = 4_000;
+
+/// 候選池上限。滿了就丟掉證據最少的候選：他若真是新的人，後面還有機會重新
+/// 累積；無限增長的池子只會讓比對越來越慢。
+const MAX_PENDING: usize = 8;
 
 /// VAD 每次處理的樣本數，必須與 `window_size` 一致。
 const VAD_WINDOW: usize = 512;
@@ -106,15 +125,6 @@ struct Voice {
 }
 
 impl Voice {
-    /// 用第一段聲紋登記一位語者。傳進來的向量已經是單位長度。
-    fn new(name: String, embedding: Vec<f32>) -> Self {
-        Self {
-            name,
-            centroid: embedding.clone(),
-            sum: embedding,
-        }
-    }
-
     /// 把一段確定是本人的聲紋併進中心。
     ///
     /// 取平均而不是換掉：登記當下拿到的往往是最差的一個樣本（第一次開口
@@ -128,9 +138,48 @@ impl Voice {
     }
 }
 
+/// 一個還沒被確認的候選語者。
+///
+/// 跟名單上誰都不像的夠長片段先進池子，等下一筆方向吻合它的獨立觀察。聲紋在
+/// 真實音訊裡會飄：同一位語者的兩個短片段可以只有 0.2 的相似度，一段不巧的
+/// 長話也可能跟誰都不像。候選制讓這兩種運氣都只留下一位等不到確認的候選，
+/// 而不是名單上的幽靈。
+struct PendingVoice {
+    /// 觀測到的聲紋平均方向，算法與 [`Voice::centroid`] 相同。
+    centroid: Vec<f32>,
+    sum: Vec<f32>,
+    /// 累積的長音訊時長。
+    bank_ms: u64,
+    /// 收過幾段獨立的長音訊。
+    turns: usize,
+}
+
+impl PendingVoice {
+    fn new(embedding: Vec<f32>, ms: u64) -> Self {
+        Self {
+            centroid: embedding.clone(),
+            sum: embedding,
+            bank_ms: ms,
+            turns: 1,
+        }
+    }
+
+    /// 併入一段吻合的觀測。取平均的理由與 [`Voice::absorb`] 相同。
+    fn absorb(&mut self, embedding: &[f32], ms: u64) {
+        for (acc, e) in self.sum.iter_mut().zip(embedding) {
+            *acc += e;
+        }
+        self.centroid.copy_from_slice(&self.sum);
+        normalize(&mut self.centroid);
+        self.bank_ms += ms;
+        self.turns += 1;
+    }
+}
+
 struct Registry {
     extractor: EmbeddingExtractor,
     known: Vec<Voice>,
+    pending: Vec<PendingVoice>,
 }
 
 /// 一段聲紋跟名單比對之後的結論。
@@ -140,7 +189,7 @@ enum Verdict {
     Same(usize),
     /// 最像這位，但不夠像到能當他的樣本。
     Likely(usize),
-    /// 跟誰都不像，長度也夠，登記一位新的。
+    /// 跟誰都不像，長度也夠，夠格當一位候選語者。
     New,
     /// 分不出來，交給呼叫端沿用軌道預設。
     Unknown,
@@ -150,7 +199,7 @@ enum Verdict {
 ///
 /// 分支順序是這裡的重點。`New` 要排在 `Likely` 前面：反過來的話，聲音跟既有
 /// 語者有幾分像的人（相似度落在 [`NEW_SPEAKER`] 與 [`SAME_SPEAKER`] 之間）
-/// 不管講多久都會判成 `Likely`，於是永遠登記不進名單，他講的每一句都掛在
+/// 不管講多久都會判成 `Likely`，於是永遠當不上候選，他講的每一句都掛在
 /// 那位既有語者名下 —— 而那正是「把話安到別人頭上」這件事本身。
 ///
 /// 兩條界線量的是不同的東西：相似度回答「像不像」，長度回答「這段聲紋可不可
@@ -191,6 +240,53 @@ fn nearest(known: &[Voice], embedding: &[f32]) -> Option<(usize, f32)> {
         .max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
+/// 把一段比對不到名單的發言交給候選池，必要時晉升一位新語者。
+///
+/// 吻合既有候選就併入（短的片段也能併：長度只限制「開新候選」，不限制
+/// 「累積證據」）；夠長才開新候選。哪位候選湊滿兩段獨立長音訊、合計證據
+/// 達 [`ENROLL_BANK_MS`]，就晉升成正式語者並回傳名字 —— 若剛吻合的這段
+/// 正是第二筆觀察，這段話直接歸給他。其餘情況回 `None`，那句話沿用軌道
+/// 的預設語者。
+fn confirm_pending(
+    pool: &mut Vec<PendingVoice>,
+    known: &mut Vec<Voice>,
+    embedding: &[f32],
+    ms: u64,
+) -> Option<String> {
+    let hit = pool
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i, cosine(&p.centroid, embedding)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .filter(|&(_, sim)| sim >= SAME_SPEAKER);
+    match hit {
+        Some((i, _)) => pool[i].absorb(embedding, ms),
+        None if ms >= MIN_ENROLL_MS => pool.push(PendingVoice::new(embedding.to_vec(), ms)),
+        None => return None,
+    }
+    if pool.len() > MAX_PENDING {
+        // 滿了丟證據最少的：真的人後面還有機會重新累積
+        let weakest = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| p.bank_ms)
+            .map(|(i, _)| i)
+            .unwrap_or_default();
+        pool.remove(weakest);
+    }
+    let pos = pool
+        .iter()
+        .position(|p| p.turns >= 2 && p.bank_ms >= ENROLL_BANK_MS)?;
+    let cand = pool.remove(pos);
+    let name = format!("s{}", known.len() + 1);
+    known.push(Voice {
+        name: name.clone(),
+        sum: cand.sum,
+        centroid: cand.centroid,
+    });
+    Some(name)
+}
+
 pub struct SpeakerBook {
     vad_model: String,
     /// 有分割模型就用語者變化當切點；載入失敗或沒給就退回靜音切點。
@@ -214,6 +310,7 @@ impl SpeakerBook {
             let _ = BOOK.set(Mutex::new(Registry {
                 extractor,
                 known: Vec::new(),
+                pending: Vec::new(),
             }));
         }
         let segmenter = match segmentation {
@@ -323,12 +420,13 @@ impl SpeakerBook {
                 reg.known[i].name.clone()
             }
             Verdict::Likely(i) => reg.known[i].name.clone(),
-            Verdict::New => {
-                let name = format!("s{}", reg.known.len() + 1);
-                reg.known.push(Voice::new(name.clone(), embedding));
-                name
+            // 跟誰都不像：先當候選。兩段獨立的長音訊互相吻合才登記，
+            // 見 [`PendingVoice`] 與模組開頭「名單為什麼會長出不存在的人」。
+            Verdict::New | Verdict::Unknown => {
+                // 一次拆借兩個欄位：reg 是 MutexGuard，欄位存取會走 DerefMut
+                let Registry { known, pending, .. } = &mut *reg;
+                confirm_pending(pending, known, &embedding, ms)?
             }
-            Verdict::Unknown => return None,
         };
 
         let start_ms = start_sample as u64 * 1000 / u64::from(SAMPLE_RATE);
@@ -371,7 +469,11 @@ mod tests {
     fn voice(name: &str, centroid: &[f32]) -> Voice {
         let mut centroid = centroid.to_vec();
         normalize(&mut centroid);
-        Voice::new(name.into(), centroid)
+        Voice {
+            name: name.into(),
+            sum: centroid.clone(),
+            centroid,
+        }
     }
 
     /// 平面上的單位向量，方便用角度描述聲紋方向。
@@ -411,10 +513,75 @@ mod tests {
     }
 
     #[test]
-    fn test_a_long_clip_that_matches_nobody_enrolls_a_new_speaker() {
-        // 夠長又跟誰都不像才是真的多了一個人
+    fn test_a_long_clip_that_matches_nobody_qualifies_as_a_candidate() {
+        // 夠長又跟誰都不像才夠格當候選；真正登記要等第二次觀察吻合
         assert_eq!(judge(Some((0, 0.2)), 2_000), Verdict::New);
         assert_eq!(judge(None, 3_000), Verdict::New);
+    }
+
+    #[test]
+    fn test_one_unmatched_long_clip_leaves_no_known_speaker() {
+        // 一段話不夠定義一個人：聲紋會飄，先進候選池等第二次觀察
+        let mut pool = Vec::new();
+        let mut known = Vec::new();
+        let name = confirm_pending(&mut pool, &mut known, &at(0.0), 3_000);
+        assert!(name.is_none());
+        assert!(known.is_empty());
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].turns, 1);
+    }
+
+    #[test]
+    fn test_two_matching_long_clips_promote_the_candidate_and_name_the_second_one() {
+        // 真的人會再開口：第二段獨立長音訊吻合就晉升，這段話歸給新語者
+        let mut pool = Vec::new();
+        let mut known = vec![voice("s1", &at(90.0))]; // 跟候選方向垂直的既有語者
+        assert!(confirm_pending(&mut pool, &mut known, &at(0.0), 3_000).is_none());
+        assert_eq!(
+            confirm_pending(&mut pool, &mut known, &at(2.0), 3_000).as_deref(),
+            Some("s2")
+        );
+        assert_eq!(known.len(), 2);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn test_two_mismatched_clips_stay_separate_candidates() {
+        // 方向差很遠的兩段是兩位不同的候選，不是同一位的兩次觀察
+        let mut pool = Vec::new();
+        let mut known = Vec::new();
+        confirm_pending(&mut pool, &mut known, &at(0.0), 3_000);
+        confirm_pending(&mut pool, &mut known, &at(120.0), 3_000); // cos 120° < 0
+        assert_eq!(pool.len(), 2);
+        assert!(known.is_empty());
+    }
+
+    #[test]
+    fn test_a_short_clip_banks_onto_a_candidate_it_matches_and_can_complete_it() {
+        // 長度只限制「開新候選」，不限制「累積證據」：3 秒加 1.5 秒的吻合
+        // 觀察合計過了門檻，候選照樣晉升
+        let mut pool = Vec::new();
+        let mut known = Vec::new();
+        assert!(confirm_pending(&mut pool, &mut known, &at(0.0), 3_000).is_none());
+        assert_eq!(
+            confirm_pending(&mut pool, &mut known, &at(5.0), 1_500).as_deref(),
+            Some("s1")
+        );
+        assert!(pool.is_empty());
+        assert_eq!(known.len(), 1);
+    }
+
+    #[test]
+    fn test_the_weakest_candidate_is_evicted_when_the_pool_is_full() {
+        let mut pool: Vec<PendingVoice> = (0..MAX_PENDING)
+            .map(|i| PendingVoice::new(at(i as f32), 1_000 + (i as u64) * 10))
+            .collect();
+        let mut known = Vec::new();
+        confirm_pending(&mut pool, &mut known, &at(200.0), 3_000);
+        assert_eq!(pool.len(), MAX_PENDING);
+        // 證據最少的舊候選被丟掉，新的留著
+        assert!(!pool.iter().any(|p| p.bank_ms == 1_000));
+        assert!(pool.iter().any(|p| p.bank_ms == 3_000));
     }
 
     #[test]
@@ -430,15 +597,15 @@ mod tests {
     }
 
     #[test]
-    fn test_a_long_middling_match_enrolls_instead_of_joining_the_nearest_speaker() {
-        // 講了五秒還只有 0.4 像，那是另一個人。判成 Likely 的話他永遠登記
-        // 不進名單，講一整場都會掛在既有語者名下。
+    fn test_a_long_middling_match_becomes_a_candidate_instead_of_joining_the_nearest_speaker() {
+        // 講了五秒還只有 0.4 像，那是另一個人。判成 Likely 的話他永遠當不上
+        // 候選，講一整場都會掛在既有語者名下。
         assert_eq!(judge(Some((2, 0.4)), 5_000), Verdict::New);
     }
 
     #[test]
-    fn test_a_speaker_who_half_matches_an_existing_one_can_still_enroll() {
-        // judge 的分支順序退回去的話，這一條會變成 Likely(0) 而永遠不登記
+    fn test_a_speaker_who_half_matches_an_existing_one_can_still_become_a_candidate() {
+        // judge 的分支順序退回去的話，這一條會變成 Likely(0) 而永遠當不上候選
         let known = [voice("s1", &at(0.0))];
         let probe = at(60.0); // cos 60° = 0.5 剛好在 SAME_SPEAKER 上，取 61 度落進中間帶
         let probe = if cosine(&known[0].centroid, &probe) >= SAME_SPEAKER {
