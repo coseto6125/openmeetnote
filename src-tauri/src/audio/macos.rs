@@ -538,7 +538,7 @@ impl Downmix {
             let real = self.carry.len();
             // 補進去的那段不是音訊，不能讓它推進擷取時間軸
             let keep = real * SAMPLE_RATE as usize / self.in_rate;
-            let mut block = std::mem::take(&mut self.carry);
+            let block = std::mem::take(&mut self.carry);
             let indexing = Indexing {
                 partial_len: Some(real),
                 ..Indexing::default()
