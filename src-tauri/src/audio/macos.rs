@@ -20,7 +20,7 @@ use std::thread::JoinHandle;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rubato::audioadapter_buffers::direct::SequentialSlice;
-use rubato::{Fft, FixedSync, Resampler};
+use rubato::{Fft, FixedSync, Indexing, Resampler};
 use screencapturekit::cm::AudioBufferList;
 use screencapturekit::prelude::*;
 
@@ -520,7 +520,7 @@ impl Downmix {
         while self.carry.len() >= self.frames_in {
             let rest = self.carry.split_off(self.frames_in);
             let block = std::mem::replace(&mut self.carry, rest);
-            if !self.resample_block(&block, block.len()) {
+            if !self.resample_block(&block, None, block.len()) {
                 return false;
             }
         }
@@ -529,23 +529,29 @@ impl Downmix {
 
     /// 收工時把還沒湊滿一個重取樣區塊的樣本吐出來。
     ///
-    /// 重取樣器一次只吃固定長度，所以補零湊滿再算，然後只取與真實樣本等比
-    /// 的輸出。不補的話 48 kHz 的麥克風每次停止都會少掉最多 21 ms，
-    /// 加上分批本身的 100 ms，最後一個字的韻尾常常就在裡面。
+    /// 重取樣器一次只吃固定長度；`partial_len` 讓它自己把不足的部分當靜音，
+    /// 輸出仍是完整區塊，所以只取與真實樣本等比的輸出。不這做的話 48 kHz
+    /// 的麥克風每次停止都會少掉最多 21 ms，加上分批本身的 100 ms，最後一個
+    /// 字的韻尾常常就在裡面。
     fn flush(&mut self) {
         if !self.carry.is_empty() && self.resampler.is_some() {
             let real = self.carry.len();
-            let mut block = std::mem::take(&mut self.carry);
-            block.resize(self.frames_in, 0.0);
-            // 補零那一段不是音訊，不能讓它推進擷取時間軸
+            // 補進去的那段不是音訊，不能讓它推進擷取時間軸
             let keep = real * SAMPLE_RATE as usize / self.in_rate;
-            self.resample_block(&block, keep);
+            let mut block = std::mem::take(&mut self.carry);
+            let indexing = Indexing {
+                partial_len: Some(real),
+                ..Indexing::default()
+            };
+            self.resample_block(&block, Some(&indexing), keep);
         }
         self.batcher.flush();
     }
 
     /// `keep` 是最多要保留幾個輸出幀，用來擋掉 flush 補進去的靜音。
-    fn resample_block(&mut self, block: &[f32], keep: usize) -> bool {
+    /// `indexing` 只有 flush 會帶：不足一塊的輸入由重取樣器自行補成靜音；
+    /// feed 路徑每次都是剛好一個完整區塊，傳 `None`。
+    fn resample_block(&mut self, block: &[f32], indexing: Option<&Indexing>, keep: usize) -> bool {
         let Some(resampler) = self.resampler.as_mut() else {
             return true;
         };
@@ -556,7 +562,7 @@ impl Downmix {
             SequentialSlice::new(block, 1, block.len()).expect("frames 取自 block 自身的長度");
         let mut output = SequentialSlice::new_mut(&mut self.out, 1, out_frames)
             .expect("out 的長度就是 output_frames_max()");
-        match resampler.process_into_buffer(&input, &mut output, None) {
+        match resampler.process_into_buffer(&input, &mut output, indexing) {
             // 寫進去的幀數每次可能不同，只送實際寫到的那一段
             Ok((_, written)) => {
                 let n = written.min(keep);
@@ -704,6 +710,39 @@ mod tests {
         assert!(
             (2900..=3100).contains(&ms),
             "三秒的音訊重取樣後變成 {ms} ms"
+        );
+    }
+
+    /// flush 的尾段必須恰好是「真實樣本的等比長度」。partial_len 之後補零
+    /// 改由重取樣器內部做，但輸出永遠是完整區塊，少了修剪就會多送一段靜音，
+    /// 時間軸往後漂。
+    #[test]
+    fn test_flush_emits_only_the_real_proportional_tail_of_a_partial_block() {
+        let (b, rx) = batcher(Track::Mic);
+        let mut p = Downmix::new(48_000, b).unwrap();
+        assert!(p.feed(&vec![0.25f32; 1024], 1)); // 恰好一個完整重取樣區塊
+        assert!(p.feed(&vec![0.5f32; 600], 1)); // 600 幀留在 carry
+        let full_chunk_out = p.batcher.pending.len();
+        p.flush();
+        drop(p);
+        let total: usize = rx.into_iter().map(|c| c.samples.len()).sum();
+        let tail = total - full_chunk_out;
+        assert_eq!(
+            tail,
+            600 * SAMPLE_RATE as usize / 48_000,
+            "flush 尾段應為真實樣本的等比長度（200 幀），實得 {tail}"
+        );
+    }
+
+    #[test]
+    fn test_flush_with_an_empty_carry_sends_nothing_extra() {
+        let (b, rx) = batcher(Track::Mic);
+        let mut p = Downmix::new(48_000, b).unwrap();
+        p.flush();
+        drop(p);
+        assert!(
+            rx.into_iter().next().is_none(),
+            "空 carry 的 flush 不該產生任何批次"
         );
     }
 }
