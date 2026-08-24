@@ -9,7 +9,10 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySe
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use wasapi::{initialize_mta, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
+use wasapi::{
+    initialize_mta, DeviceEnumerator, DeviceEventCallbacks, Direction, Role, SampleType,
+    StreamMode, WaveFormat,
+};
 
 use super::{
     await_tracks, AudioCapture, AudioError, Chunk, TrackReady, CAPTURE_BACKLOG_CHUNKS, SAMPLE_RATE,
@@ -156,7 +159,7 @@ fn capture_inner(
     ready: &Sender<TrackReady>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let opened = open_device(track, device_dir);
-    let (client, h_event, capture_client, blockalign) = match opened {
+    let (mut client, mut h_event, mut capture_client, mut blockalign) = match opened {
         Ok(v) => {
             let _ = ready.send(Ok(()));
             v
@@ -167,10 +170,43 @@ fn capture_inner(
         }
     };
 
+    // 預設裝置熱切換：會議中途系統預設被換掉（插耳機之類），已開著的串流
+    // 不會自己跟著搬，會一路錄到過期裝置。註冊只負責翻旗標，真正的重開由
+    // 下面迴圈自己做；註冊失敗只損失熱切換，不能拖垮整軌擷取。
+    let switch_pending = Arc::new(AtomicBool::new(false));
+    // `_registration` 是有繫住的底線變數，不是多餘的：DeviceEventRegistration
+    // 一 drop 就解除註冊，寫成 `let _ =` 會在這一行立刻解掉。
+    let _registration = match register_default_switch(device_dir, &switch_pending) {
+        Ok(reg) => Some(reg),
+        Err(e) => {
+            crate::stt::live::log(&format!(
+                "{} 軌：裝置變更通知註冊失敗，熱切換停用：{e}",
+                track.as_str()
+            ));
+            None
+        }
+    };
+
     let mut raw = vec![0u8; blockalign * client.get_buffer_size()? as usize * 4];
     let mut batcher = Batcher::new(track, tx);
 
     while !stop.load(Ordering::Relaxed) {
+        // 預設裝置被換掉了：關掉舊串流、在新裝置上重開。Batcher 沿用同一個，
+        // captured_start_ms 的時間軸因此連續；重開瞬間的少量樣本缺口，換的是
+        // 「從此刻起錄的是對的裝置」。
+        if switch_pending.swap(false, Ordering::Relaxed) {
+            client.stop_stream()?;
+            let (c, h, cc, ba) = open_device(track, device_dir)?;
+            crate::stt::live::log(&format!(
+                "{} 軌偵測到預設裝置變更，已切換到新裝置",
+                track.as_str()
+            ));
+            raw = vec![0u8; ba * c.get_buffer_size()? as usize * 4];
+            client = c;
+            h_event = h;
+            capture_client = cc;
+            blockalign = ba;
+        }
         // 逾時而不是無限等待，否則停止旗標要等到下一個音訊事件才會被看到；
         // 全程靜音的會議尾段會因此卡住不結束。
         if h_event.wait_for_event(200).is_err() {
@@ -230,4 +266,71 @@ fn open_device(track: Track, device_dir: Direction) -> Result<OpenedDevice, Stri
     let opened = open().map_err(|e| e.to_string())?;
     crate::stt::live::log(&format!("已開啟 {} 軌裝置", track.as_str()));
     Ok(opened)
+}
+
+/// 註冊「這一軌方向的 Console 預設裝置改變」通知。
+///
+/// Callback 在 Windows 音訊系統自己的執行緒上跑，必須快返回，也不得回呼
+/// 註冊它的 enumerator —— 所以這裡只翻旗標，重開裝置留給擷取執行緒做。
+fn register_default_switch(
+    device_dir: Direction,
+    flag: &Arc<AtomicBool>,
+) -> Result<wasapi::DeviceEventRegistration, Box<dyn std::error::Error>> {
+    let mut callbacks = DeviceEventCallbacks::new();
+    let pending = flag.clone();
+    callbacks.set_default_device_callback(move |dir, role, _id| {
+        if default_change_concerns(device_dir, dir, role) {
+            pending.store(true, Ordering::Relaxed);
+        }
+    });
+    let enumerator = DeviceEnumerator::new()?;
+    Ok(enumerator.register_notification_callback(callbacks)?)
+}
+
+/// 只有「我這一軌的方向」且「Console role」的切換才與我有關：Console 是
+/// open_device 解析預設裝置用的 role；其他 role 是 VoIP 之類的接管，另一個
+/// 方向則是別軌的事。
+fn default_change_concerns(mine: Direction, changed: Direction, role: Role) -> bool {
+    mine == changed && role == Role::Console
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_change_concerns_matches_own_direction_on_console_role() {
+        assert!(default_change_concerns(
+            Direction::Capture,
+            Direction::Capture,
+            Role::Console
+        ));
+        assert!(default_change_concerns(
+            Direction::Render,
+            Direction::Render,
+            Role::Console
+        ));
+    }
+
+    #[test]
+    fn test_default_change_concerns_ignores_other_direction_and_other_roles() {
+        // 另一軌的預設改變不歸我管
+        assert!(!default_change_concerns(
+            Direction::Capture,
+            Direction::Render,
+            Role::Console
+        ));
+        // Communications / Multimedia 被接管不代表系統預設變了；
+        // open_device 解析預設用的是 Console
+        assert!(!default_change_concerns(
+            Direction::Capture,
+            Direction::Capture,
+            Role::Communications
+        ));
+        assert!(!default_change_concerns(
+            Direction::Render,
+            Direction::Render,
+            Role::Multimedia
+        ));
+    }
 }

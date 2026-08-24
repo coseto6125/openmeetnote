@@ -120,6 +120,9 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            # src/audio/wasapi.rs 的單元測試只在 Windows 上存在，不打這個旗標
+            # 它們在任何地方都不會被執行
+            native: true
           # runner 本身就是 arm64，這一格可以真的把測試跑起來 ——
           # src/audio/macos.rs 的單元測試在 Linux 上連編譯都不存在
           - target: aarch64-apple-darwin
