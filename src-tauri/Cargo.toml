@@ -33,7 +33,7 @@ tempfile = "3.27.0"
 # 語者切點用 pyannote segmentation 的直接 ONNX 推論。不走 sherpa-onnx 的
 # diarization C API：那顆預編 DLL 在 Windows 上固定崩潰（§18），而這裡只
 # 需要「音訊 → 每幀語者活動度」這一步，自己跑模型反而三個平台行為一致。
-ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
     "std",
     "download-binaries",
 ] }
