@@ -22,7 +22,7 @@ use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig};
 use super::diff::Corrections;
 use super::paraformer::Paraformer;
 use super::speakers::{speaker_at, SpeakerBook, SpeakerSpan};
-use super::tea::{hotword_prompt, timed_sentences, Tea};
+use super::tea::{hotword_prompt, timed_sentences, RunEngine, Tea};
 use super::{Result, SttError};
 use crate::audio::{platform_capture, AudioCapture, AudioError, Chunk, SAMPLE_RATE};
 use crate::model::Track;
@@ -390,16 +390,16 @@ impl LocalSttSource {
         // 各自載一份會多吃三百多 MB，而它們的呼叫都短到搶不到鎖。
         let punct = load_punct(models.punct.as_deref());
         let fast = {
-            let (dir, vad, tx, punct, progress, ready) = (
-                models.paraformer_dir.clone(),
-                models.vad.clone(),
+            let (models, tx, punct, progress, ready, mode) = (
+                models.clone(),
                 result_tx.clone(),
                 punct.clone(),
                 progress.clone(),
                 ready_tx.clone(),
+                mode.clone(),
             );
             std::thread::spawn(move || {
-                partial_loop(fast_rx, tx, &dir, &vad, punct, progress, &ready)
+                partial_loop(fast_rx, tx, &models, punct, progress, &ready, &*mode)
             })
         };
         let slow = {
@@ -651,12 +651,13 @@ fn shape_partial(text: &str, punct: Option<&SharedPunct>) -> String {
 fn partial_loop(
     rx: Receiver<Chunk>,
     tx: Sender<TranscriptInput>,
-    model_dir: &str,
-    vad_model: &str,
+    models: &ModelPaths,
     punct: Option<SharedPunct>,
     progress: Progress,
     ready: &Sender<std::result::Result<(), String>>,
+    mode: &(dyn Fn() -> FinalMode + Send + Sync),
 ) {
+    let (model_dir, vad_model) = (models.paraformer_dir.as_str(), models.vad.as_str());
     let mut engine = match Paraformer::load(model_dir, 2) {
         Ok(e) => {
             log(&format!("即時稿引擎已載入：{model_dir}"));
@@ -676,6 +677,10 @@ fn partial_loop(
     let mut vad_ok = true;
     let mut buffers: HashMap<Track, TrackBuffer> = HashMap::new();
     let mut last_run: HashMap<Track, u64> = HashMap::new();
+    // 定稿模式的切換記在這條執行緒上，不在定稿那邊：`mode` 在定稿執行緒上
+    // 每個 chunk 都被呼叫，那裡只能讀原子，寫檔的 log 不能放進去。兩邊讀的
+    // 是同一組原子，這裡記下的就是定稿下一個切點會用的模式。
+    let mut logged_mode: Option<FinalMode> = None;
 
     // 一次把積壓的音訊全部收進來再跑一次引擎，不是一批跑一次。
     // 每批只有 100 ms 但重跑整個視窗要數百毫秒，逐批處理會讓落後持續累積，
@@ -684,6 +689,11 @@ fn partial_loop(
         let mut batch = vec![first];
         while let Ok(more) = rx.try_recv() {
             batch.push(more);
+        }
+        let now_mode = mode();
+        if logged_mode != Some(now_mode) {
+            log(&format!("定稿模式切換為{}", now_mode.label()));
+            logged_mode = Some(now_mode);
         }
         for chunk in batch {
             let track = chunk.track;
@@ -920,8 +930,12 @@ fn final_loop(
         // 會讓前一批算到 0、後一批算到超過批次長度的數字（實測 8400 ms 的
         // 批次回報 22934 ms 人聲）。拿那個數字當閘門會把真實內容整段丟掉。
         // RMS 是無狀態的，同一段音訊算幾次都一樣。
-        let level = rms(&batch);
+        //
+        // 看的是最響的 8 秒而不是整批平均，見 [`gate_level`]。
+        let level = gate_level(&batch);
         let floor = floors.entry(track).or_default();
+        // 底噪估計吃的是同一個窗化的值：門檻要跟 `level` 比，兩者得在同一
+        // 個尺度上。整批平均會把會議模式的底噪估得比即時模式低，門檻跟著失準。
         floor.observe(level);
 
         // 數位靜音直接跳過，純粹是為了不浪費 VAD 的計算；判斷本身不靠它。
@@ -999,16 +1013,29 @@ fn final_loop(
         // （見 [`transcribe_runs`]）。只有系統音訊軌需要分離語者：麥克風軌
         // 一定是使用者本人，那是不需要模型就成立的先驗，再去比對只會製造
         // 認錯的機會。
-        let spans = match (track, speakers.as_mut()) {
-            (Track::System, Some(book)) => book.split(&batch),
-            _ => Vec::new(),
+        //
+        // 切點算在名單的複本上（見 [`super::speakers::SpeakerDraft`]）：這批還可能被當成幻覺
+        // 丟掉或轉錄失敗，只有真的送出定稿之後才寫回名單。
+        let (spans, draft) = match (track, speakers.as_mut()) {
+            (Track::System, Some(book)) => {
+                let (spans, draft) = book.propose(&batch);
+                (spans, Some(draft))
+            }
+            _ => (Vec::new(), None),
         };
-        match transcribe_runs(&engine, &batch, &spans, &hotwords, punct.as_ref()) {
+        match transcribe_runs(
+            &engine,
+            &batch,
+            &spans,
+            &hotwords,
+            punct.as_ref(),
+            speech_floor,
+        ) {
             Ok(segments) => {
                 // 能量閘門擋不住的那一種：環境噪音的 RMS 可以剛好高過門檻，
                 // 模型在上面編出字幕組署名（whisper 時代實測）。兩小時實測漏過兩筆，都在
                 // 沒人說話的麥克風軌上。
-                let texts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
+                let texts: Vec<&str> = segments.iter().map(|s| s.seg.text.as_str()).collect();
                 if crate::stt::is_hallucination(&texts, level) {
                     log(&format!(
                         "{} 軌丟棄幻覺（起點 {batch_start_ms} ms，RMS {level:.4}）：{texts:?}",
@@ -1020,7 +1047,7 @@ fn final_loop(
                     "{} 軌定稿：起點 {batch_start_ms} ms，{buffered_ms} ms 音訊（RMS {level:.4}，人聲 {voiced_pct:.0}%）→ {} 句 {:?}",
                     track.as_str(),
                     segments.len(),
-                    segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>()
+                    texts
                 ));
                 let counter = progress.of(track);
                 let n = counter.load(Ordering::Relaxed);
@@ -1042,6 +1069,9 @@ fn final_loop(
                     Some(sent) => counter.store(n + sent, Ordering::Relaxed),
                     None => return,
                 }
+                if let (Some(book), Some(draft)) = (speakers.as_ref(), draft) {
+                    book.commit(draft);
+                }
             }
             Err(e) => log(&format!("定稿失敗，這段維持即時稿：{e}")),
         }
@@ -1056,7 +1086,7 @@ fn final_loop(
         }
         let batch = std::mem::take(&mut buf.samples);
         let buffered_ms = batch.len() as u64 * 1000 / u64::from(SAMPLE_RATE);
-        let level = rms(&batch);
+        let level = gate_level(&batch);
         if level < SILENT_RMS {
             continue;
         }
@@ -1067,15 +1097,27 @@ fn final_loop(
         if voiced == 0 {
             continue;
         }
-        let spans = match (*track, speakers.as_mut()) {
-            (Track::System, Some(book)) => book.split(&batch),
-            _ => Vec::new(),
+        let (spans, draft) = match (*track, speakers.as_mut()) {
+            (Track::System, Some(book)) => {
+                let (spans, draft) = book.propose(&batch);
+                (spans, Some(draft))
+            }
+            _ => (Vec::new(), None),
         };
-        let Ok(segments) = transcribe_runs(&engine, &batch, &spans, &hotwords, punct.as_ref())
-        else {
+        let speech_floor = floors
+            .get(track)
+            .map_or(SPEECH_FLOOR, |f| SPEECH_FLOOR.max(f.threshold()));
+        let Ok(segments) = transcribe_runs(
+            &engine,
+            &batch,
+            &spans,
+            &hotwords,
+            punct.as_ref(),
+            speech_floor,
+        ) else {
             continue;
         };
-        let texts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
+        let texts: Vec<&str> = segments.iter().map(|s| s.seg.text.as_str()).collect();
         if crate::stt::is_hallucination(&texts, level) {
             continue;
         }
@@ -1098,6 +1140,9 @@ fn final_loop(
         };
         if let Some(sent) = emit_final(&tx, &mut ctx, &segments) {
             counter.store(n + sent, Ordering::Relaxed);
+            if let (Some(book), Some(draft)) = (speakers.as_ref(), draft) {
+                book.commit(draft);
+            }
         }
     }
 }
@@ -1219,6 +1264,14 @@ impl FinalMode {
         }
     }
 
+    /// 寫進 log 的名稱。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Meeting => "會議（45～90 秒）",
+            Self::Live => "即時（8～15 秒）",
+        }
+    }
+
     /// 單批定稿的長度上限：到了就切，不等講者停頓。
     pub const fn max_batch_ms(self) -> u64 {
         match self {
@@ -1300,23 +1353,18 @@ fn decode_setting(v: u8) -> FinalModeSetting {
 /// `ModeSource` 在定稿執行緒上被呼叫，不能等鎖、不能等 I/O。
 /// `set_final_mode` 改的就是這個值，因此改動在下一個切點就會生效，
 /// 不必重開會議。
+///
+/// `Clone` 共用同一個原子：session 開會時複製一份放進 `ModeSource`，
+/// 定稿執行緒從此不必經過 Tauri 的狀態表（那張表有鎖）。
+#[derive(Clone)]
 pub struct FinalModeHandle {
-    setting: AtomicU8,
-    /// 上一次記過 log 的實際模式；0 代表還沒記過。跟 `setting` 的編碼
-    /// 分開，因為這裡多一個「尚未記過」的狀態，覆用同一個編碼會跟
-    /// `Meeting`（也是設定值裡的某個變體）混淆。
-    logged: AtomicU8,
+    setting: Arc<AtomicU8>,
 }
-
-const LOGGED_NONE: u8 = 0;
-const LOGGED_MEETING: u8 = 1;
-const LOGGED_LIVE: u8 = 2;
 
 impl FinalModeHandle {
     pub fn new(initial: FinalModeSetting) -> Self {
         Self {
-            setting: AtomicU8::new(encode_setting(initial)),
-            logged: AtomicU8::new(LOGGED_NONE),
+            setting: Arc::new(AtomicU8::new(encode_setting(initial))),
         }
     }
 
@@ -1329,23 +1377,10 @@ impl FinalModeHandle {
             .store(encode_setting(setting), Ordering::Release);
     }
 
-    /// `ModeSource` 的核心：解出目前該用的 `FinalMode`，只在跟上一次
-    /// 解出來的不同時才印一行 log，而不是每個切點都印。
-    pub fn resolve_and_log(&self, connected: bool) -> FinalMode {
-        let effective = self.get().resolve(connected);
-        let code = match effective {
-            FinalMode::Meeting => LOGGED_MEETING,
-            FinalMode::Live => LOGGED_LIVE,
-        };
-        let prev = self.logged.swap(code, Ordering::AcqRel);
-        if prev != code {
-            let label = match effective {
-                FinalMode::Meeting => "會議（45～90 秒）",
-                FinalMode::Live => "即時（8～15 秒）",
-            };
-            log(&format!("定稿模式切換為{label}"));
-        }
-        effective
+    /// `ModeSource` 的核心：解出目前該用的 `FinalMode`。只讀一個原子；
+    /// 模式切換的 log 由即時稿執行緒記（見 `partial_loop`）。
+    pub fn resolve(&self, connected: bool) -> FinalMode {
+        self.get().resolve(connected)
     }
 }
 
@@ -1479,6 +1514,53 @@ fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
+/// 閘門看的能量窗長與步長。
+const LEVEL_WINDOW_MS: usize = 8_000;
+const LEVEL_STEP_MS: usize = 1_000;
+
+/// 閘門與幻覺判斷用的批次能量：8 秒窗（步長 1 秒）裡最響的那一窗的 RMS。
+/// 不超過 8 秒的批次就是整批的 RMS。
+///
+/// [`SPEECH_FLOOR`] 是在 8 到 15 秒的批次上量出來的。整批平均在會議模式
+/// （45 到 90 秒）會被靜音稀釋：45 秒批次裡一句 1 秒、RMS 0.04 的回應，
+/// 平均下來約 0.006，低於門檻，整批被當成太小聲丟掉。取最響的 8 秒窗，
+/// 每種模式都在門檻被校準的尺度上判斷。
+fn gate_level(samples: &[f32]) -> f32 {
+    let per_ms = SAMPLE_RATE as usize / 1000;
+    let (win, step) = (LEVEL_WINDOW_MS * per_ms, LEVEL_STEP_MS * per_ms);
+    if samples.len() <= win {
+        return rms(samples);
+    }
+    // 先算每秒的平方和，每個窗是相鄰八秒的和；最後補一個貼齊尾端的窗，
+    // 不足一秒的尾巴才不會被漏看。
+    let blocks: Vec<f64> = samples
+        .chunks_exact(step)
+        .map(|c| c.iter().map(|&x| f64::from(x) * f64::from(x)).sum())
+        .collect();
+    let k = win / step;
+    let best = blocks
+        .windows(k)
+        .map(|w| w.iter().sum::<f64>())
+        .fold(0.0, f64::max);
+    let aligned = (best / win as f64).sqrt() as f32;
+    aligned.max(rms(&samples[samples.len() - win..]))
+}
+
+/// 判斷有沒有聲音的窗長。
+const EXTENT_WINDOW_MS: usize = 100;
+
+/// 這段音訊裡第一個到最後一個 RMS 高過 `floor` 的 100 ms 窗，毫秒，
+/// 相對於 `samples` 的開頭。沒有任何一窗夠響就是 `None`。
+fn voiced_extent(samples: &[f32], floor: f32) -> Option<(u64, u64)> {
+    let per_ms = SAMPLE_RATE as usize / 1000;
+    let per = per_ms * EXTENT_WINDOW_MS;
+    let loud = |w: &[f32]| rms(w) > floor;
+    let first = samples.chunks(per).position(loud)?;
+    let last = samples.chunks(per).rposition(loud)?;
+    let end = ((last + 1) * per).min(samples.len()) / per_ms;
+    Some(((first * EXTENT_WINDOW_MS) as u64, end as u64))
+}
+
 /// 語者換手處往外多切的音訊長度。
 ///
 /// 切點來自分割模型，會落在字的邊緣上；多給一點讓換手前後的字完整進到
@@ -1487,12 +1569,14 @@ const RUN_PAD_MS: u64 = 200;
 
 /// 一位語者連續發言的一段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SpeakerRun {
+struct SpeakerRun<'a> {
     /// 這段在批次裡負責的時間範圍，句子的時間分配在這裡面。
     /// 相鄰兩段首尾相接，整批沒有漏掉的區間。
     span: (u64, u64),
     /// 實際送去轉錄的範圍：`span` 前後各加 [`RUN_PAD_MS`]，夾在批次內。
     cut: (u64, u64),
+    /// 這段的語者。整批一段時是 `None`，句子的語者再用 `speaker_at` 找。
+    speaker: Option<&'a str>,
 }
 
 /// 按語者把一批音訊切成幾段。
@@ -1504,10 +1588,11 @@ struct SpeakerRun {
 /// 相鄰的同語者片段合併成一段；段與段的界線取兩者之間空隙的中點，頭尾延伸
 /// 到批次邊界 —— 分割模型沒標到的零碎語音也要有人負責，否則那幾個字會消失。
 /// 少於兩位語者就是整批一段。
-fn speaker_runs(spans: &[SpeakerSpan], batch_ms: u64) -> Vec<SpeakerRun> {
+fn speaker_runs(spans: &[SpeakerSpan], batch_ms: u64) -> Vec<SpeakerRun<'_>> {
     let whole = vec![SpeakerRun {
         span: (0, batch_ms),
         cut: (0, batch_ms),
+        speaker: None,
     }];
     let mut sorted: Vec<&SpeakerSpan> = spans.iter().collect();
     sorted.sort_by_key(|s| s.start_ms);
@@ -1530,45 +1615,90 @@ fn speaker_runs(spans: &[SpeakerSpan], batch_ms: u64) -> Vec<SpeakerRun> {
         .map(|i| {
             let lo = if i == 0 { 0 } else { bounds[i - 1] };
             let hi = bounds.get(i).copied().unwrap_or(batch_ms);
-            (lo, hi.max(lo))
+            (lo, hi.max(lo), merged[i].2)
         })
-        .filter(|(lo, hi)| hi > lo)
-        .map(|(lo, hi)| SpeakerRun {
+        .filter(|(lo, hi, _)| hi > lo)
+        .map(|(lo, hi, speaker)| SpeakerRun {
             span: (lo, hi),
             cut: (
                 lo.saturating_sub(RUN_PAD_MS),
                 (hi + RUN_PAD_MS).min(batch_ms),
             ),
+            speaker: Some(speaker),
         })
         .collect()
 }
 
+/// 定稿的一句，連同它所屬那段的語者。
+#[derive(Debug, Clone, PartialEq)]
+struct RunSegment<'a> {
+    seg: super::Segment,
+    /// 按語者分段轉錄時就是那段的語者。句子的時間是估的，拿它回頭用
+    /// `speaker_at` 找語者可能落在那段自己的發言範圍外，退回預設語者。
+    speaker: Option<&'a str>,
+}
+
 /// 轉錄一批音訊：一位語者整批一次，兩位以上每段各一次（見 [`speaker_runs`]）。
 ///
-/// 片段時間相對於批次開頭，跟整批一次轉錄時一樣。
+/// 片段時間相對於批次開頭，跟整批一次轉錄時一樣。句子的時間分配在每段
+/// 實際有聲音的範圍（見 [`voiced_extent`]，門檻 `speech_floor`）：一段 45 秒
+/// 只有最後 5 秒在講話，句子不該從 0 秒開始。
+///
+/// 某一段轉錄失敗只丟那一段，記下它的範圍，其他段照常送出；全部失敗才
+/// 回錯，交給呼叫端讓整批維持即時稿。
 ///
 /// 標點在切句之前上，而不是像 whisper 時代那樣留給 `emit_final` 逐句上：
 /// TEA-ASR 常常整段不下標點（實測 90 秒只出一個逗號），切句靠的正是標點，
 /// 先切再上等於切不出句子。整段一次上也讓標點模型看得到完整上下文。
-fn transcribe_runs(
-    engine: &Tea,
+fn transcribe_runs<'a>(
+    engine: &impl RunEngine,
     batch: &[f32],
-    spans: &[SpeakerSpan],
+    spans: &'a [SpeakerSpan],
     hotwords: &str,
     punct: Option<&SharedPunct>,
-) -> Result<Vec<super::Segment>> {
+    speech_floor: f32,
+) -> Result<Vec<RunSegment<'a>>> {
     let per_ms = u64::from(SAMPLE_RATE) / 1000;
     let batch_ms = batch.len() as u64 / per_ms;
+    let samples = |(lo, hi): (u64, u64)| {
+        let hi = ((hi * per_ms) as usize).min(batch.len());
+        &batch[((lo * per_ms) as usize).min(hi)..hi]
+    };
+    let runs = speaker_runs(spans, batch_ms);
+    let cuts: Vec<&[f32]> = runs.iter().map(|r| samples(r.cut)).collect();
     let mut out = Vec::new();
-    for run in speaker_runs(spans, batch_ms) {
-        let lo = (run.cut.0 * per_ms) as usize;
-        let hi = ((run.cut.1 * per_ms) as usize).min(batch.len());
-        let text = engine.text(&batch[lo..hi], hotwords)?;
+    let mut errors = Vec::new();
+    for (run, text) in runs.iter().zip(engine.texts(&cuts, hotwords)) {
+        let text = match text {
+            Ok(t) => t,
+            Err(e) => {
+                log(&format!(
+                    "定稿有一段失敗（批次內 {} 到 {} ms），其餘照常送出：{e}",
+                    run.span.0, run.span.1
+                ));
+                errors.push(e);
+                continue;
+            }
+        };
         let text = match punct {
             Some(p) if !text.is_empty() => p.apply(&text),
             _ => text,
         };
-        out.extend(timed_sentences(&text, run.span.0, run.span.1));
+        let (lo, hi) = voiced_extent(samples(run.span), speech_floor)
+            .map_or(run.span, |(a, b)| (run.span.0 + a, run.span.0 + b));
+        out.extend(
+            timed_sentences(&text, lo, hi.min(run.span.1))
+                .into_iter()
+                .map(|seg| RunSegment {
+                    seg,
+                    speaker: run.speaker,
+                }),
+        );
+    }
+    if errors.len() == runs.len() {
+        if let Some(e) = errors.into_iter().next() {
+            return Err(e);
+        }
     }
     Ok(out)
 }
@@ -1597,7 +1727,7 @@ struct FinalContext<'a> {
 fn emit_final(
     tx: &Sender<TranscriptInput>,
     ctx: &mut FinalContext<'_>,
-    segments: &[super::Segment],
+    segments: &[RunSegment<'_>],
 ) -> Option<u64> {
     let FinalContext {
         track,
@@ -1609,7 +1739,7 @@ fn emit_final(
     } = ctx;
     let (track, finalized, batch_start_ms) = (*track, *finalized, *batch_start_ms);
     let mut sent = 0u64;
-    for seg in segments {
+    for RunSegment { seg, speaker } in segments {
         let text = seg.text.trim();
         if text.is_empty() {
             // 空白不佔用 segment 編號，否則畫面上會出現一排空片段
@@ -1625,7 +1755,9 @@ fn emit_final(
         let ok = tx
             .send(TranscriptInput::Final {
                 segment_id: segment_id(track, finalized + sent),
-                speaker_id: speaker_at(spans, seg.start_ms, seg.end_ms)
+                // 分段轉錄時語者跟著段走；整批一段時才從時間找
+                speaker_id: speaker
+                    .or_else(|| speaker_at(spans, seg.start_ms, seg.end_ms))
                     .unwrap_or(speaker_of(track))
                     .to_owned(),
                 text: super::diff::to_traditional(&punctuated, vocab),
@@ -1736,9 +1868,9 @@ mod tests {
         // 模擬「會議進行中改設定」：closure 只建一次，`set` 之後
         // 下一次呼叫就要看到新值，不必重建 handle。
         let handle = FinalModeHandle::new(FinalModeSetting::Meeting);
-        assert_eq!(handle.resolve_and_log(false), FinalMode::Meeting);
+        assert_eq!(handle.resolve(false), FinalMode::Meeting);
         handle.set(FinalModeSetting::Live);
-        assert_eq!(handle.resolve_and_log(false), FinalMode::Live);
+        assert_eq!(handle.resolve(false), FinalMode::Live);
     }
 
     #[test]
@@ -1750,14 +1882,13 @@ mod tests {
     }
 
     #[test]
-    fn test_final_mode_handle_resolve_and_log_only_logs_on_change() {
-        // `resolve_and_log` 的 log 副作用不好斷言，這裡驗證它至少不會 panic，
-        // 而且連續呼叫同一個有效模式時 `logged` 只切換一次狀態轉移。
-        let handle = FinalModeHandle::new(FinalModeSetting::Meeting);
-        for _ in 0..5 {
-            assert_eq!(handle.resolve_and_log(false), FinalMode::Meeting);
-        }
-        assert_eq!(handle.logged.load(Ordering::Relaxed), LOGGED_MEETING);
+    fn test_final_mode_handle_clone_sees_a_later_set() {
+        // session 在開會時複製一份給定稿執行緒；設定畫面改的是 Tauri 管的
+        // 那一份，複本必須看得到
+        let managed = FinalModeHandle::new(FinalModeSetting::Meeting);
+        let captured = managed.clone();
+        managed.set(FinalModeSetting::Live);
+        assert_eq!(captured.resolve(false), FinalMode::Live);
     }
 }
 
@@ -2339,10 +2470,11 @@ mod speaker_run_tests {
         }
     }
 
-    fn whole(batch_ms: u64) -> Vec<SpeakerRun> {
+    fn whole(batch_ms: u64) -> Vec<SpeakerRun<'static>> {
         vec![SpeakerRun {
             span: (0, batch_ms),
             cut: (0, batch_ms),
+            speaker: None,
         }]
     }
 
@@ -2440,5 +2572,245 @@ mod speaker_run_tests {
             ),
             (8_000, 15_000)
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_path_tests {
+    use super::*;
+
+    /// 回傳腳本結果的假引擎：`Ok` 是那段的文字，`Err` 是那段的失敗訊息。
+    struct Script(Vec<std::result::Result<&'static str, &'static str>>);
+
+    impl RunEngine for Script {
+        fn texts(&self, runs: &[&[f32]], _hotwords: &str) -> Vec<Result<String>> {
+            assert_eq!(runs.len(), self.0.len(), "段數與腳本不符");
+            self.0
+                .iter()
+                .map(|r| match r {
+                    Ok(t) => Ok((*t).to_owned()),
+                    Err(m) => Err(SttError::Decode((*m).to_owned())),
+                })
+                .collect()
+        }
+    }
+
+    const PER_MS: usize = SAMPLE_RATE as usize / 1000;
+
+    fn silence(ms: usize) -> Vec<f32> {
+        vec![0.0; ms * PER_MS]
+    }
+
+    /// RMS 為 `level` 的正弦波。
+    fn tone(ms: usize, level: f32) -> Vec<f32> {
+        let amp = level * std::f32::consts::SQRT_2;
+        (0..ms * PER_MS)
+            .map(|i| amp * (i as f32 * 0.07).sin())
+            .collect()
+    }
+
+    fn span(start_ms: u64, end_ms: u64, speaker: &str) -> SpeakerSpan {
+        SpeakerSpan {
+            start_ms,
+            end_ms,
+            speaker: speaker.into(),
+        }
+    }
+
+    /// 一句 1 秒的回應放在 `batch_ms` 長的批次中間。
+    fn reply_in(batch_ms: usize) -> Vec<f32> {
+        let mut b = silence(batch_ms / 2);
+        b.extend(tone(1_000, 0.04));
+        b.extend(silence(batch_ms - batch_ms / 2 - 1_000));
+        b
+    }
+
+    #[test]
+    fn test_gate_level_short_reply_gets_the_same_verdict_in_8s_and_45s_batches() {
+        let (short, long) = (reply_in(8_000), reply_in(45_000));
+        // 整批平均會把 45 秒那批稀釋到門檻以下，這正是要修的情況
+        assert!(rms(&long) < SPEECH_FLOOR, "{}", rms(&long));
+        let verdict = |b: &[f32]| {
+            let ms = (b.len() / PER_MS) as u64;
+            gate(1_000, ms, gate_level(b), SPEECH_FLOOR)
+        };
+        assert_eq!(verdict(&short), Gate::Send);
+        assert_eq!(verdict(&long), verdict(&short));
+    }
+
+    #[test]
+    fn test_gate_level_batch_up_to_8s_is_its_plain_rms() {
+        let b = reply_in(8_000);
+        assert_eq!(gate_level(&b), rms(&b));
+        assert_eq!(gate_level(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_gate_level_loud_tail_shorter_than_a_step_is_seen() {
+        // 8.5 秒：最後半秒不在任何整秒對齊的窗裡，要靠貼齊尾端的那一窗
+        let mut b = silence(8_000);
+        b.extend(tone(500, 0.1));
+        assert!(gate_level(&b) >= rms(&b[b.len() - 8_000 * PER_MS..]));
+        assert!(gate_level(&b) > rms(&b));
+    }
+
+    #[test]
+    fn test_voiced_extent_silence_is_none() {
+        assert_eq!(voiced_extent(&silence(5_000), SPEECH_FLOOR), None);
+        assert_eq!(voiced_extent(&[], SPEECH_FLOOR), None);
+    }
+
+    #[test]
+    fn test_transcribe_runs_speech_only_at_the_end_starts_near_the_end() {
+        let mut batch = silence(40_000);
+        batch.extend(tone(5_000, 0.05));
+        let segs = transcribe_runs(
+            &Script(vec![Ok("今天開會討論預算。")]),
+            &batch,
+            &[],
+            "",
+            None,
+            SPEECH_FLOOR,
+        )
+        .unwrap();
+        assert_eq!(segs.len(), 1);
+        assert!(segs[0].seg.start_ms >= 39_900, "{:?}", segs[0].seg);
+        assert_eq!(segs[0].seg.end_ms, 45_000);
+    }
+
+    #[test]
+    fn test_transcribe_runs_no_loud_window_falls_back_to_the_full_range() {
+        let segs = transcribe_runs(
+            &Script(vec![Ok("好。")]),
+            &silence(10_000),
+            &[],
+            "",
+            None,
+            SPEECH_FLOOR,
+        )
+        .unwrap();
+        assert_eq!((segs[0].seg.start_ms, segs[0].seg.end_ms), (0, 10_000));
+    }
+
+    #[test]
+    fn test_transcribe_runs_stacked_stop_is_one_segment() {
+        let segs = transcribe_runs(
+            &Script(vec![Ok("太好了！。")]),
+            &tone(2_000, 0.05),
+            &[],
+            "",
+            None,
+            SPEECH_FLOOR,
+        )
+        .unwrap();
+        assert_eq!(
+            segs.iter().map(|s| s.seg.text.as_str()).collect::<Vec<_>>(),
+            ["太好了！"]
+        );
+    }
+
+    #[test]
+    fn test_transcribe_runs_one_failed_run_keeps_the_others() {
+        let spans = [span(0, 1_000, "s1"), span(9_000, 10_000, "s2")];
+        let segs = transcribe_runs(
+            &Script(vec![Err("解碼失敗"), Ok("好。")]),
+            &silence(10_000),
+            &spans,
+            "",
+            None,
+            SPEECH_FLOOR,
+        )
+        .unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].seg.text, "好。");
+        assert_eq!(segs[0].speaker, Some("s2"));
+    }
+
+    #[test]
+    fn test_transcribe_runs_every_run_failed_is_an_error() {
+        let spans = [span(0, 1_000, "s1"), span(9_000, 10_000, "s2")];
+        let r = transcribe_runs(
+            &Script(vec![Err("一"), Err("二")]),
+            &silence(10_000),
+            &spans,
+            "",
+            None,
+            SPEECH_FLOOR,
+        );
+        assert!(
+            matches!(r, Err(SttError::Decode(ref m)) if m == "一"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn test_emit_final_run_speaker_survives_estimated_times_outside_its_span() {
+        // s2 只在 9-10 秒被標到，但那段負責 5-10 秒；「乙」的時間估在
+        // 5000-7500，跟 s2 的標註沒有重疊，從時間找會退回預設語者
+        let spans = [span(0, 1_000, "s1"), span(9_000, 10_000, "s2")];
+        let segs = transcribe_runs(
+            &Script(vec![Ok("甲。"), Ok("乙乙。丙丙。")]),
+            &silence(10_000),
+            &spans,
+            "",
+            None,
+            SPEECH_FLOOR,
+        )
+        .unwrap();
+        assert_eq!(
+            speaker_at(&spans, segs[1].seg.start_ms, segs[1].seg.end_ms),
+            None
+        );
+
+        let (tx, rx) = channel();
+        let vocab = Corrections::default();
+        let mut ctx = FinalContext {
+            track: Track::System,
+            finalized: 0,
+            batch_start_ms: 0,
+            punct: None,
+            spans: &spans,
+            vocab: &vocab,
+        };
+        assert_eq!(emit_final(&tx, &mut ctx, &segs), Some(3));
+        drop(tx);
+        let speakers: Vec<String> = rx
+            .iter()
+            .map(|m| match m {
+                TranscriptInput::Final { speaker_id, .. } => speaker_id,
+                _ => panic!("只會送出定稿"),
+            })
+            .collect();
+        assert_eq!(speakers, ["s1", "s2", "s2"]);
+    }
+
+    #[test]
+    fn test_emit_final_single_run_still_finds_the_speaker_by_time() {
+        let spans = [span(0, 10_000, "s3")];
+        let segs = transcribe_runs(
+            &Script(vec![Ok("好。")]),
+            &silence(10_000),
+            &spans,
+            "",
+            None,
+            SPEECH_FLOOR,
+        )
+        .unwrap();
+        assert_eq!(segs[0].speaker, None);
+        let (tx, rx) = channel();
+        let vocab = Corrections::default();
+        let mut ctx = FinalContext {
+            track: Track::System,
+            finalized: 0,
+            batch_start_ms: 0,
+            punct: None,
+            spans: &spans,
+            vocab: &vocab,
+        };
+        assert_eq!(emit_final(&tx, &mut ctx, &segs), Some(1));
+        let Ok(TranscriptInput::Final { speaker_id, .. }) = rx.try_recv() else {
+            panic!("應該送出一句定稿");
+        };
+        assert_eq!(speaker_id, "s3");
     }
 }

@@ -2321,20 +2321,27 @@ fn begin_meeting(app: &AppHandle, state: &SessionHandle, store: &StoreHandle) ->
 
     // 音訊裝置在這裡才開，不在 app 啟動時：錄音沒開始就佔住麥克風，
     // 其他程式會拿不到，而使用者不會知道是誰佔的。
-    // 這個 closure 在定稿執行緒的每一個切點都會被呼叫，因此只能讀原子
-    // 變數：`app.state` 是 O(1) 的型別表查詢，`connected()`／
-    // `resolve_and_log` 都只讀原子，沒有鎖、沒有資料庫、不會等。
-    // 兩個 handle 都用 `try_state`：sink 沒被 manage 時當成沒連線，
-    // `FinalModeHandle` 少了就退回最準確也最安全的會議模式，而不是 panic。
+    // 這個 closure 在定稿執行緒上每個 chunk 都會被呼叫，所以不能碰 I/O，
+    // 模式切換的 log 由即時稿執行緒記（見 `live::partial_loop`）。
+    // `FinalModeHandle` 在這裡複製一份帶進去，共用同一個原子，設定畫面
+    // 改的值下一個切點就看得到。沒被 manage 時退回最準確也最安全的
+    // 會議模式，而不是 panic。
+    //
+    // sink 的連線狀態仍走 `try_state`：那是 Tauri 狀態表的查詢，會短暫
+    // 拿一把鎖（不做 I/O）。`SinkHandle` 沒有可複製的連線旗標可以帶進來。
+    let final_mode = app
+        .try_state::<crate::stt::live::FinalModeHandle>()
+        .map(|h| h.inner().clone());
     let app_for_mode = app.clone();
     let mode: crate::stt::live::ModeSource = std::sync::Arc::new(move || {
         let connected = app_for_mode
             .try_state::<crate::sink::SinkHandle>()
             .is_some_and(|s| s.connected());
-        app_for_mode
-            .try_state::<crate::stt::live::FinalModeHandle>()
-            .map(|h| h.resolve_and_log(connected))
-            .unwrap_or(crate::stt::live::FinalMode::Meeting)
+        final_mode
+            .as_ref()
+            .map_or(crate::stt::live::FinalMode::Meeting, |h| {
+                h.resolve(connected)
+            })
     });
     match crate::stt::live::ModelPaths::discover()
         .and_then(|m| crate::stt::live::LocalSttSource::start(m, audio_dir, mode))
