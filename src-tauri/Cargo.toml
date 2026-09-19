@@ -56,7 +56,7 @@ ort = { version = "=2.0.0-rc.10", default-features = false, features = [
 ] }
 # 使用者資料目錄。日誌一定要寫得進去，而安裝版的程式目錄是唯讀的；
 # 「該寫哪裡」是每個平台各自的慣例，不是一條可以自己拼出來的路徑。
-dirs = "6"
+dirs = "7"
 
 # sherpa-rs 兩個平台的連結方式不同，所以不放在 [dependencies]：同一個 package
 # 在兩處宣告時 feature 會被聯集，static 與 tts 併在一起會撞上上游的
