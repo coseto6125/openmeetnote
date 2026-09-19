@@ -2321,8 +2321,11 @@ fn begin_meeting(app: &AppHandle, state: &SessionHandle, store: &StoreHandle) ->
 
     // 音訊裝置在這裡才開，不在 app 啟動時：錄音沒開始就佔住麥克風，
     // 其他程式會拿不到，而使用者不會知道是誰佔的。
+    // 批次長度模式先固定為會議記錄；切換的開關還沒接上。
+    let mode: crate::stt::live::ModeSource =
+        std::sync::Arc::new(|| crate::stt::live::FinalMode::Meeting);
     match crate::stt::live::ModelPaths::discover()
-        .and_then(|m| crate::stt::live::LocalSttSource::start(m, audio_dir))
+        .and_then(|m| crate::stt::live::LocalSttSource::start(m, audio_dir, mode))
     {
         Ok(src) => {
             if let Ok(mut s) = state.inner.lock() {

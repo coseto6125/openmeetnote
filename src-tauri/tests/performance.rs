@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use openmeetnote_lib::stt::{load_wav_16k_mono, paraformer::Paraformer, whisper::Whisper};
+use openmeetnote_lib::stt::{load_wav_16k_mono, paraformer::Paraformer, tea::Tea};
 
 fn assets() -> Option<std::path::PathBuf> {
     let d = std::path::PathBuf::from(
@@ -14,18 +14,32 @@ fn assets() -> Option<std::path::PathBuf> {
     d.is_dir().then_some(d)
 }
 
+/// TEA-ASR 的兩個模型檔。環境變數優先，其次是素材目錄的 `models/tea/`。
+fn tea_paths(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let pick = |var: &str, name: &str| {
+        std::env::var(var)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| dir.join("models/tea").join(name))
+    };
+    (
+        pick("OMN_TEA_MODEL", "TEA-ASR-1.1.Q4_K_M.gguf"),
+        pick("OMN_TEA_MMPROJ", "TEA-ASR-1.1.mmproj-Q8_0.gguf"),
+    )
+}
+
 #[test]
+#[ignore = "載入 1.4 GB 的定稿模型；單獨執行"]
 fn test_the_pipeline_keeps_up_with_real_time() {
     let Some(dir) = assets() else {
         eprintln!("略過：找不到測試素材");
         return;
     };
-    let (wm, pd, wav) = (
-        dir.join("models/ggml-large-v3-turbo-q5_0.bin"),
+    let (tm, tp) = tea_paths(&dir);
+    let (pd, wav) = (
         dir.join("sherpa-onnx-paraformer-zh-2023-09-14"),
         dir.join("near.wav"),
     );
-    if !wm.exists() || !pd.is_dir() || !wav.exists() {
+    if !tm.exists() || !tp.exists() || !pd.is_dir() || !wav.exists() {
         eprintln!("略過：缺少模型或音訊");
         return;
     }
@@ -35,8 +49,8 @@ fn test_the_pipeline_keeps_up_with_real_time() {
 
     // 載入成本：使用者按下開始錄音之後要等多久才真的開始
     let t = Instant::now();
-    let whisper = Whisper::load(wm.to_str().unwrap(), 4).expect("載入 whisper");
-    let whisper_load = t.elapsed().as_secs_f64();
+    let tea = Tea::load(tm.to_str().unwrap(), tp.to_str().unwrap(), 4).expect("載入 TEA-ASR");
+    let tea_load = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
     let mut para = Paraformer::load(pd.to_str().unwrap(), 4).expect("載入 Paraformer");
@@ -48,18 +62,18 @@ fn test_the_pipeline_keeps_up_with_real_time() {
     let para_rtf = t.elapsed().as_secs_f64() / audio_s;
 
     let t = Instant::now();
-    let _ = whisper.transcribe(&samples).expect("定稿");
-    let whisper_rtf = t.elapsed().as_secs_f64() / audio_s;
+    let _ = tea.transcribe(&samples, "").expect("定稿");
+    let tea_rtf = t.elapsed().as_secs_f64() / audio_s;
 
-    println!("載入：whisper {whisper_load:.2}s、Paraformer {para_load:.2}s");
-    println!("RTF：whisper {whisper_rtf:.3}、Paraformer {para_rtf:.3}");
+    println!("載入：TEA-ASR {tea_load:.2}s、Paraformer {para_load:.2}s");
+    println!("RTF：TEA-ASR {tea_rtf:.3}、Paraformer {para_rtf:.3}");
 
     // 兩個引擎跑在各自的執行緒上，所以界線要分開設 —— 把兩個 RTF 相加
     // 不對應任何真實情況。真正會壞的是定稿追不上錄音：RTF 到 1.0 就
     // 開始越積越多，一小時的會議永遠處理不完。留 20% 餘裕當防線。
     assert!(
-        whisper_rtf < 0.8,
-        "定稿 RTF {whisper_rtf:.3} 太高，長會議會越積越多"
+        tea_rtf < 0.8,
+        "定稿 RTF {tea_rtf:.3} 太高，長會議會越積越多"
     );
 
     // 即時稿要在說完話的當下就出現，慢下來使用者會直接看到字卡住
@@ -82,8 +96,8 @@ fn test_the_pipeline_keeps_up_with_real_time() {
 
     // 載入時間直接就是使用者按下開始錄音後的空窗，模型都在本機不該超過十秒
     assert!(
-        whisper_load + para_load < 10.0,
+        tea_load + para_load < 10.0,
         "模型載入要 {:.1}s，開始錄音的等待太久",
-        whisper_load + para_load
+        tea_load + para_load
     );
 }

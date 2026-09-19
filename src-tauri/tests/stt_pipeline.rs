@@ -5,8 +5,12 @@
 //! 版本庫，所以缺席時整份跳過而不是失敗 —— 讓 CI 因為沒有模型就紅燈，
 //! 只會訓練出「忽略紅燈」的習慣。
 //!
+//! 載入定稿模型的測試標成 `#[ignore]`：兩個模型檔合計一.四 GB，推論會吃滿
+//! 四條執行緒，不該跟其他測試一起平行跑。要跑就單獨、一次一個：
+//!
 //! ```bash
-//! OMN_TEST_ASSETS=/home/enor/whisper-bench cargo test --test stt_pipeline
+//! OMN_TEST_ASSETS=/home/enor/whisper-bench \
+//!   cargo test --test stt_pipeline -- --ignored --test-threads=1
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -15,7 +19,7 @@ use openmeetnote_lib::stt::{
     diff::{self, Corrections},
     live, load_wav_16k_mono,
     paraformer::Paraformer,
-    whisper::Whisper,
+    tea::Tea,
 };
 
 /// 測試素材的位置。這些檔案（模型與會議錄音）合計超過一 GB，不進版本庫。
@@ -29,6 +33,20 @@ fn assets() -> Option<PathBuf> {
 fn require(dir: &Path, rel: &str) -> Option<PathBuf> {
     let p = dir.join(rel);
     p.exists().then_some(p)
+}
+
+/// TEA-ASR 的兩個模型檔。環境變數優先，其次是素材目錄的 `models/tea/`。
+fn tea(dir: &Path) -> Option<Tea> {
+    let pick = |var: &str, name: &str| {
+        std::env::var(var)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| dir.join("models/tea").join(name))
+    };
+    let model = pick("OMN_TEA_MODEL", "TEA-ASR-1.1.Q4_K_M.gguf");
+    let mmproj = pick("OMN_TEA_MMPROJ", "TEA-ASR-1.1.mmproj-Q8_0.gguf");
+    (model.exists() && mmproj.exists()).then(|| {
+        Tea::load(model.to_str().unwrap(), mmproj.to_str().unwrap(), 4).expect("載入 TEA-ASR")
+    })
 }
 
 /// 這段音訊裡確實出現、而且是台灣會議特有的詞。
@@ -45,22 +63,24 @@ const EXPECTED: &[&str] = &[
 ];
 
 #[test]
-fn test_whisper_transcribes_taiwanese_meeting_terms() {
+#[ignore = "載入 1.4 GB 的定稿模型；單獨執行"]
+fn test_tea_transcribes_taiwanese_meeting_terms() {
     let Some(dir) = assets() else {
         eprintln!("略過：找不到測試素材目錄");
         return;
     };
-    let (Some(model), Some(wav)) = (
-        require(&dir, "models/ggml-large-v3-turbo-q5_0.bin"),
-        require(&dir, "near.wav"),
-    ) else {
-        eprintln!("略過：缺少 whisper 模型或測試音訊");
+    let Some(wav) = require(&dir, "near.wav") else {
+        eprintln!("略過：缺少測試音訊");
+        return;
+    };
+    let Some(engine) = tea(&dir) else {
+        eprintln!("略過：缺少 TEA-ASR 模型");
         return;
     };
 
     let samples = load_wav_16k_mono(wav.to_str().unwrap()).expect("讀取音訊");
-    let engine = Whisper::load(model.to_str().unwrap(), 4).expect("載入 whisper");
-    let segments = engine.transcribe(&samples).expect("轉錄");
+    // 不帶熱詞：這裡量的是模型本身認不認得這些詞
+    let segments = engine.transcribe(&samples, "").expect("轉錄");
 
     let text: String = segments.iter().map(|s| s.text.as_str()).collect();
     let hits: Vec<&str> = EXPECTED
@@ -121,25 +141,26 @@ fn test_paraformer_is_fast_enough_for_live_captions() {
 }
 
 #[test]
+#[ignore = "載入 1.4 GB 的定稿模型；單獨執行"]
 fn test_the_two_engines_disagree_exactly_where_the_hard_words_are() {
     let Some(dir) = assets() else {
         eprintln!("略過：找不到測試素材目錄");
         return;
     };
-    let (Some(whisper_model), Some(para_dir), Some(wav)) = (
-        require(&dir, "models/ggml-large-v3-turbo-q5_0.bin"),
+    let (Some(para_dir), Some(wav)) = (
         require(&dir, "sherpa-onnx-paraformer-zh-2023-09-14"),
         require(&dir, "near.wav"),
     ) else {
         eprintln!("略過：缺少模型或測試音訊");
         return;
     };
+    let Some(engine) = tea(&dir) else {
+        eprintln!("略過：缺少 TEA-ASR 模型");
+        return;
+    };
 
     let samples = load_wav_16k_mono(wav.to_str().unwrap()).expect("讀取音訊");
-    let reference = Whisper::load(whisper_model.to_str().unwrap(), 4)
-        .expect("載入 whisper")
-        .transcribe(&samples)
-        .expect("定稿");
+    let reference = engine.transcribe(&samples, "").expect("定稿");
     let tokens = Paraformer::load(para_dir.to_str().unwrap(), 4)
         .expect("載入 Paraformer")
         .tokens(&samples);

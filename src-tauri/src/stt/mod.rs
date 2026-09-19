@@ -1,6 +1,6 @@
 //! 本機轉錄引擎（BLUEPRINT.md §5.3.1）。
 //!
-//! 兩個引擎，一快一準：Paraformer 供錄音期間的即時稿，whisper 供片段定稿。
+//! 兩個引擎，一快一準：Paraformer 供錄音期間的即時稿，TEA-ASR 供片段定稿。
 //! 兩者對同一段的結果不一致時，該處是 `Gap`，交給使用者確認 —— 這不是備援，
 //! 實測顯示兩個引擎的錯誤不重疊，分歧本身就指出最可能出錯的位置。
 //!
@@ -12,7 +12,7 @@ pub mod live;
 pub mod paraformer;
 pub mod segment;
 pub mod speakers;
-pub mod whisper;
+pub mod tea;
 
 /// 一段連續發言。時間以擷取音訊為基準（`captured_audio_ms`），不是會議時間軸：
 /// 暫停期間沒有音訊，兩者會分岔，混用會讓引用定位到錯的地方。
@@ -22,7 +22,7 @@ pub struct Segment {
     pub start_ms: u64,
     pub end_ms: u64,
     pub text: String,
-    /// whisper 判斷這段沒有語音的機率。
+    /// 引擎判斷這段沒有語音的機率。Paraformer 與 TEA-ASR 都不提供，一律 0。
     ///
     /// 幻覺（憑空生出「字幕志願者 XXX」這類訓練資料殘留）幾乎都伴隨高值：
     /// 模型自己知道沒東西可轉，但解碼器仍被迫吐出 token。能量閘門擋不住

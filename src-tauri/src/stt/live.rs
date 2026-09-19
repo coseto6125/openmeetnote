@@ -1,10 +1,10 @@
 //! 即時轉錄來源：把音訊擷取與兩個引擎接成 `TranscriptSource`。
 //!
 //! 兩個引擎跑在各自的執行緒上，因為它們的速度差二十倍：Paraformer 每秒就能
-//! 回一次結果，whisper 一段十幾秒的音訊要跑好幾秒。放同一條執行緒會讓即時稿
+//! 回一次結果，TEA-ASR 一段幾十秒的音訊要跑好幾秒。放同一條執行緒會讓即時稿
 //! 被定稿拖住，畫面就不動了。
 //!
-//! 對應到 session 既有的修訂語意：Paraformer 出 `Partial`，whisper 出 `Final`。
+//! 對應到 session 既有的修訂語意：Paraformer 出 `Partial`，TEA-ASR 出 `Final`。
 //! 定稿覆蓋即時稿走的是 `segment_id` + revision 那條既有路徑，這裡不需要新規則。
 
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig};
 use super::diff::Corrections;
 use super::paraformer::Paraformer;
 use super::speakers::{speaker_at, SpeakerBook, SpeakerSpan};
-use super::whisper::Whisper;
+use super::tea::{hotword_prompt, timed_sentences, Tea};
 use super::{Result, SttError};
 use crate::audio::{platform_capture, AudioCapture, AudioError, Chunk, SAMPLE_RATE};
 use crate::model::Track;
@@ -149,7 +149,7 @@ const FAST_BACKLOG_CHUNKS: usize = 150;
 /// 定稿佇列的長度上限（每批 100 ms），約十分鐘。
 ///
 /// 定稿的內容會進逐字稿，丟掉就是真的少一段，所以給得比即時稿寬得多。
-/// 但仍然有界：whisper 卡住時無界佇列會一路長到會議結束。
+/// 但仍然有界：定稿卡住時無界佇列會一路長到會議結束。
 const SLOW_BACKLOG_CHUNKS: usize = 6_000;
 
 /// 寫檔佇列的長度上限（每批 100 ms），約十分鐘。
@@ -160,7 +160,10 @@ const WRITE_BACKLOG_CHUNKS: usize = 6_000;
 
 #[derive(Debug, Clone)]
 pub struct ModelPaths {
-    pub whisper: String,
+    /// TEA-ASR 的文字解碼器（GGUF）。
+    pub tea_model: String,
+    /// TEA-ASR 的音訊編碼器（mmproj GGUF）。兩個檔案缺一不可。
+    pub tea_mmproj: String,
     pub paraformer_dir: String,
     pub vad: String,
     /// 標點模型。缺席時逐字稿照樣產生，只是沒有標點。
@@ -180,11 +183,14 @@ impl ModelPaths {
             std::env::var(var).unwrap_or_else(|_| model(name).to_string_lossy().into_owned())
         };
 
-        let whisper = from_env("OMN_WHISPER_MODEL", "ggml-large-v3-turbo-q5_0.bin");
+        let tea_model = from_env("OMN_TEA_MODEL", "TEA-ASR-1.1.Q4_K_M.gguf");
+        let tea_mmproj = from_env("OMN_TEA_MMPROJ", "TEA-ASR-1.1.mmproj-Q8_0.gguf");
         let paraformer_dir = from_env("OMN_PARAFORMER_DIR", "sherpa-onnx-paraformer-zh-2023-09-14");
 
-        if !std::path::Path::new(&whisper).exists() {
-            return Err(SttError::Load(format!("找不到定稿模型：{whisper}")));
+        for p in [&tea_model, &tea_mmproj] {
+            if !std::path::Path::new(p).exists() {
+                return Err(SttError::Load(format!("找不到定稿模型：{p}")));
+            }
         }
         if !std::path::Path::new(&paraformer_dir).is_dir() {
             return Err(SttError::Load(format!(
@@ -215,7 +221,8 @@ impl ModelPaths {
         });
 
         Ok(Self {
-            whisper,
+            tea_model,
+            tea_mmproj,
             paraformer_dir,
             vad,
             punct,
@@ -277,7 +284,14 @@ impl LocalSttSource {
     /// 以為會議被記錄下來了。
     /// `audio_dir` 是這場會議的音訊要寫去哪。`None` 代表不保留原音 —— 那時
     /// 逐字稿就是唯一紀錄，事後無法驗證也無法換模型重跑。
-    pub fn start(models: ModelPaths, audio_dir: Option<std::path::PathBuf>) -> Result<Self> {
+    ///
+    /// `mode` 在定稿的每一次切點判斷都會被呼叫一次，回傳當下的批次長度模式
+    /// （見 [`FinalMode`]）。它跑在定稿執行緒上，必須便宜且不阻塞。
+    pub fn start(
+        models: ModelPaths,
+        audio_dir: Option<std::path::PathBuf>,
+        mode: ModeSource,
+    ) -> Result<Self> {
         // 只有「這個平台沒有實作」才映成 NoCapture。裝置不見了、擷取起不來
         // 都是真的失敗，不該讓上層退回 fixture。
         let mut capture = platform_capture().map_err(|e| match e {
@@ -390,7 +404,9 @@ impl LocalSttSource {
         };
         let slow = {
             let (models, tx) = (models.clone(), result_tx);
-            std::thread::spawn(move || final_loop(slow_rx, tx, &models, punct, progress, &ready_tx))
+            std::thread::spawn(move || {
+                final_loop(slow_rx, tx, &models, punct, progress, &ready_tx, &*mode)
+            })
         };
 
         // 落地的音訊段走逐字稿同一條 channel 回 session。音訊執行緒不碰
@@ -482,7 +498,7 @@ impl TranscriptSource for LocalSttSource {
 
     /// 模型載入期間裝置已經在收音了，這段長度是兩個時鐘的固定落差。
     ///
-    /// whisper 那顆模型有五百多 MB，載入要好幾秒到數十秒。不扣掉它，每一段
+    /// TEA-ASR 兩個模型檔合計約一.五 GB，載入要好幾秒到數十秒。不扣掉它，每一段
     /// 音訊的會議時間都會晚上這麼多，而且每場會議都會發生，不只暫停時。
     fn captured_before_attach_ms(&self) -> u64 {
         self.capture_started.elapsed().as_millis() as u64
@@ -585,7 +601,7 @@ impl SharedPunct {
 
 /// 載入標點模型。載不起來就回 `None`，逐字稿照樣產生，只是讀起來像一長串。
 ///
-/// whisper 自己會加一些標點，但它只看得到單一個切片，句子被切斷的地方就
+/// TEA-ASR 自己會加一些標點，但它只看得到單一個切片，句子被切斷的地方就
 /// 加不出來；Paraformer 則完全不出標點。
 pub fn load_punct(model: Option<&str>) -> Option<SharedPunct> {
     let model = model?;
@@ -770,9 +786,9 @@ fn partial_loop(
     }
 }
 
-/// 定稿迴圈：由 VAD 決定切點，一個語音段送一次 whisper。
+/// 定稿迴圈：由 VAD 決定切點，一個語音段送一次 TEA-ASR。
 ///
-/// 不用固定長度切窗：機械地每十二秒切一刀，切點會落在句子中間，whisper 只能
+/// 不用固定長度切窗：機械地每十二秒切一刀，切點會落在句子中間，模型只能
 /// 在殘句內部加標點，結果就是斷句與標點都不成形。VAD 知道哪裡是語音結束
 /// （靜音超過 `min_silence_duration`），在那裡切每段就是完整的一句或幾句話。
 ///
@@ -784,13 +800,18 @@ fn final_loop(
     punct: Option<SharedPunct>,
     progress: Progress,
     ready: &Sender<std::result::Result<(), String>>,
+    mode: &(dyn Fn() -> FinalMode + Send + Sync),
 ) {
-    let (model, vad_model) = (models.whisper.as_str(), models.vad.as_str());
+    let (model, mmproj, vad_model) = (
+        models.tea_model.as_str(),
+        models.tea_mmproj.as_str(),
+        models.vad.as_str(),
+    );
     let speaker_model = models
         .speaker
         .as_ref()
         .map(|(a, b)| (a.as_str(), b.as_str()));
-    let engine = match Whisper::load(model, 4) {
+    let engine = match Tea::load(model, mmproj, 4) {
         Ok(e) => {
             log(&format!("定稿引擎已載入：{model}"));
             let _ = ready.send(Ok(()));
@@ -812,6 +833,8 @@ fn final_loop(
         }
         Corrections::from_file(&p)
     };
+    // 詞表右欄同時當熱詞，放在 prompt 的 system 那一格
+    let hotwords = hotword_prompt(vocab.terms());
 
     // 只有系統音訊軌需要辨識語者：麥克風軌一定是使用者本人，那是不需要
     // 模型就成立的先驗，再去比對聲紋只會製造把自己認成別人的機會。
@@ -878,10 +901,12 @@ fn final_loop(
 
         let buffered_ms = buf.samples.len() as u64 * 1000 / u64::from(SAMPLE_RATE);
 
-        // 對方還在講就別切，會把句子攔腰截斷。除非已經長到 whisper 的
-        // context（30 秒）快裝不下，那時寧可切壞一句也不能讓整段被默默截掉。
-        let must_cut = buffered_ms >= MAX_SEGMENT_MS;
-        if !must_cut && (speaking || buffered_ms < MIN_BATCH_MS) {
+        // 對方還在講就別切，會把句子攔腰截斷。除非已經長到模式的上限，
+        // 那時寧可切壞一句也不能讓定稿一直不出來。模式每次都重讀：
+        // 使用者可以在會議中途切換。
+        let mode = mode();
+        let must_cut = buffered_ms >= mode.max_batch_ms();
+        if !must_cut && (speaking || buffered_ms < mode.min_batch_ms()) {
             continue;
         }
 
@@ -970,10 +995,18 @@ fn final_loop(
             }
         }
 
-        match engine.transcribe(&batch) {
+        // 語者切點要在轉錄之前算：一批裡有兩位以上語者時，每位各自送轉錄
+        // （見 [`transcribe_runs`]）。只有系統音訊軌需要分離語者：麥克風軌
+        // 一定是使用者本人，那是不需要模型就成立的先驗，再去比對只會製造
+        // 認錯的機會。
+        let spans = match (track, speakers.as_mut()) {
+            (Track::System, Some(book)) => book.split(&batch),
+            _ => Vec::new(),
+        };
+        match transcribe_runs(&engine, &batch, &spans, &hotwords) {
             Ok(segments) => {
                 // 能量閘門擋不住的那一種：環境噪音的 RMS 可以剛好高過門檻，
-                // whisper 在上面編出字幕組署名。兩小時實測漏過兩筆，都在
+                // 模型在上面編出字幕組署名（whisper 時代實測）。兩小時實測漏過兩筆，都在
                 // 沒人說話的麥克風軌上。
                 let texts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
                 if crate::stt::is_hallucination(&texts, level) {
@@ -991,12 +1024,6 @@ fn final_loop(
                 ));
                 let counter = progress.of(track);
                 let n = counter.load(Ordering::Relaxed);
-                // 只有系統音訊軌需要分離語者：麥克風軌一定是使用者本人，
-                // 那是不需要模型就成立的先驗，再去比對只會製造認錯的機會。
-                let spans = match (track, speakers.as_mut()) {
-                    (Track::System, Some(book)) => book.split(&batch),
-                    _ => Vec::new(),
-                };
                 if !spans.is_empty() {
                     let names: std::collections::BTreeSet<&str> =
                         spans.iter().map(|s| s.speaker.as_str()).collect();
@@ -1039,7 +1066,11 @@ fn final_loop(
         if voiced == 0 {
             continue;
         }
-        let Ok(segments) = engine.transcribe(&batch) else {
+        let spans = match (*track, speakers.as_mut()) {
+            (Track::System, Some(book)) => book.split(&batch),
+            _ => Vec::new(),
+        };
+        let Ok(segments) = transcribe_runs(&engine, &batch, &spans, &hotwords) else {
             continue;
         };
         let texts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
@@ -1052,10 +1083,6 @@ fn final_loop(
             buf.start_ms,
             segments.len()
         ));
-        let spans = match (*track, speakers.as_mut()) {
-            (Track::System, Some(book)) => book.split(&batch),
-            _ => Vec::new(),
-        };
         let counter = progress.of(*track);
         let n = counter.load(Ordering::Relaxed);
         let mut ctx = FinalContext {
@@ -1077,7 +1104,7 @@ fn final_loop(
 struct FinalBuffer {
     samples: Vec<f32>,
     voiced_samples: usize,
-    /// 這批音訊在該軌擷取音訊中的起點。whisper 給的時間是相對於送進去的
+    /// 這批音訊在該軌擷取音訊中的起點。引擎給的時間是相對於送進去的
     /// 片段，要加上這個偏移才是會議中的絕對位置。
     start_ms: u64,
 }
@@ -1161,19 +1188,45 @@ fn voiced_ms(vad: &mut SileroVad, samples: &[f32]) -> u64 {
 /// VAD 每次處理的樣本數，必須與 `SileroVadConfig::window_size` 一致。
 const VAD_WINDOW: usize = 512;
 
-/// 送去定稿前至少要累積這麼長的語音。
+/// 定稿批次的長度模式。
 ///
-/// VAD 在每個停頓處都會切一段，直接一段一送的話 whisper 只拿得到一兩秒的
+/// 下限：VAD 在每個停頓處都會切一段，直接一段一送的話模型只拿得到一兩秒的
 /// 片段，轉出來是「那今天感謝。」這種殘句。累積到接近一句完整的話再送，
 /// 模型才有足夠上下文，斷句與標點也才成形。
-const MIN_BATCH_MS: u64 = 8_000;
-
-/// 單段定稿的長度上限。
 ///
-/// whisper 的 context 只有 30 秒，超過會被默默截掉。而且一段講太久，
-/// 使用者要等到整段結束才看得到定稿。VAD 的 `max_speech_duration` 實測
-/// 擋不住連續發言，所以在這裡自己切。
-const MAX_SEGMENT_MS: u64 = 15_000;
+/// 上限：一段講太久，使用者要等到整段結束才看得到定稿。VAD 的
+/// `max_speech_duration` 實測擋不住連續發言，所以在這裡自己切。
+///
+/// 兩種模式是同一個取捨的兩端：會議記錄要的是準（上下文越長越準，晚一分鐘
+/// 看到沒關係），即時字幕要的是快。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalMode {
+    /// 45 到 90 秒一批。
+    Meeting,
+    /// 8 到 15 秒一批。
+    Live,
+}
+
+impl FinalMode {
+    /// 送去定稿前至少要累積這麼長的音訊。
+    pub const fn min_batch_ms(self) -> u64 {
+        match self {
+            Self::Meeting => 45_000,
+            Self::Live => 8_000,
+        }
+    }
+
+    /// 單批定稿的長度上限：到了就切，不等講者停頓。
+    pub const fn max_batch_ms(self) -> u64 {
+        match self {
+            Self::Meeting => 90_000,
+            Self::Live => 15_000,
+        }
+    }
+}
+
+/// 定稿執行緒每次切點判斷時問一次的模式來源。
+pub type ModeSource = Arc<dyn Fn() -> FinalMode + Send + Sync>;
 
 /// 有意義的發言至少要有這個能量。
 ///
@@ -1305,6 +1358,91 @@ fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
+/// 語者換手處往外多切的音訊長度。
+///
+/// 切點來自分割模型，會落在字的邊緣上；多給一點讓換手前後的字完整進到
+/// 模型裡。時間分配仍用沒有加寬的範圍，句子不會跨進鄰段。
+const RUN_PAD_MS: u64 = 200;
+
+/// 一位語者連續發言的一段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpeakerRun {
+    /// 這段在批次裡負責的時間範圍，句子的時間分配在這裡面。
+    /// 相鄰兩段首尾相接，整批沒有漏掉的區間。
+    span: (u64, u64),
+    /// 實際送去轉錄的範圍：`span` 前後各加 [`RUN_PAD_MS`]，夾在批次內。
+    cut: (u64, u64),
+}
+
+/// 按語者把一批音訊切成幾段。
+///
+/// 兩位以上語者時分開轉錄，因為模型不給時間戳：整批一次轉完的話，句子的
+/// 時間是按字數比例估的，換手處的句子會被估到錯的語者身上。各自轉錄之後，
+/// 每一句都落在自己那位語者的範圍裡。
+///
+/// 相鄰的同語者片段合併成一段；段與段的界線取兩者之間空隙的中點，頭尾延伸
+/// 到批次邊界 —— 分割模型沒標到的零碎語音也要有人負責，否則那幾個字會消失。
+/// 少於兩位語者就是整批一段。
+fn speaker_runs(spans: &[SpeakerSpan], batch_ms: u64) -> Vec<SpeakerRun> {
+    let whole = vec![SpeakerRun {
+        span: (0, batch_ms),
+        cut: (0, batch_ms),
+    }];
+    let mut sorted: Vec<&SpeakerSpan> = spans.iter().collect();
+    sorted.sort_by_key(|s| s.start_ms);
+    let mut merged: Vec<(u64, u64, &str)> = Vec::new();
+    for s in sorted {
+        match merged.last_mut() {
+            Some(last) if last.2 == s.speaker => last.1 = last.1.max(s.end_ms),
+            _ => merged.push((s.start_ms, s.end_ms, s.speaker.as_str())),
+        }
+    }
+    if merged.len() < 2 {
+        return whole;
+    }
+    // 第 i 段與第 i+1 段的界線
+    let bounds: Vec<u64> = merged
+        .windows(2)
+        .map(|w| ((w[0].1 + w[1].0) / 2).min(batch_ms))
+        .collect();
+    (0..merged.len())
+        .map(|i| {
+            let lo = if i == 0 { 0 } else { bounds[i - 1] };
+            let hi = bounds.get(i).copied().unwrap_or(batch_ms);
+            (lo, hi.max(lo))
+        })
+        .filter(|(lo, hi)| hi > lo)
+        .map(|(lo, hi)| SpeakerRun {
+            span: (lo, hi),
+            cut: (
+                lo.saturating_sub(RUN_PAD_MS),
+                (hi + RUN_PAD_MS).min(batch_ms),
+            ),
+        })
+        .collect()
+}
+
+/// 轉錄一批音訊：一位語者整批一次，兩位以上每段各一次（見 [`speaker_runs`]）。
+///
+/// 片段時間相對於批次開頭，跟整批一次轉錄時一樣。
+fn transcribe_runs(
+    engine: &Tea,
+    batch: &[f32],
+    spans: &[SpeakerSpan],
+    hotwords: &str,
+) -> Result<Vec<super::Segment>> {
+    let per_ms = u64::from(SAMPLE_RATE) / 1000;
+    let batch_ms = batch.len() as u64 / per_ms;
+    let mut out = Vec::new();
+    for run in speaker_runs(spans, batch_ms) {
+        let lo = (run.cut.0 * per_ms) as usize;
+        let hi = ((run.cut.1 * per_ms) as usize).min(batch.len());
+        let text = engine.text(&batch[lo..hi], hotwords)?;
+        out.extend(timed_sentences(&text, run.span.0, run.span.1));
+    }
+    Ok(out)
+}
+
 /// 送出定稿需要的東西。
 ///
 /// 打包成一個結構而不是攤成八個參數：這些值全都描述「同一批音訊的同一次
@@ -1323,7 +1461,7 @@ struct FinalContext<'a> {
 
 /// 逐句送出定稿，回傳送出的句數；`None` 代表接收端已關閉，呼叫端該收工。
 ///
-/// 一句一段而不是整塊送出：whisper 的 segment 邊界是模型判斷的語意邊界，
+/// 一句一段而不是整塊送出：片段邊界是句末標點（見 `tea::timed_sentences`），
 /// 合併之後畫面上就會出現一大段沒有換行的文字，而且尾巴常常斷在句中
 /// （切片邊界落在句子中間時）。逐句輸出讓每一行都是完整的一句話。
 fn emit_final(
@@ -1980,5 +2118,121 @@ mod speech_floor_tests {
         let floor = SPEECH_FLOOR.max(f.threshold());
         assert!(floor > 0.0050, "安靜環境下擋不住實測的幻覺能量");
         assert!(floor < 0.0107, "門檻高到會吃掉小聲說的話");
+    }
+}
+
+#[cfg(test)]
+mod speaker_run_tests {
+    use super::*;
+
+    fn span(start_ms: u64, end_ms: u64, speaker: &str) -> SpeakerSpan {
+        SpeakerSpan {
+            start_ms,
+            end_ms,
+            speaker: speaker.into(),
+        }
+    }
+
+    fn whole(batch_ms: u64) -> Vec<SpeakerRun> {
+        vec![SpeakerRun {
+            span: (0, batch_ms),
+            cut: (0, batch_ms),
+        }]
+    }
+
+    #[test]
+    fn test_speaker_runs_no_spans_is_the_whole_batch() {
+        assert_eq!(speaker_runs(&[], 60_000), whole(60_000));
+    }
+
+    #[test]
+    fn test_speaker_runs_one_speaker_is_the_whole_batch() {
+        let spans = [span(1_000, 9_000, "A"), span(12_000, 50_000, "A")];
+        assert_eq!(speaker_runs(&spans, 60_000), whole(60_000));
+    }
+
+    #[test]
+    fn test_speaker_runs_alternating_speakers_cover_the_batch_without_gaps() {
+        let spans = [
+            span(0, 10_000, "A"),
+            span(12_000, 20_000, "B"),
+            span(20_000, 30_000, "A"),
+        ];
+        let runs = speaker_runs(&spans, 40_000);
+        assert_eq!(
+            runs.iter().map(|r| r.span).collect::<Vec<_>>(),
+            [(0, 11_000), (11_000, 20_000), (20_000, 40_000)]
+        );
+        assert_eq!(
+            runs.iter().map(|r| r.cut).collect::<Vec<_>>(),
+            [(0, 11_200), (10_800, 20_200), (19_800, 40_000)]
+        );
+    }
+
+    #[test]
+    fn test_speaker_runs_adjacent_same_speaker_spans_merge() {
+        let spans = [
+            span(0, 5_000, "A"),
+            span(5_500, 9_000, "A"),
+            span(9_000, 20_000, "B"),
+            span(21_000, 30_000, "B"),
+        ];
+        let runs = speaker_runs(&spans, 30_000);
+        assert_eq!(
+            runs.iter().map(|r| r.span).collect::<Vec<_>>(),
+            [(0, 9_000), (9_000, 30_000)]
+        );
+    }
+
+    #[test]
+    fn test_speaker_runs_unsorted_spans_are_ordered_first() {
+        let spans = [span(9_000, 20_000, "B"), span(0, 9_000, "A")];
+        let runs = speaker_runs(&spans, 20_000);
+        assert_eq!(
+            runs.iter().map(|r| r.span).collect::<Vec<_>>(),
+            [(0, 9_000), (9_000, 20_000)]
+        );
+    }
+
+    #[test]
+    fn test_speaker_runs_padding_is_clamped_at_the_batch_edges() {
+        // 換手點離批次頭尾都不到 200 ms
+        let spans = [
+            span(0, 100, "A"),
+            span(100, 4_900, "B"),
+            span(4_900, 5_000, "A"),
+        ];
+        let runs = speaker_runs(&spans, 5_000);
+        assert_eq!(
+            runs.iter().map(|r| r.cut).collect::<Vec<_>>(),
+            [(0, 300), (0, 5_000), (4_700, 5_000)]
+        );
+    }
+
+    #[test]
+    fn test_speaker_runs_span_past_the_batch_end_is_clamped() {
+        // 分割模型的最後一段可能比實際樣本長一點點
+        let spans = [span(0, 3_000, "A"), span(3_000, 9_999, "B")];
+        let runs = speaker_runs(&spans, 5_000);
+        assert_eq!(runs.last().unwrap().span, (3_000, 5_000));
+        assert!(runs.iter().all(|r| r.cut.1 <= 5_000));
+    }
+
+    #[test]
+    fn test_final_mode_thresholds() {
+        assert_eq!(
+            (
+                FinalMode::Meeting.min_batch_ms(),
+                FinalMode::Meeting.max_batch_ms()
+            ),
+            (45_000, 90_000)
+        );
+        assert_eq!(
+            (
+                FinalMode::Live.min_batch_ms(),
+                FinalMode::Live.max_batch_ms()
+            ),
+            (8_000, 15_000)
+        );
     }
 }
