@@ -133,9 +133,7 @@ impl SinkHandle {
         snapshot: Option<Snapshot>,
         commands: Option<CommandHandler>,
     ) {
-        let url = url
-            .map(|u| u.trim().to_owned())
-            .filter(|u| !u.is_empty());
+        let url = url.map(|u| u.trim().to_owned()).filter(|u| !u.is_empty());
         let on = url.is_some();
         // 先公布目標再開啟旗標：反過來的話中間那一瞬間會把批次送進一個
         // 還不知道要連去哪裡的任務。
@@ -431,9 +429,10 @@ mod tests {
     /// 退避倍增到 5 秒就停住。
     #[test]
     fn test_next_backoff_caps_at_five_seconds() {
-        let seq: Vec<Duration> = std::iter::successors(Some(BACKOFF_MIN), |d| Some(next_backoff(*d)))
-            .take(8)
-            .collect();
+        let seq: Vec<Duration> =
+            std::iter::successors(Some(BACKOFF_MIN), |d| Some(next_backoff(*d)))
+                .take(8)
+                .collect();
         assert_eq!(
             seq,
             vec![
@@ -487,7 +486,10 @@ mod tests {
         // 所以要等 `connected` 為真才送；那之後的每一筆都保證轉發。
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !handle.connected() {
-            assert!(tokio::time::Instant::now() < deadline, "5 秒內沒連上測試伺服器");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "5 秒內沒連上測試伺服器"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         handle.try_send(r#"{"n":1}"#.to_owned());
