@@ -13,10 +13,17 @@ import {
   settings,
   type BackendOption,
   type FieldSource,
+  type FinalMode,
   type ProviderKind,
   type ResolvedProvider,
   type SecretPresence,
 } from '../session';
+
+const FINAL_MODE_LABEL: Record<FinalMode, string> = {
+  auto: '自動（有外部連線時即時）',
+  meeting: '會議（準確，約 45 秒後定稿）',
+  live: '即時（約 10 秒後定稿）',
+};
 
 const KIND_LABEL: Record<ProviderKind, string> = {
   stt: '逐字稿 Provider',
@@ -134,19 +141,22 @@ export function SettingsView() {
   // null 代表還沒讀到。用它區分「載入中」與「已知關閉」，
   // 否則畫面會先閃一下錯的狀態，讓人以為設定被改掉了。
   const [keepAudio, setKeepAudio] = useState<boolean | null>(null);
+  const [finalMode, setFinalMode] = useState<FinalMode | null>(null);
 
   const reload = useCallback(async () => {
     try {
       // 偵測要啟動子行程，比讀設定慢，但兩者一起等：先畫出一個
       // 還不知道能不能用的選單，只會讓使用者選到一半又被換掉
-      const [r, b, keep] = await Promise.all([
+      const [r, b, keep, mode] = await Promise.all([
         settings.get(),
         settings.backends(),
         settings.keepAudio(),
+        settings.finalMode(),
       ]);
       setBackends(b);
       setRows(r);
       setKeepAudio(keep);
+      setFinalMode(mode);
       // 草稿從已解析的值起始，包含環境變數提供的值：
       // 使用者看到的就是實際生效的內容
       setDrafts(
@@ -337,6 +347,43 @@ export function SettingsView() {
           </section>
         );
       })}
+
+      <section className="panel">
+        <div className="panel-head">
+          <span className="card-title">定稿模式</span>
+        </div>
+        <label className="setting-field">
+          <span className="setting-label">定稿模式</span>
+          <select
+            value={finalMode ?? 'auto'}
+            disabled={finalMode === null}
+            onChange={async (e) => {
+              const next = e.target.value as FinalMode;
+              const prev = finalMode;
+              // 先更新畫面再寫後端：跟保留原音不同，這個開關在會議進行中
+              // 也會生效，使用者按下去要立刻看到選到了哪個，寫入失敗再退回。
+              setFinalMode(next);
+              try {
+                await settings.setFinalMode(next);
+                setStatus({ tone: 'ok', text: `定稿模式已改為${FINAL_MODE_LABEL[next]}` });
+              } catch (err) {
+                setFinalMode(prev);
+                setStatus({ tone: 'bad', text: String(err) });
+              }
+            }}
+          >
+            {(Object.keys(FINAL_MODE_LABEL) as FinalMode[]).map((m) => (
+              <option key={m} value={m}>
+                {FINAL_MODE_LABEL[m]}
+              </option>
+            ))}
+          </select>
+        </label>
+        <p className="hint">
+          會議記錄要準，即時字幕（例如面試提詞）要快，兩者要的批次長度不一樣。自動模式在有外部
+          連線時視為需要即時，否則視為一般會議；改動立即生效，不必重開會議。
+        </p>
+      </section>
 
       <section className="panel">
         <div className="panel-head">
