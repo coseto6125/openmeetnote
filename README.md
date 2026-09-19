@@ -94,7 +94,8 @@ openmeetnote.exe                    # Windows: next to the .exe
 OpenMeetNote.app                    # macOS: next to the .app, not inside it
 vocabulary.txt                      # proper-noun corrections, edit freely
 models/
-  ggml-large-v3-turbo-q5_0.bin      # final transcript
+  TEA-ASR-1.1.Q4_K_M.gguf           # final transcript (text decoder)
+  TEA-ASR-1.1.mmproj-Q8_0.gguf      # final transcript (audio encoder)
   sherpa-onnx-paraformer-zh-.../    # live transcript
   sherpa-onnx-punct-ct-transformer/ # punctuation
   silero_vad.onnx                   # voice activity detection
@@ -117,7 +118,8 @@ priority over the GUI settings:
 | Variable | Purpose |
 |---|---|
 | `OPENMEETNOTE_LLM_PROVIDER` | `claude-code`, `codex`, `system`, `fixture` |
-| `OMN_WHISPER_MODEL` | Final-transcript model path |
+| `OMN_TEA_MODEL` | Final-transcript text decoder (GGUF) |
+| `OMN_TEA_MMPROJ` | Final-transcript audio encoder (mmproj GGUF) |
 | `OMN_PARAFORMER_DIR` | Live-transcript model directory |
 | `OMN_VAD_MODEL` | Voice activity model |
 | `OMN_PUNCT_MODEL` | Punctuation model |
@@ -149,7 +151,7 @@ Two engines, because they differ by a factor of twenty in speed:
 | Stage | Engine | RTF | Role |
 |---|---|---|---|
 | Live | Paraformer int8 | 0.03 | Words on screen while the meeting runs |
-| Final | whisper large-v3-turbo-q5 | 0.55 | Quality, punctuation, timestamps |
+| Final | TEA-ASR-1.1 Q4_K_M (llama.cpp) | 0.1–0.15 | Quality, punctuation; sentence times are proportional estimates |
 
 Audio passes Silero VAD for segmentation, then two gates decide whether a
 batch is worth the final engine at all: too little energy is skipped outright,
@@ -263,7 +265,7 @@ only teaches people to ignore red. Point `OMN_TEST_ASSETS` at the directory.
 ## Building
 
 Native builds work on Windows and macOS with the usual toolchain plus `cmake`,
-`ninja` and a C++ compiler for whisper.cpp.
+`ninja` and a C++ compiler for llama.cpp.
 
 The Windows binary can also be cross-compiled from Linux:
 
@@ -277,10 +279,11 @@ pnpm tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --no-bundle
 That needs ninja, Clang 19 or newer, and cargo-xwin. Three pitfalls are
 recorded in [CONTEXT.md](./CONTEXT.md): cmake not finding ninja, MSVC's STL
 requiring Clang 19, and cross-compilation not enabling CPU SIMD — the last one
-makes whisper nine times slower if left alone.
+made whisper nine times slower. llama.cpp now gets its x86 instruction sets
+from `.cargo/config.toml` on every build, native or cross.
 
-Two dependencies are vendored under `src-tauri/vendor/` because they carry
-patches. Both are otherwise byte-identical to their crates.io release, so
+One dependency is vendored under `src-tauri/vendor/` because it carries
+patches. It is otherwise byte-identical to its crates.io release, so
 `diff` shows exactly what changed. The reasons are in
 [`src-tauri/vendor/README.md`](./src-tauri/vendor/README.md).
 
@@ -301,7 +304,7 @@ patches. Both are otherwise byte-identical to their crates.io release, so
 ## Stack
 
 Tauri 2, React + TypeScript, Rust core, SQLite, WASAPI loopback (Windows),
-ScreenCaptureKit + CoreAudio (macOS), whisper.cpp, sherpa-onnx.
+ScreenCaptureKit + CoreAudio (macOS), llama.cpp, sherpa-onnx.
 
 ## License
 
