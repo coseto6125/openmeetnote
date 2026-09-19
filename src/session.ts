@@ -340,6 +340,9 @@ export interface ResolvedProvider {
   secret: SecretPresence;
 }
 
+/** 定稿批次長度模式（見 `stt::live::FinalModeSetting`）。 */
+export type FinalMode = 'auto' | 'meeting' | 'live';
+
 export type BackendKind = 'system' | 'agentCli' | 'api' | 'fixture';
 
 /** 摘要與 Agent Provider 的一個可選後端，含這台機器上的偵測結果。 */
@@ -364,6 +367,9 @@ export const settings = {
   /** 錄音時是否保留原音。關掉之後逐字稿就是唯一紀錄，事後無法驗證。 */
   keepAudio: () => invoke<boolean>('get_keep_audio'),
   setKeepAudio: (keep: boolean) => invoke<void>('set_keep_audio', { keep }),
+  /** 定稿批次長度模式：`auto`（依外部連線自動切換）／`meeting`／`live`。 */
+  finalMode: () => invoke<FinalMode>('get_final_mode'),
+  setFinalMode: (mode: FinalMode) => invoke<void>('set_final_mode', { mode }),
 };
 
 export function subscribe(onBatch: (b: SessionEventBatch) => void): Promise<UnlistenFn> {

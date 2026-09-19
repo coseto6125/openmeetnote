@@ -12,13 +12,37 @@ use openmeetnote_lib::agent::{self, BudgetInputs, GenerationRequest, Limits, Tok
 use openmeetnote_lib::document::{self, Block, RenderContext};
 use openmeetnote_lib::model::{Origin, Timeline, Track};
 use openmeetnote_lib::store::{DomainEvent, SegmentRevision, Store};
-use openmeetnote_lib::stt::{load_wav_16k_mono, whisper::Whisper};
+use openmeetnote_lib::stt::{load_wav_16k_mono, tea::Tea};
 
 fn assets() -> Option<PathBuf> {
     let dir = PathBuf::from(
         std::env::var("OMN_TEST_ASSETS").unwrap_or_else(|_| "/home/enor/whisper-bench".into()),
     );
     dir.is_dir().then_some(dir)
+}
+
+/// TEA-ASR 的兩個模型檔。環境變數優先，其次是素材目錄的 `models/tea/`。
+fn tea_paths(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let pick = |var: &str, name: &str| {
+        std::env::var(var)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| dir.join("models/tea").join(name))
+    };
+    (
+        pick("OMN_TEA_MODEL", "TEA-ASR-1.1.Q4_K_M.gguf"),
+        pick("OMN_TEA_MMPROJ", "TEA-ASR-1.1.mmproj-Q8_0.gguf"),
+    )
+}
+
+fn transcribe(
+    model: &std::path::Path,
+    mmproj: &std::path::Path,
+    samples: &[f32],
+) -> Vec<openmeetnote_lib::stt::Segment> {
+    Tea::load(model.to_str().unwrap(), mmproj.to_str().unwrap(), 4)
+        .expect("載入 TEA-ASR")
+        .transcribe(samples, "")
+        .expect("轉錄")
 }
 
 /// 依字元數估算 token。真實 Planner 用自己的 tokenizer，這裡只需要一個
@@ -44,7 +68,7 @@ fn revision(id: u64, text: &str, start_ms: u64, end_ms: u64) -> SegmentRevision 
         captured_end_ms: end_ms,
         echo_likelihood: None,
         overlap_group_id: None,
-        provider_stream_id: Some("whisper".into()),
+        provider_stream_id: Some("tea".into()),
         provider_result_id: Some(format!("r{id}")),
         rollover_generation: 0,
         origin: Origin::Provider,
@@ -53,26 +77,21 @@ fn revision(id: u64, text: &str, start_ms: u64, end_ms: u64) -> SegmentRevision 
 }
 
 #[test]
+#[ignore = "載入 1.4 GB 的定稿模型；單獨執行"]
 fn test_audio_becomes_a_deliverable_document() {
     let Some(dir) = assets() else {
         eprintln!("略過：找不到測試素材目錄");
         return;
     };
-    let (model, wav) = (
-        dir.join("models/ggml-large-v3-turbo-q5_0.bin"),
-        dir.join("near.wav"),
-    );
-    if !model.exists() || !wav.exists() {
+    let ((model, mmproj), wav) = (tea_paths(&dir), dir.join("near.wav"));
+    if !model.exists() || !mmproj.exists() || !wav.exists() {
         eprintln!("略過：缺少模型或測試音訊");
         return;
     }
 
     // ── 1. 音訊 → 逐字稿 ──────────────────────────────────────────
     let samples = load_wav_16k_mono(wav.to_str().unwrap()).expect("讀取音訊");
-    let segments = Whisper::load(model.to_str().unwrap(), 4)
-        .expect("載入 whisper")
-        .transcribe(&samples)
-        .expect("轉錄");
+    let segments = transcribe(&model, &mmproj, &samples);
     assert!(segments.len() >= 5, "轉錄結果太少，後面的斷言會失去意義");
 
     // ── 2. 逐字稿 → 事件日誌 ──────────────────────────────────────
@@ -271,11 +290,8 @@ fn test_the_whole_chain_holds_on_real_audio() {
         eprintln!("略過：找不到測試素材目錄");
         return;
     };
-    let (model, wav) = (
-        dir.join("models/ggml-large-v3-turbo-q5_0.bin"),
-        dir.join("near.wav"),
-    );
-    if !model.exists() || !wav.exists() {
+    let ((model, mmproj), wav) = (tea_paths(&dir), dir.join("near.wav"));
+    if !model.exists() || !mmproj.exists() || !wav.exists() {
         eprintln!("略過：缺少模型或測試音訊");
         return;
     }
@@ -293,10 +309,7 @@ fn test_the_whole_chain_holds_on_real_audio() {
 
     // ── 1. 音訊 → 逐字稿 ──────────────────────────────────────────
     let samples = load_wav_16k_mono(wav.to_str().unwrap()).expect("讀取音訊");
-    let segments = Whisper::load(model.to_str().unwrap(), 4)
-        .expect("載入 whisper")
-        .transcribe(&samples)
-        .expect("轉錄");
+    let segments = transcribe(&model, &mmproj, &samples);
     assert!(segments.len() >= 5, "轉錄結果太少");
 
     let mut store = Store::new(openmeetnote_lib::db::open_in_memory().expect("開資料庫"));

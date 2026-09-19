@@ -562,6 +562,89 @@ pub fn save_secret(config: State<ConfigHandle>, kind: String, value: String) -> 
         .map_err(|e| e.to_string())
 }
 
+/// 事件 sink 的 WebSocket 目標。空字串代表關閉。
+///
+/// 跟 provider 設定分開存：那三欄是「哪個服務、哪個模型」，
+/// 這一個是本機的一條輸出管線，兩者沒有共同的生命週期。
+pub const SINK_URL: &str = "sink_url";
+
+#[tauri::command]
+pub fn get_sink_url(store: State<crate::store::StoreHandle>) -> Result<Option<String>, String> {
+    let st = store.exclusive().map_err(|e| e.to_string())?;
+    Ok(st
+        .app_setting(SINK_URL)
+        .map_err(|e| e.to_string())?
+        .filter(|u| !u.trim().is_empty()))
+}
+
+/// 設定或清除轉發目標，立即生效。
+///
+/// 先寫資料庫再套用：反過來的話，寫入失敗時執行中的行為會跟持久化的設定
+/// 不一致，而使用者看到的是後者。
+#[tauri::command]
+pub fn set_sink_url(
+    app: tauri::AppHandle,
+    store: State<crate::store::StoreHandle>,
+    sink: State<crate::sink::SinkHandle>,
+    url: Option<String>,
+) -> Result<(), String> {
+    // 只收本機的 ws://。規則與理由在 `normalize_url`：啟動時的環境變數路徑
+    // 走同一個函式，兩個入口不會各自放寬。
+    let url = crate::sink::normalize_url(url.as_deref())?;
+    store
+        .exclusive()
+        .map_err(|e| e.to_string())?
+        .set_app_setting(SINK_URL, url.as_deref().unwrap_or(""))
+        .map_err(|e| e.to_string())?;
+    sink.set_url(
+        url,
+        Some(crate::session::sink_snapshot(app.clone())),
+        Some(crate::session::sink_command_handler(app)),
+    );
+    Ok(())
+}
+
+/// 定稿批次長度模式：`auto`／`meeting`／`live`。跟 `SINK_URL` 分開存，
+/// 存取方式（app_settings、環境變數優先、Tauri command）刻意照抄同一套，
+/// 這樣兩個設定在使用者眼裡的行為是一致的。
+pub const FINAL_MODE: &str = "final_mode";
+
+/// 啟動時決定用哪個 `final_mode`：跟 `OPENMEETNOTE_SINK_URL` 同一套優先順序
+/// ——環境變數先於資料庫，兩者都沒有就是 `auto`。抽成純函式是因為
+/// 這條優先順序需要決定性地測，而 `lib.rs` 的 `setup` 裡叫不到假的 env。
+pub fn resolve_final_mode(
+    env: &dyn Env,
+    stored: Option<&str>,
+) -> crate::stt::live::FinalModeSetting {
+    let raw = env
+        .get("OPENMEETNOTE_FINAL_MODE")
+        .or_else(|| stored.map(str::to_owned));
+    crate::stt::live::FinalModeSetting::parse(raw.as_deref().unwrap_or(""))
+}
+
+#[tauri::command]
+pub fn get_final_mode(handle: State<crate::stt::live::FinalModeHandle>) -> Result<String, String> {
+    Ok(handle.get().as_str().to_owned())
+}
+
+/// 設定或清除強制模式，立即生效：`handle.set` 之後，定稿執行緒在下一個
+/// 切點就會讀到新值，不必重開會議。跟 `set_sink_url` 一樣先寫資料庫再套用。
+#[tauri::command]
+pub fn set_final_mode(
+    store: State<crate::store::StoreHandle>,
+    handle: State<crate::stt::live::FinalModeHandle>,
+    mode: String,
+) -> Result<(), String> {
+    let setting = crate::stt::live::FinalModeSetting::parse(&mode);
+    store
+        .exclusive()
+        .map_err(|e| e.to_string())?
+        .set_app_setting(FINAL_MODE, setting.as_str())
+        .map_err(|e| e.to_string())?;
+    handle.set(setting);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn clear_secret(config: State<ConfigHandle>, kind: String) -> Result<(), String> {
     let kind = ProviderKind::parse(&kind).ok_or("未知的 Provider 類別")?;
@@ -805,5 +888,51 @@ mod tests {
     #[test]
     fn a_missing_executable_is_reported_as_absent_not_as_an_error() {
         assert!(resolve_exe("openmeetnote-no-such-binary").is_none());
+    }
+
+    // ── resolve_final_mode：跟 OPENMEETNOTE_SINK_URL 同一套優先順序 ──
+
+    #[test]
+    fn test_resolve_final_mode_env_wins_over_the_stored_value() {
+        let env = FakeEnv::with(&[("OPENMEETNOTE_FINAL_MODE", "live")]);
+        assert_eq!(
+            resolve_final_mode(&env, Some("meeting")),
+            crate::stt::live::FinalModeSetting::Live
+        );
+    }
+
+    #[test]
+    fn test_resolve_final_mode_env_whitespace_only_falls_back_to_stored_value() {
+        // `SystemEnv::get` 已經把空白值當成沒設定；`FakeEnv` 走同一個
+        // 介面，這裡驗證的是呼叫端不會把空白字串誤當成「env 設定了」。
+        let env = FakeEnv::with(&[("OPENMEETNOTE_FINAL_MODE", "   ")]);
+        assert_eq!(
+            resolve_final_mode(&env, Some("meeting")),
+            crate::stt::live::FinalModeSetting::Meeting
+        );
+    }
+
+    #[test]
+    fn test_resolve_final_mode_absent_everywhere_defaults_to_auto() {
+        assert_eq!(
+            resolve_final_mode(&FakeEnv::default(), None),
+            crate::stt::live::FinalModeSetting::Auto
+        );
+    }
+
+    #[test]
+    fn test_resolve_final_mode_stored_unknown_value_falls_back_to_auto() {
+        assert_eq!(
+            resolve_final_mode(&FakeEnv::default(), Some("turbo")),
+            crate::stt::live::FinalModeSetting::Auto
+        );
+    }
+
+    #[test]
+    fn test_resolve_final_mode_stored_mixed_case_is_recognized() {
+        assert_eq!(
+            resolve_final_mode(&FakeEnv::default(), Some("Live")),
+            crate::stt::live::FinalModeSetting::Live
+        );
     }
 }

@@ -4,7 +4,8 @@
 //! （M1）完成前就能驗證轉錄品質與分歧標記的實際效果。
 //!
 //! ```text
-//! OMN_WHISPER_MODEL=/path/ggml-large-v3-turbo-q5_0.bin \
+//! OMN_TEA_MODEL=/path/TEA-ASR-1.1.Q4_K_M.gguf \
+//! OMN_TEA_MMPROJ=/path/TEA-ASR-1.1.mmproj-Q8_0.gguf \
 //! OMN_PARAFORMER_DIR=/path/sherpa-onnx-paraformer-zh-2023-09-14 \
 //! cargo run --release --example compare -- meeting.wav
 //! ```
@@ -15,7 +16,7 @@ use openmeetnote_lib::stt::{
     diff::{self, Corrections},
     load_wav_16k_mono,
     paraformer::Paraformer,
-    whisper::Whisper,
+    tea::Tea,
 };
 
 /// 兩個引擎各用幾個執行緒。定稿的吞吐直接決定會議結束後要等多久，
@@ -35,9 +36,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wav = std::env::args()
         .nth(1)
         .ok_or("用法：compare <wav>（16 kHz 單聲道）")?;
-    let whisper_model = env_or(
-        "OMN_WHISPER_MODEL",
-        "/home/enor/whisper-bench/models/ggml-large-v3-turbo-q5_0.bin",
+    let tea_model = env_or(
+        "OMN_TEA_MODEL",
+        "/home/enor/whisper-bench/models/tea/TEA-ASR-1.1.Q4_K_M.gguf",
+    );
+    let tea_mmproj = env_or(
+        "OMN_TEA_MMPROJ",
+        "/home/enor/whisper-bench/models/tea/TEA-ASR-1.1.mmproj-Q8_0.gguf",
     );
     let paraformer_dir = env_or(
         "OMN_PARAFORMER_DIR",
@@ -54,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fast_s = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
-    let slow = Whisper::load(&whisper_model, threads())?.transcribe(&samples)?;
+    let slow = Tea::load(&tea_model, &tea_mmproj, threads())?.transcribe(&samples, "")?;
     let slow_s = t.elapsed().as_secs_f64();
 
     // 使用者詞表之後從設定讀。現在放這裡是為了讓輸出示範校正表的效果，
@@ -65,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "Paraformer {fast_s:.2}s（RTF {:.3}）{} token\n\
-         whisper    {slow_s:.2}s（RTF {:.3}）{} 段\n\
+         TEA-ASR    {slow_s:.2}s（RTF {:.3}）{} 段\n\
          一致 {agreed}/{} 段\n",
         fast_s / audio_s,
         tokens.len(),
@@ -74,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         compared.len(),
     );
 
-    println!("──── 定稿（whisper）────");
+    println!("──── 定稿（TEA-ASR）────");
     let final_text: String = slow.iter().map(|s| s.text.as_str()).collect();
     println!("{}\n", diff::to_traditional(&final_text, &corrections));
 

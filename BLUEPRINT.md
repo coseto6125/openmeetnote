@@ -177,11 +177,11 @@ partial 與 final 由兩個本機引擎分別產生，不是同一個模型跑�
 | 階段 | 引擎 | 角色 |
 |---|---|---|
 | partial | Paraformer 離線 int8（sherpa-onnx） | 錄音期間的即時稿 |
-| final | whisper large-v3-turbo-q5（whisper.cpp） | 片段定稿，提供 `start_ms`／`end_ms` |
+| final | TEA-ASR-1.1 Q4_K_M + mmproj Q8_0（llama.cpp 多模態，行程內） | 片段定稿；`start_ms`／`end_ms` 是估計值 |
 
 兩者對同一片段的結果不一致時，該處標為 `Gap` 交由使用者確認，不靜默採用其中一方。這不是為了保險而多跑一次：實測顯示兩個引擎的錯誤不重疊，分歧本身就指出最可能出錯的位置，而那些位置幾乎都是專有名詞。
 
-whisper 必須帶時間戳執行。`-nt`（no timestamps）會抑制時間戳 token 並改變解碼路徑，微調模型在該模式下會提前輸出 EOT 而截斷；何況引用驗證本來就需要時間戳定位。
+TEA-ASR 不輸出時間戳。每句的 `start_ms`／`end_ms` 是估出來的：一批裡有兩位以上語者時按語者分段各自轉錄，句子按字數比例分配在該段實際有聲音的範圍內（第一個到最後一個 RMS 高過發言下限的 100 ms 窗；沒有就用整段）。語者跟著段走，不從估出來的時間回頭找。誤差約幾百毫秒，語者歸屬與引用定位都容得下；要精確時間得另接強制對齊。
 
 已測過並排除的選項，記在這裡是為了不再走一次：
 
@@ -194,7 +194,7 @@ whisper 必須帶時間戳執行。`-nt`（no timestamps）會抑制時間戳 to
 | SenseVoice int8 | 全面輸給同級的 Paraformer：更慢、命中更少 |
 | whisper medium-q5 | 與 turbo 同分但更慢、記憶體多三成 |
 | 雲端 STT（Azure 等） | 與本機優先定位衝突，且需付費 |
-| 把使用者詞表餵給 whisper 當 initial prompt | 好處只在提示裡全是這場真的講到的詞時存在，而那是事前不會知道的事。同一段音訊七個關鍵詞，命中數：不餵 3、餵這場的 7 個詞 5、15 詞 3、22 詞 3、37 詞 2 —— 多加八個沒講到的詞就把好處抵銷掉，還弄錯本來就對的「達悟族」「原民會」，所以也沒有一個安全的長度上限可設。「召委」「拼板舟」每一種長度都轉不對，校正表一行就解決。重跑方式見 `stt::whisper` 的 `initial_prompt_probe` |
+| 把使用者詞表餵給 whisper 當 initial prompt | 好處只在提示裡全是這場真的講到的詞時存在，而那是事前不會知道的事。同一段音訊七個關鍵詞，命中數：不餵 3、餵這場的 7 個詞 5、15 詞 3、22 詞 3、37 詞 2 —— 多加八個沒講到的詞就把好處抵銷掉，還弄錯本來就對的「達悟族」「原民會」，所以也沒有一個安全的長度上限可設。「召委」「拼板舟」每一種長度都轉不對，校正表一行就解決。這是 whisper 時代的結論。TEA-ASR 的熱詞放在 prompt 的 system 那一格，實測 30 個與這場無關的詞也不傷準確度，所以現在詞表右欄會當熱詞送進去（最多 64 個、單詞 32 字、合計 1024 位元組，含控制 token 語法的詞丟掉） |
 | streaming zipformer 中文系列（14M transducer、small-ctc、zipformer-ctc int8） | 全是中文單語模型。同一段真實會議，Paraformer 認得 gmail、google、meeting、work／worker／works，zipformer-ctc 只吐得出 `GO`、`GOG`、`OK`，英文產品名塌成兩三個大寫字母。目標詞命中 18 次對 20 次，也沒有贏。它在近場 `near.wav` 上領先，因為那份音訊全中文，量不到這個缺口 |
 | Dolphin base CTC int8 | 離線 CTC，要看完整段才出字，補不了即時稿的位置；int8 實際 99 MB（官方頁面標的 77 MB 是壓縮包），比現用的 Paraformer 大 |
 

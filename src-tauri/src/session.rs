@@ -1663,8 +1663,8 @@ impl Session {
 
     /// Stop 走 §6 的 Stopping → Finalizing → Completed。
     ///
-    /// 這裡只走到 Finalizing，最後一步交給 `tick`：按下結束的當下，whisper
-    /// 那邊還積著最多十五秒沒送的音訊，也還有批次正在轉錄。三段一次跳完
+    /// 這裡只走到 Finalizing，最後一步交給 `tick`：按下結束的當下，TEA-ASR
+    /// 那邊還積著最多一個定稿批次沒送的音訊，也還有批次正在轉錄。三段一次跳完
     /// 的話 `tick` 立刻停止 poll，那些結果永遠不會落地，使用者會發現結語
     /// 從逐字稿裡消失 —— 而那通常正是整場最該留下的部分。
     pub fn stop(&mut self) -> CommandReceipt {
@@ -2231,6 +2231,20 @@ pub fn spawn_pump(app: AppHandle) {
             // 先落地再送 UI：畫面上出現的內容必須已經寫進資料庫，
             // 反過來的話崩潰之後畫面看過的東西會消失。
             let _ = flush(&handle, &app.state::<StoreHandle>());
+            // 外部 sink 走同一個節流窗，所以消費者看到的時序跟 UI 一致。
+            // 沒設定目標時的成本是一次 relaxed 讀：不序列化、不送、不等待。
+            // `try_state` 而不是 `state`：sink 沒被 manage 時要當成關閉，
+            // 不是讓事件泵 panic。
+            if let Some(sink) = app.try_state::<crate::sink::SinkHandle>() {
+                if sink.enabled() {
+                    // 這裡序列化一次，emit 裡面還會再序列化一次。共用一份
+                    // 需要改掉 Tauri 的 emit 契約，而那條路上的成本比這一次
+                    // to_string 高得多。
+                    if let Ok(text) = serde_json::to_string(&batch) {
+                        sink.try_send(text);
+                    }
+                }
+            }
             // emit 在鎖外，避免 WebView 的序列化成本拖住命令處理。
             let _ = app.emit(EVENT_CHANNEL, batch);
         }
@@ -2245,6 +2259,13 @@ pub fn start_meeting(
     state: State<SessionHandle>,
     store: State<StoreHandle>,
 ) -> CommandReceipt {
+    begin_meeting(&app, &state, &store)
+}
+
+/// `start_meeting` 的本體。`#[tauri::command]` 的參數形狀由 Tauri 決定，
+/// 拆出來 sink 的命令處理器才進得去：`State` 只在命令的呼叫慣例裡萃取得出來，
+/// 而 sink 那條路上只有一個 `AppHandle`。
+fn begin_meeting(app: &AppHandle, state: &SessionHandle, store: &StoreHandle) -> CommandReceipt {
     // 一次只有一個開始流程。少了這道門，雙擊的第二次會建立空會議、開音訊
     // 裝置、把正在錄音的來源換掉，最後才由 `Session::start` 回報「已在進行
     // 中」—— 拒絕得太晚，傷害已經造成。
@@ -2279,7 +2300,7 @@ pub fn start_meeting(
     // 要清哪一場就刪哪一個。
     //
     // 讀不到設定就當成要保留：預設保留原音，而讀取失敗不該悄悄改變預設。
-    let keep_audio = with_store(&store, |st| st.app_setting(KEEP_AUDIO))
+    let keep_audio = with_store(store, |st| st.app_setting(KEEP_AUDIO))
         .ok()
         .flatten()
         .as_deref()
@@ -2289,7 +2310,7 @@ pub fn start_meeting(
             crate::stt::live::log("設定為不保留原音，這場只留逐字稿");
             None
         }
-        true => match crate::config::audio_dir(&app, meeting) {
+        true => match crate::config::audio_dir(app, meeting) {
             Ok(dir) => Some(dir),
             Err(e) => {
                 crate::stt::live::log(&format!("無法建立音訊目錄，這場不保留原音：{e}"));
@@ -2300,8 +2321,28 @@ pub fn start_meeting(
 
     // 音訊裝置在這裡才開，不在 app 啟動時：錄音沒開始就佔住麥克風，
     // 其他程式會拿不到，而使用者不會知道是誰佔的。
+    // 這個 closure 在定稿執行緒上每個 chunk 都會被呼叫，所以不能碰 I/O，
+    // 模式切換的 log 由即時稿執行緒記（見 `live::partial_loop`）。
+    // `FinalModeHandle` 在這裡複製一份帶進去，共用同一個原子，設定畫面
+    // 改的值下一個切點就看得到。沒被 manage 時退回最準確也最安全的
+    // 會議模式，而不是 panic。sink 的連線旗標同樣在這裡取出一份，
+    // closure 裡只剩兩次原子讀取。
+    let final_mode = app
+        .try_state::<crate::stt::live::FinalModeHandle>()
+        .map(|h| h.inner().clone());
+    let sink_connected = app
+        .try_state::<crate::sink::SinkHandle>()
+        .map(|s| s.connected_flag());
+    let mode: crate::stt::live::ModeSource = std::sync::Arc::new(move || {
+        let connected = sink_connected.as_ref().is_some_and(|f| f());
+        final_mode
+            .as_ref()
+            .map_or(crate::stt::live::FinalMode::Meeting, |h| {
+                h.resolve(connected)
+            })
+    });
     match crate::stt::live::ModelPaths::discover()
-        .and_then(|m| crate::stt::live::LocalSttSource::start(m, audio_dir))
+        .and_then(|m| crate::stt::live::LocalSttSource::start(m, audio_dir, mode))
     {
         Ok(src) => {
             if let Ok(mut s) = state.inner.lock() {
@@ -2322,7 +2363,7 @@ pub fn start_meeting(
         }
     }
 
-    command(&state, &store, |s| s.start(meeting))
+    command(state, store, |s| s.start(meeting))
 }
 
 /// 兩位語者其實是同一個人。
@@ -2883,7 +2924,10 @@ pub fn rebuild_projections(
     with_store(&store, |st| st.rebuild_projections(meeting_id))
 }
 
-fn with_store<T, F>(store: &State<StoreHandle>, f: F) -> Result<T, String>
+/// 取 `&StoreHandle` 而不是 `&State<…>`，理由與 `command` 相同：`State` 會
+/// 自動解參考，命令那邊一個字都不用改，而沒有 `State` 的呼叫端（sink 的命令
+/// 處理器、測試）也進得來。
+fn with_store<T, F>(store: &StoreHandle, f: F) -> Result<T, String>
 where
     F: FnOnce(&mut Store) -> crate::store::Result<T>,
 {
@@ -2954,6 +2998,68 @@ pub fn resync(state: State<SessionHandle>) -> Result<SessionProjection, String> 
     state
         .with(|s| s.projection())
         .map_err(|_| POISONED_NOTE.to_owned())
+}
+
+/// sink 重連時要送的完整投影，跟 `resync` 是同一份資料。
+///
+/// 包成 closure 而不是讓 sink 自己去拿：sink 不該知道 `SessionHandle`，
+/// 而且測試裡沒有 `AppHandle`，接縫留在這邊兩邊都能獨立測。
+///
+/// 拿不到就回 None（鎖損毀、狀態還沒 manage）。沒有快照的連線仍然可用，
+/// 消費者靠 `prevHighSeq` 的缺號自己決定要不要重建。
+pub fn sink_snapshot(app: AppHandle) -> crate::sink::Snapshot {
+    std::sync::Arc::new(move || {
+        let state = app.try_state::<SessionHandle>()?;
+        let projection = state.with(|s| s.projection()).ok()?;
+        let mut value = serde_json::to_value(&projection).ok()?;
+        // 攤平成跟其他 frame 一樣的「kind 在頂層」形狀，
+        // 消費者才能用同一個 switch 分派。
+        value
+            .as_object_mut()?
+            .insert("kind".to_owned(), serde_json::Value::from("sinkSnapshot"));
+        serde_json::to_string(&value).ok()
+    })
+}
+
+/// 消費者透過 sink 送來的命令，走的是 UI 按鈕那條路。
+///
+/// 包成 closure 的理由同 `sink_snapshot`：sink 不該知道 `SessionHandle`。
+/// 每一支都呼叫 `#[tauri::command]` 的本體函式，不是命令本身 —— `State`
+/// 只在命令的呼叫慣例裡萃取得出來，而這裡只有 `AppHandle`。走同一個本體
+/// 因此保證編號配發、事件記錄與 flush 跟使用者按按鈕時完全一樣，WebView
+/// 也就從原本的批次泵收到這些事件。
+///
+/// 回 `Err` 的字串會原樣送回消費者，所以它是給人看的訊息，不是錯誤碼。
+pub fn sink_command_handler(app: AppHandle) -> crate::sink::CommandHandler {
+    std::sync::Arc::new(move |name: &str| -> Result<(), String> {
+        let state = app.try_state::<SessionHandle>().ok_or("工作階段尚未就緒")?;
+        let store = app.try_state::<StoreHandle>().ok_or("資料庫尚未就緒")?;
+        let receipt = match name {
+            "startMeeting" => {
+                // 上一場已經結束時，UI 的流程是先「新會議」再「開始錄音」，
+                // 否則 `Session::start` 會拒絕。消費者只有一個 startMeeting，
+                // 這一步因此補在這裡，而不是要求對方記住兩段式的順序。
+                if matches!(state.with(|s| s.state), Ok(MeetingState::Completed)) {
+                    let r = start_new_meeting(&state, &store);
+                    if !r.accepted {
+                        return Err(r.note.unwrap_or_else(|| POISONED_NOTE.to_owned()));
+                    }
+                }
+                begin_meeting(&app, &state, &store)
+            }
+            "pauseMeeting" => command(&state, &store, |s| s.pause()),
+            "resumeMeeting" => command(&state, &store, |s| s.resume()),
+            "endMeeting" => command(&state, &store, |s| s.stop()),
+            _ => return Err("unknown command".to_owned()),
+        };
+        // pending 也算成功：事件已經記下，只是還沒寫進資料庫，重試由 flush
+        // 那條路負責。回成功並附註是騙人，回失敗會讓消費者再送一次而產生
+        // 兩場會議 —— 這裡選成功，因為命令確實發生了。
+        match receipt.accepted {
+            true => Ok(()),
+            false => Err(receipt.note.unwrap_or_else(|| "命令被拒絕".to_owned())),
+        }
+    })
 }
 
 /// 原型用的降級注入。真實來源是 Adapter 回報，不是命令。
@@ -3058,7 +3164,7 @@ mod tests {
 
     /// 只在收尾階段才吐出結果的來源。
     ///
-    /// 模擬真實情況：使用者按下結束時，whisper 還積著沒送的音訊，結果要
+    /// 模擬真實情況：使用者按下結束時，TEA-ASR 還積著沒送的音訊，結果要
     /// 幾秒後才出來。
     struct LateSource {
         pending: Vec<TranscriptInput>,
@@ -3102,7 +3208,7 @@ mod tests {
     /// 結束會議並等收尾走完。
     ///
     /// stop 只走到 Finalizing，最後一步由 tick 在來源排空之後完成 —— 真實
-    /// 情況下那是 whisper 把殘餘音訊轉完的時間。測試的 fixture 沒有背景
+    /// 情況下那是 TEA-ASR 把殘餘音訊轉完的時間。測試的 fixture 沒有背景
     /// 工作，一個 tick 就結束。
     fn stop_and_settle(s: &mut Session) -> CommandReceipt {
         let r = s.stop();
@@ -3336,7 +3442,7 @@ mod tests {
     ///
     /// 音訊裝置在模型載入前就開始收音（否則開頭會掉字），會議時鐘卻要等
     /// `start` 才跑。少了這個常數，每一段音訊的會議時間都晚上一個模型載入
-    /// 的長度 —— whisper 那顆五百多 MB，這不是可以忽略的誤差，而且每場
+    /// 的長度 —— TEA-ASR 的模型檔案（GGUF 主模型加 mmproj 音訊編碼器）不小，這不是可以忽略的誤差，而且每場
     /// 會議都會發生，不只暫停時。
     #[test]
     fn test_audio_recorded_while_the_models_loaded_keeps_its_meeting_time() {

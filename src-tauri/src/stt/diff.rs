@@ -11,8 +11,8 @@ use super::{Segment, Token};
 /// 存在的理由有兩個，形狀相同所以合成一張表：
 ///
 /// 1. zhconv 的台灣轉換不含部分 IT 詞彙（「網絡」該是「網路」）。
-/// 2. 專有名詞是所有引擎的共同盲區，而它是事後校正。為什麼不改餵給模型當
-///    提示，理由與量到的數字記在 `from_file` 上。
+/// 2. 專有名詞是所有引擎的共同盲區。右欄也會當熱詞餵給定稿引擎，兩者
+///    怎麼分工記在 `from_file` 上。
 pub struct Corrections(Vec<(String, String)>);
 
 /// 詞彙轉換的內建項。使用者的專有名詞另外附加，不寫死在這裡。
@@ -36,29 +36,14 @@ impl Corrections {
     /// 沒有任何模型轉得對），而每個人的會議裡固定出現的人名、機關名、產品
     /// 代號都不一樣，內建詞表不可能涵蓋。這裡讓使用者自己補。
     ///
-    /// 事後校正而不是餵給模型當提示。理由是量出來的，數字與重跑方式見
-    /// `stt::whisper` 的 `initial_prompt_probe`。同一段會議音訊、七個關鍵詞，
-    /// 提示裡塞幾個詞對上幾個：
+    /// 右欄同時當熱詞餵給定稿引擎（見 [`Corrections::terms`]），左欄的
+    /// 校正照舊在事後套用。兩者不互斥：熱詞讓模型第一次就寫對，校正表收拾
+    /// 它仍然寫錯的。
     ///
-    /// | 提示 | 命中 |
-    /// |---|---|
-    /// | 不帶 | 3 |
-    /// | 7 詞（全是這場講到的） | 5 |
-    /// | 15 詞 | 3 |
-    /// | 22 詞 | 3 |
-    /// | 37 詞 | 2 |
-    ///
-    /// 好處只在「提示裡全是這場真的會講到的詞」時存在，加八個沒講到的詞就
-    /// 沒了，而且那八個詞還會把本來就對的「達悟族」「原民會」弄錯。詞表的
-    /// 用途正是收那些「哪場會用得到還不知道」的詞，所以做不到那個前提，也
-    /// 沒有一個安全的長度上限可以設。
-    ///
-    /// 「召委」與「拼板舟」則是每一種長度都轉不對，校正表一行就解決。提示
-    /// 能做的事校正表都能做，反過來不成立。
-    ///
-    /// （這裡原本寫的是「initial prompt 會讓它整段跳過內容」。那個說法沒有
-    /// 重現：probe 逐十秒統計字數，五種設定都沒有出現塌掉的區間。留著錯的
-    /// 理由會讓下一個人用錯的判準重做這個決定。）
+    /// whisper 時代量過熱詞的反效果：提示裡每多一個這場沒講到的詞，命中就
+    /// 往下掉（7 詞 5 中、37 詞 2 中），所以當時只做事後校正。TEA-ASR 把
+    /// 熱詞放在 system 那一格，實測帶 30 個無關詞也不傷準確度，那個理由已經
+    /// 不成立。
     pub fn from_file(path: &std::path::Path) -> Self {
         let Ok(text) = std::fs::read_to_string(path) else {
             return Self::default();
@@ -84,6 +69,17 @@ impl Corrections {
             .collect();
         extra.append(&mut self.0);
         Self(extra)
+    }
+
+    /// 使用者詞表的右欄（正確寫法），內建的簡繁詞彙不算。
+    ///
+    /// 內建項是補 zhconv 的轉換缺口，不是這場會議會講到的專有名詞，放進
+    /// 熱詞只是佔位置。
+    pub fn terms(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .iter()
+            .filter(|(from, to)| !BUILTIN.iter().any(|(a, b)| a == from && b == to))
+            .map(|(_, to)| to.as_str())
     }
 
     pub fn apply(&self, s: &str) -> String {
@@ -174,6 +170,27 @@ mod tests {
             end_ms,
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn test_terms_without_vocabulary_file_is_empty() {
+        // 內建的簡繁詞彙不是這場會講到的專有名詞
+        assert_eq!(Corrections::default().terms().count(), 0);
+    }
+
+    #[test]
+    fn test_terms_lists_user_right_hand_side_in_order() {
+        let c = Corrections::default().with(&[("達物族", "達悟族"), ("平板舟", "拼板舟")]);
+        assert_eq!(c.terms().collect::<Vec<_>>(), ["達悟族", "拼板舟"]);
+    }
+
+    #[test]
+    fn test_terms_from_file_skips_comments_and_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vocabulary.txt");
+        std::fs::write(&p, "# 註解\n\n召偉=召委\n  \n西拉亞 = 西拉雅\n").unwrap();
+        let c = Corrections::from_file(&p);
+        assert_eq!(c.terms().collect::<Vec<_>>(), ["召委", "西拉雅"]);
     }
 
     fn toks(items: &[(u64, &str)]) -> Vec<Token> {

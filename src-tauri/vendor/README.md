@@ -1,30 +1,12 @@
 # Vendored dependencies
 
-Two crates are vendored here because they carry local patches. Both are
-otherwise byte-identical to the crates.io release they were taken from, so
+One crate is vendored here because it carries local patches. It is
+otherwise byte-identical to the crates.io release it was taken from, so
 `diff` against the registry source shows exactly what changed and nothing else.
 
-They live in-tree rather than in forks so that `git clone && cargo build`
+It lives in-tree rather than in a fork so that `git clone && cargo build`
 works with no extra setup, and so the patch is reviewable in the same commit
 as the code that depends on it.
-
-## `whisper-rs-sys` 0.15.0 — 11 lines in `build.rs`
-
-Cross-compilation does not enable x86 SIMD: `GGML_NATIVE` probes the *build
-host*, not the target. Building the Windows binary from Linux therefore fell
-back to a scalar path and ran **nine times slower** (RTF 3.96 against 0.45
-for a native build).
-
-The patch sets the four instruction-set defines explicitly for `x86_64`
-targets. Everything else, including the bundled `whisper.cpp` sources, is
-upstream.
-
-```
-$ diff -u ~/.cargo/registry/src/*/whisper-rs-sys-0.15.0/build.rs whisper-rs-sys/build.rs
-```
-
-Upstream: <https://github.com/tazz4843/whisper-rs> (MIT)
-Bundled `whisper.cpp`: <https://github.com/ggml-org/whisper.cpp> (MIT)
 
 ## `sherpa-rs` 0.6.8 — three small fixes in two files
 

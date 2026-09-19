@@ -7,6 +7,7 @@ pub mod db;
 pub mod document;
 pub mod model;
 mod session;
+pub mod sink;
 pub mod store;
 pub mod stt;
 
@@ -17,6 +18,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(session::SessionHandle::default())
         .manage(config::ConfigHandle::default())
+        .manage(sink::SinkHandle::default())
         .setup(|app| {
             // 資料庫放 app data dir，不是安裝目錄：安裝目錄在 Windows 需要
             // 提權才能寫，而且解除安裝會連同會議紀錄一起清掉。
@@ -42,7 +44,50 @@ pub fn run() {
                     Err(e) => stt::live::log(&format!("收尾未完成生成失敗：{e}")),
                 }
             }
+            // sink 的目標在 manage 之前讀出來：之後 store 的所有權已經交出去。
+            // 讀不到就當成沒設定 —— 一條轉發管線不該擋住程式啟動。
+            // 環境變數優先於資料庫：沒有設定畫面的時候，這是唯一不用改
+            // 資料庫就能打開轉發的入口，也讓同一份安裝在不同啟動方式下
+            // 可以開關。
+            let sink_url = std::env::var("OPENMEETNOTE_SINK_URL")
+                .ok()
+                .filter(|u| !u.trim().is_empty())
+                .or_else(|| {
+                    store
+                        .exclusive()
+                        .ok()
+                        .and_then(|st| st.app_setting(config::SINK_URL).ok().flatten())
+                        .filter(|u| !u.trim().is_empty())
+                });
+            // 跟 sink_url 同一個道理：讀不到資料庫就當成沒設定，而「沒設定」
+            // 在 `final_mode` 這裡就是 `auto`，不該讓一個設定讀不到就擋住
+            // 會議開始。
+            let stored_final_mode = store
+                .exclusive()
+                .ok()
+                .and_then(|st| st.app_setting(config::FINAL_MODE).ok().flatten());
+            let final_mode =
+                config::resolve_final_mode(&config::SystemEnv, stored_final_mode.as_deref());
             app.manage(store);
+            app.manage(stt::live::FinalModeHandle::new(final_mode));
+
+            // 資料庫裡的值可能是舊版存進去的，環境變數更沒有經過設定畫面：
+            // 兩者都走 `set_sink_url` 那一道檢查。不合格就不開轉發，並記下原因。
+            let sink_url = match sink::normalize_url(sink_url.as_deref()) {
+                Ok(url) => url,
+                Err(why) => {
+                    stt::live::log(&format!("事件 sink 目標被拒絕，轉發保持關閉：{why}"));
+                    None
+                }
+            };
+            if let Some(url) = sink_url {
+                stt::live::log(&format!("事件 sink 轉發到 {url}"));
+                app.state::<sink::SinkHandle>().set_url(
+                    Some(url),
+                    Some(session::sink_snapshot(app.handle().clone())),
+                    Some(session::sink_command_handler(app.handle().clone())),
+                );
+            }
 
             session::spawn_pump(app.handle().clone());
             Ok(())
@@ -79,6 +124,10 @@ pub fn run() {
             config::save_provider,
             config::save_secret,
             config::clear_secret,
+            config::get_sink_url,
+            config::set_sink_url,
+            config::get_final_mode,
+            config::set_final_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,28 +1,38 @@
-//! whisper 在無語音音訊上的幻覺（實測迴歸）。
+//! 定稿模型在無語音音訊上的幻覺（實測迴歸）。
 //!
-//! 兩小時 soak 漏過兩筆「字幕志愿者 XXX」，都在沒人說話的麥克風軌上，
-//! RMS 剛好高過能量門檻。這裡用真實模型重現它，確認判準擋得住。
+//! whisper 時代的兩小時 soak 漏過兩筆「字幕志愿者 XXX」，都在沒人說話的
+//! 麥克風軌上，RMS 剛好高過能量門檻。這裡用真實模型重現它，確認判準擋得住。
+//! 換成 TEA-ASR 之後判準照舊，這些測試守的是「若它編了，我們擋得住」。
 
-use openmeetnote_lib::stt::{is_hallucination, whisper::Whisper};
+use openmeetnote_lib::stt::{is_hallucination, tea::Tea};
 
-fn model() -> Option<Whisper> {
-    let p = std::path::PathBuf::from(
+fn model() -> Option<Tea> {
+    let dir = std::path::PathBuf::from(
         std::env::var("OMN_TEST_ASSETS").unwrap_or_else(|_| "/home/enor/whisper-bench".into()),
-    )
-    .join("models/ggml-large-v3-turbo-q5_0.bin");
-    p.exists()
-        .then(|| Whisper::load(p.to_str().unwrap(), 4).expect("載入模型"))
+    );
+    let pick = |var: &str, name: &str| {
+        std::env::var(var)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| dir.join("models/tea").join(name))
+    };
+    let m = pick("OMN_TEA_MODEL", "TEA-ASR-1.1.Q4_K_M.gguf");
+    let p = pick("OMN_TEA_MMPROJ", "TEA-ASR-1.1.mmproj-Q8_0.gguf");
+    (m.exists() && p.exists())
+        .then(|| Tea::load(m.to_str().unwrap(), p.to_str().unwrap(), 4).expect("載入模型"))
 }
 
 #[test]
-fn test_whisper_invents_subtitle_credits_on_silence_and_the_filter_catches_them() {
+#[ignore = "載入 1.4 GB 的定稿模型；單獨執行"]
+fn test_silence_hallucinations_if_any_are_caught_by_the_filter() {
     let Some(w) = model() else {
         eprintln!("略過：找不到模型");
         return;
     };
 
     // 純靜音是最乾淨的重現：沒有任何訊號，模型仍會產生訓練資料殘留
-    let segs = w.transcribe(&vec![0.0f32; 16_000 * 8]).expect("轉錄靜音");
+    let segs = w
+        .transcribe(&vec![0.0f32; 16_000 * 8], "")
+        .expect("轉錄靜音");
     println!(
         "靜音轉出 {} 句：{:?}",
         segs.len(),
@@ -30,7 +40,7 @@ fn test_whisper_invents_subtitle_credits_on_silence_and_the_filter_catches_them(
     );
 
     // 模型行為會隨版本變動，所以斷言的是「若它編了，我們擋得住」，
-    // 而不是「它一定會編」—— 後者是在測 whisper 不是測我們的程式碼。
+    // 而不是「它一定會編」—— 後者是在測模型不是測我們的程式碼。
     let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
     if texts
         .iter()
@@ -44,6 +54,7 @@ fn test_whisper_invents_subtitle_credits_on_silence_and_the_filter_catches_them(
 }
 
 #[test]
+#[ignore = "載入 1.4 GB 的定稿模型；單獨執行"]
 fn test_real_speech_survives_the_filter() {
     let Some(w) = model() else { return };
     let dir = std::path::PathBuf::from(
@@ -56,7 +67,7 @@ fn test_real_speech_survives_the_filter() {
     }
     let s = openmeetnote_lib::stt::load_wav_16k_mono(wav.to_str().unwrap()).expect("讀音訊");
     let rms = (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt();
-    let segs = w.transcribe(&s[..16_000 * 30]).expect("轉錄語音");
+    let segs = w.transcribe(&s[..16_000 * 30], "").expect("轉錄語音");
 
     let texts: Vec<&str> = segs.iter().map(|x| x.text.as_str()).collect();
     assert!(

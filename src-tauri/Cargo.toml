@@ -19,13 +19,30 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tokio = { version = "1", features = ["time"] }
+# sync/net/macros 是 sink 要的：有界通道與 watch（sync）、WebSocket 底下的
+# TCP（net）、轉發迴圈的 select!（macros）。
+tokio = { version = "1", features = ["time", "sync", "net", "macros"] }
+# 事件 sink 的傳輸層。只走 ws://：外部消費者跑在同一台機器上（§5.1 的
+# 「本機優先」），為此掛一份 TLS 實作只會多一顆原生相依。
+tokio-tungstenite = "0.29"
+# tokio-tungstenite 的 Stream/Sink 要靠它的 extension trait 才能用。
+# 已經在相依樹裡，這裡只是把它變成直接相依。
+futures-util = { version = "0.3", default-features = false, features = [
+    "std",
+    "sink",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 thiserror = "2.0.19"
 sha2 = "0.11.0"
-whisper-rs = "0.16.0"
+# 定稿引擎 TEA-ASR 走 llama.cpp 的多模態（mtmd）音訊路徑，只用 CPU。
+# 關掉預設 feature：openmp 會讓 Windows 版多依賴 vcomp140.dll、Linux 版多依賴
+# libgomp，ggml 自己的執行緒池就夠用；common 是 llama.cpp 的 CLI 輔助碼，mtmd
+# 用不到。x86 SIMD 的設定在 repo 根目錄的 .cargo/config.toml。
+llama-cpp-2 = { version = "0.1.156", default-features = false, features = [
+    "mtmd",
+] }
 hound = "3.5.1"
 strsim = "0.11.1"
 zhconv = "0.4.1"
@@ -56,7 +73,7 @@ sherpa-rs = "0.6.8"
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "4", features = ["windows-native-keyring-store"] }
 # 系統音訊 loopback 與麥克風擷取（§5.2）。純 Rust 綁定，不需要 C++ 工具鏈，
-# 因此交叉編譯到 Windows 不會像 whisper.cpp 那樣需要額外處理。
+# 因此交叉編譯到 Windows 不會像 llama.cpp 那樣需要額外處理。
 wasapi = "0.24"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -84,12 +101,7 @@ cpal = "0.18"
 rubato = "5"
 
 
-# whisper-rs-sys 在交叉編譯時不會開啟 x86 SIMD：GGML_NATIVE 偵測的是編譯主機
-# 而不是目標，結果 Windows 版慢九倍（RTF 3.96 對原生的 0.45）。這份 patch 只
-# 多加四個 cmake define，其餘與上游相同。
 [patch.crates-io]
-whisper-rs-sys = { path = "vendor/whisper-rs-sys" }
-
 # sherpa-rs 的 Diarize::compute 有兩個會讓行程崩潰的問題：C 端回傳 null 時
 # 直接解參考，以及「分不出語者」那條路徑提早 bail 而跳過資源釋放，累積幾次
 # 之後堆就壞了。這份 patch 只補這兩處，其餘與上游相同。
