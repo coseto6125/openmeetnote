@@ -138,6 +138,13 @@ impl SinkHandle {
         self.shared.connected.load(Ordering::Acquire)
     }
 
+    /// 與 [`Self::connected`] 同一個旗標，但可以帶離 handle。給不能碰鎖的
+    /// 執行緒用：定稿執行緒每個切點都要知道有沒有消費者在聽。
+    pub fn connected_flag(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let shared = Arc::clone(&self.shared);
+        move || shared.connected.load(Ordering::Acquire)
+    }
+
     /// 設定或清除轉發目標。`None`（或空字串）代表關閉。
     ///
     /// 第一次設定目標時才建立背景任務，因此「沒設定」這個狀態下沒有任何
@@ -561,6 +568,18 @@ mod tests {
                 BACKOFF_MAX,
             ]
         );
+    }
+
+    /// 帶離 handle 的旗標跟著同一個原子走，handle 本身消失後仍可讀。
+    #[test]
+    fn test_connected_flag_follows_the_shared_state_after_the_handle_is_gone() {
+        let sink = SinkHandle::default();
+        let flag = sink.connected_flag();
+        assert!(!flag());
+        sink.shared.connected.store(true, Ordering::Release);
+        assert!(flag());
+        drop(sink);
+        assert!(flag());
     }
 
     /// 空字串等於關閉，不會被當成一個目標。

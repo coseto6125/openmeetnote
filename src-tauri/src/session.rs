@@ -2325,18 +2325,16 @@ fn begin_meeting(app: &AppHandle, state: &SessionHandle, store: &StoreHandle) ->
     // 模式切換的 log 由即時稿執行緒記（見 `live::partial_loop`）。
     // `FinalModeHandle` 在這裡複製一份帶進去，共用同一個原子，設定畫面
     // 改的值下一個切點就看得到。沒被 manage 時退回最準確也最安全的
-    // 會議模式，而不是 panic。
-    //
-    // sink 的連線狀態仍走 `try_state`：那是 Tauri 狀態表的查詢，會短暫
-    // 拿一把鎖（不做 I/O）。`SinkHandle` 沒有可複製的連線旗標可以帶進來。
+    // 會議模式，而不是 panic。sink 的連線旗標同樣在這裡取出一份，
+    // closure 裡只剩兩次原子讀取。
     let final_mode = app
         .try_state::<crate::stt::live::FinalModeHandle>()
         .map(|h| h.inner().clone());
-    let app_for_mode = app.clone();
+    let sink_connected = app
+        .try_state::<crate::sink::SinkHandle>()
+        .map(|s| s.connected_flag());
     let mode: crate::stt::live::ModeSource = std::sync::Arc::new(move || {
-        let connected = app_for_mode
-            .try_state::<crate::sink::SinkHandle>()
-            .is_some_and(|s| s.connected());
+        let connected = sink_connected.as_ref().is_some_and(|f| f());
         final_mode
             .as_ref()
             .map_or(crate::stt::live::FinalMode::Meeting, |h| {
