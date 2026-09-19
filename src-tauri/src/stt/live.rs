@@ -8,7 +8,7 @@
 //! 定稿覆蓋即時稿走的是 `segment_id` + revision 那條既有路徑，這裡不需要新規則。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -1231,6 +1231,124 @@ impl FinalMode {
 /// 定稿執行緒每次切點判斷時問一次的模式來源。
 pub type ModeSource = Arc<dyn Fn() -> FinalMode + Send + Sync>;
 
+/// 使用者在設定畫面選的值。`Auto` 還要看有沒有外部連線才知道套用哪一個
+/// `FinalMode`；`Meeting`／`Live` 直接強制，不看連線狀態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalModeSetting {
+    Auto,
+    Meeting,
+    Live,
+}
+
+impl FinalModeSetting {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Meeting => "meeting",
+            Self::Live => "live",
+        }
+    }
+
+    /// 空字串、只有空白、還沒設定過都當成 `auto`；認不得的值也一樣落回
+    /// `auto`，但那種情況會記一行 log —— 使用者可能是打錯字，
+    /// 不該悄悄吃掉這個訊號。大小寫不分：設定檔跟環境變數都可能混用。
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Self::Auto,
+            "meeting" => Self::Meeting,
+            "live" => Self::Live,
+            other => {
+                log(&format!("未知的定稿模式「{other}」，改用自動"));
+                Self::Auto
+            }
+        }
+    }
+
+    /// `Auto` 看目前有沒有外部連線；`Meeting`／`Live` 無視連線狀態。
+    fn resolve(self, connected: bool) -> FinalMode {
+        match self {
+            Self::Meeting => FinalMode::Meeting,
+            Self::Live => FinalMode::Live,
+            Self::Auto => {
+                if connected {
+                    FinalMode::Live
+                } else {
+                    FinalMode::Meeting
+                }
+            }
+        }
+    }
+}
+
+fn encode_setting(setting: FinalModeSetting) -> u8 {
+    match setting {
+        FinalModeSetting::Auto => 0,
+        FinalModeSetting::Meeting => 1,
+        FinalModeSetting::Live => 2,
+    }
+}
+
+fn decode_setting(v: u8) -> FinalModeSetting {
+    match v {
+        1 => FinalModeSetting::Meeting,
+        2 => FinalModeSetting::Live,
+        _ => FinalModeSetting::Auto,
+    }
+}
+
+/// `final_mode` 設定的執行期狀態。放一個原子而不是每次切點都查資料庫：
+/// `ModeSource` 在定稿執行緒上被呼叫，不能等鎖、不能等 I/O。
+/// `set_final_mode` 改的就是這個值，因此改動在下一個切點就會生效，
+/// 不必重開會議。
+pub struct FinalModeHandle {
+    setting: AtomicU8,
+    /// 上一次記過 log 的實際模式；0 代表還沒記過。跟 `setting` 的編碼
+    /// 分開，因為這裡多一個「尚未記過」的狀態，覆用同一個編碼會跟
+    /// `Meeting`（也是設定值裡的某個變體）混淆。
+    logged: AtomicU8,
+}
+
+const LOGGED_NONE: u8 = 0;
+const LOGGED_MEETING: u8 = 1;
+const LOGGED_LIVE: u8 = 2;
+
+impl FinalModeHandle {
+    pub fn new(initial: FinalModeSetting) -> Self {
+        Self {
+            setting: AtomicU8::new(encode_setting(initial)),
+            logged: AtomicU8::new(LOGGED_NONE),
+        }
+    }
+
+    pub fn get(&self) -> FinalModeSetting {
+        decode_setting(self.setting.load(Ordering::Acquire))
+    }
+
+    pub fn set(&self, setting: FinalModeSetting) {
+        self.setting
+            .store(encode_setting(setting), Ordering::Release);
+    }
+
+    /// `ModeSource` 的核心：解出目前該用的 `FinalMode`，只在跟上一次
+    /// 解出來的不同時才印一行 log，而不是每個切點都印。
+    pub fn resolve_and_log(&self, connected: bool) -> FinalMode {
+        let effective = self.get().resolve(connected);
+        let code = match effective {
+            FinalMode::Meeting => LOGGED_MEETING,
+            FinalMode::Live => LOGGED_LIVE,
+        };
+        let prev = self.logged.swap(code, Ordering::AcqRel);
+        if prev != code {
+            let label = match effective {
+                FinalMode::Meeting => "會議（45～90 秒）",
+                FinalMode::Live => "即時（8～15 秒）",
+            };
+            log(&format!("定稿模式切換為{label}"));
+        }
+        effective
+    }
+}
+
 /// 有意義的發言至少要有這個能量。
 ///
 /// 只在 VAD 已經判定有語音結構之後才套用，所以不會誤殺小聲說的話。
@@ -1564,6 +1682,82 @@ mod tests {
             assert!(buf.samples.len() <= max_samples);
         }
         assert_eq!(buf.samples.len(), max_samples);
+    }
+
+    // ── FinalModeSetting／FinalModeHandle ───────────────────────────
+
+    #[test]
+    fn test_parse_final_mode_absent_returns_auto() {
+        assert_eq!(FinalModeSetting::parse(""), FinalModeSetting::Auto);
+    }
+
+    #[test]
+    fn test_parse_final_mode_whitespace_only_returns_auto() {
+        assert_eq!(FinalModeSetting::parse("   "), FinalModeSetting::Auto);
+    }
+
+    #[test]
+    fn test_parse_final_mode_mixed_case_matches_known_value() {
+        assert_eq!(
+            FinalModeSetting::parse("Meeting"),
+            FinalModeSetting::Meeting
+        );
+        assert_eq!(FinalModeSetting::parse("LIVE"), FinalModeSetting::Live);
+        assert_eq!(FinalModeSetting::parse(" Auto "), FinalModeSetting::Auto);
+    }
+
+    #[test]
+    fn test_parse_final_mode_unknown_value_falls_back_to_auto() {
+        assert_eq!(FinalModeSetting::parse("turbo"), FinalModeSetting::Auto);
+    }
+
+    /// 解析表：每個設定值 × 有沒有外部連線。
+    #[test]
+    fn test_resolve_final_mode_every_setting_times_connected_state() {
+        let cases = [
+            (FinalModeSetting::Auto, true, FinalMode::Live),
+            (FinalModeSetting::Auto, false, FinalMode::Meeting),
+            (FinalModeSetting::Meeting, true, FinalMode::Meeting),
+            (FinalModeSetting::Meeting, false, FinalMode::Meeting),
+            (FinalModeSetting::Live, true, FinalMode::Live),
+            (FinalModeSetting::Live, false, FinalMode::Live),
+        ];
+        for (setting, connected, want) in cases {
+            assert_eq!(
+                setting.resolve(connected),
+                want,
+                "{setting:?} connected={connected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_final_mode_handle_set_applies_at_the_next_cut_without_restart() {
+        // 模擬「會議進行中改設定」：closure 只建一次，`set` 之後
+        // 下一次呼叫就要看到新值，不必重建 handle。
+        let handle = FinalModeHandle::new(FinalModeSetting::Meeting);
+        assert_eq!(handle.resolve_and_log(false), FinalMode::Meeting);
+        handle.set(FinalModeSetting::Live);
+        assert_eq!(handle.resolve_and_log(false), FinalMode::Live);
+    }
+
+    #[test]
+    fn test_final_mode_handle_rapid_double_set_last_one_wins() {
+        let handle = FinalModeHandle::new(FinalModeSetting::Auto);
+        handle.set(FinalModeSetting::Meeting);
+        handle.set(FinalModeSetting::Live);
+        assert_eq!(handle.get(), FinalModeSetting::Live);
+    }
+
+    #[test]
+    fn test_final_mode_handle_resolve_and_log_only_logs_on_change() {
+        // `resolve_and_log` 的 log 副作用不好斷言，這裡驗證它至少不會 panic，
+        // 而且連續呼叫同一個有效模式時 `logged` 只切換一次狀態轉移。
+        let handle = FinalModeHandle::new(FinalModeSetting::Meeting);
+        for _ in 0..5 {
+            assert_eq!(handle.resolve_and_log(false), FinalMode::Meeting);
+        }
+        assert_eq!(handle.logged.load(Ordering::Relaxed), LOGGED_MEETING);
     }
 }
 
