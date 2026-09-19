@@ -92,7 +92,7 @@ sherpa-rs = { version = "0.6.8", default-features = false, features = [
 ] }
 # 系統音訊走 ScreenCaptureKit（macOS 13+），它可以直接指定 16 kHz 單聲道，
 # 錄下來就是轉錄要的格式。
-screencapturekit = "8"
+screencapturekit = "10"
 # 麥克風走 CoreAudio。不跟系統音訊共用 ScreenCaptureKit 是因為它的麥克風
 # 擷取要 macOS 15，綁在那上面等於讓 13 與 14 的使用者錄不到自己的聲音。
 cpal = "0.18"
