@@ -2231,6 +2231,20 @@ pub fn spawn_pump(app: AppHandle) {
             // 先落地再送 UI：畫面上出現的內容必須已經寫進資料庫，
             // 反過來的話崩潰之後畫面看過的東西會消失。
             let _ = flush(&handle, &app.state::<StoreHandle>());
+            // 外部 sink 走同一個節流窗，所以消費者看到的時序跟 UI 一致。
+            // 沒設定目標時的成本是一次 relaxed 讀：不序列化、不送、不等待。
+            // `try_state` 而不是 `state`：sink 沒被 manage 時要當成關閉，
+            // 不是讓事件泵 panic。
+            if let Some(sink) = app.try_state::<crate::sink::SinkHandle>() {
+                if sink.enabled() {
+                    // 這裡序列化一次，emit 裡面還會再序列化一次。共用一份
+                    // 需要改掉 Tauri 的 emit 契約，而那條路上的成本比這一次
+                    // to_string 高得多。
+                    if let Ok(text) = serde_json::to_string(&batch) {
+                        sink.try_send(text);
+                    }
+                }
+            }
             // emit 在鎖外，避免 WebView 的序列化成本拖住命令處理。
             let _ = app.emit(EVENT_CHANNEL, batch);
         }
@@ -2245,6 +2259,13 @@ pub fn start_meeting(
     state: State<SessionHandle>,
     store: State<StoreHandle>,
 ) -> CommandReceipt {
+    begin_meeting(&app, &state, &store)
+}
+
+/// `start_meeting` 的本體。`#[tauri::command]` 的參數形狀由 Tauri 決定，
+/// 拆出來 sink 的命令處理器才進得去：`State` 只在命令的呼叫慣例裡萃取得出來，
+/// 而 sink 那條路上只有一個 `AppHandle`。
+fn begin_meeting(app: &AppHandle, state: &SessionHandle, store: &StoreHandle) -> CommandReceipt {
     // 一次只有一個開始流程。少了這道門，雙擊的第二次會建立空會議、開音訊
     // 裝置、把正在錄音的來源換掉，最後才由 `Session::start` 回報「已在進行
     // 中」—— 拒絕得太晚，傷害已經造成。
@@ -2279,7 +2300,7 @@ pub fn start_meeting(
     // 要清哪一場就刪哪一個。
     //
     // 讀不到設定就當成要保留：預設保留原音，而讀取失敗不該悄悄改變預設。
-    let keep_audio = with_store(&store, |st| st.app_setting(KEEP_AUDIO))
+    let keep_audio = with_store(store, |st| st.app_setting(KEEP_AUDIO))
         .ok()
         .flatten()
         .as_deref()
@@ -2289,7 +2310,7 @@ pub fn start_meeting(
             crate::stt::live::log("設定為不保留原音，這場只留逐字稿");
             None
         }
-        true => match crate::config::audio_dir(&app, meeting) {
+        true => match crate::config::audio_dir(app, meeting) {
             Ok(dir) => Some(dir),
             Err(e) => {
                 crate::stt::live::log(&format!("無法建立音訊目錄，這場不保留原音：{e}"));
@@ -2322,7 +2343,7 @@ pub fn start_meeting(
         }
     }
 
-    command(&state, &store, |s| s.start(meeting))
+    command(state, store, |s| s.start(meeting))
 }
 
 /// 兩位語者其實是同一個人。
@@ -2883,7 +2904,10 @@ pub fn rebuild_projections(
     with_store(&store, |st| st.rebuild_projections(meeting_id))
 }
 
-fn with_store<T, F>(store: &State<StoreHandle>, f: F) -> Result<T, String>
+/// 取 `&StoreHandle` 而不是 `&State<…>`，理由與 `command` 相同：`State` 會
+/// 自動解參考，命令那邊一個字都不用改，而沒有 `State` 的呼叫端（sink 的命令
+/// 處理器、測試）也進得來。
+fn with_store<T, F>(store: &StoreHandle, f: F) -> Result<T, String>
 where
     F: FnOnce(&mut Store) -> crate::store::Result<T>,
 {
@@ -2954,6 +2978,68 @@ pub fn resync(state: State<SessionHandle>) -> Result<SessionProjection, String> 
     state
         .with(|s| s.projection())
         .map_err(|_| POISONED_NOTE.to_owned())
+}
+
+/// sink 重連時要送的完整投影，跟 `resync` 是同一份資料。
+///
+/// 包成 closure 而不是讓 sink 自己去拿：sink 不該知道 `SessionHandle`，
+/// 而且測試裡沒有 `AppHandle`，接縫留在這邊兩邊都能獨立測。
+///
+/// 拿不到就回 None（鎖損毀、狀態還沒 manage）。沒有快照的連線仍然可用，
+/// 消費者靠 `prevHighSeq` 的缺號自己決定要不要重建。
+pub fn sink_snapshot(app: AppHandle) -> crate::sink::Snapshot {
+    std::sync::Arc::new(move || {
+        let state = app.try_state::<SessionHandle>()?;
+        let projection = state.with(|s| s.projection()).ok()?;
+        let mut value = serde_json::to_value(&projection).ok()?;
+        // 攤平成跟其他 frame 一樣的「kind 在頂層」形狀，
+        // 消費者才能用同一個 switch 分派。
+        value
+            .as_object_mut()?
+            .insert("kind".to_owned(), serde_json::Value::from("sinkSnapshot"));
+        serde_json::to_string(&value).ok()
+    })
+}
+
+/// 消費者透過 sink 送來的命令，走的是 UI 按鈕那條路。
+///
+/// 包成 closure 的理由同 `sink_snapshot`：sink 不該知道 `SessionHandle`。
+/// 每一支都呼叫 `#[tauri::command]` 的本體函式，不是命令本身 —— `State`
+/// 只在命令的呼叫慣例裡萃取得出來，而這裡只有 `AppHandle`。走同一個本體
+/// 因此保證編號配發、事件記錄與 flush 跟使用者按按鈕時完全一樣，WebView
+/// 也就從原本的批次泵收到這些事件。
+///
+/// 回 `Err` 的字串會原樣送回消費者，所以它是給人看的訊息，不是錯誤碼。
+pub fn sink_command_handler(app: AppHandle) -> crate::sink::CommandHandler {
+    std::sync::Arc::new(move |name: &str| -> Result<(), String> {
+        let state = app.try_state::<SessionHandle>().ok_or("工作階段尚未就緒")?;
+        let store = app.try_state::<StoreHandle>().ok_or("資料庫尚未就緒")?;
+        let receipt = match name {
+            "startMeeting" => {
+                // 上一場已經結束時，UI 的流程是先「新會議」再「開始錄音」，
+                // 否則 `Session::start` 會拒絕。消費者只有一個 startMeeting，
+                // 這一步因此補在這裡，而不是要求對方記住兩段式的順序。
+                if matches!(state.with(|s| s.state), Ok(MeetingState::Completed)) {
+                    let r = start_new_meeting(&state, &store);
+                    if !r.accepted {
+                        return Err(r.note.unwrap_or_else(|| POISONED_NOTE.to_owned()));
+                    }
+                }
+                begin_meeting(&app, &state, &store)
+            }
+            "pauseMeeting" => command(&state, &store, |s| s.pause()),
+            "resumeMeeting" => command(&state, &store, |s| s.resume()),
+            "endMeeting" => command(&state, &store, |s| s.stop()),
+            _ => return Err("unknown command".to_owned()),
+        };
+        // pending 也算成功：事件已經記下，只是還沒寫進資料庫，重試由 flush
+        // 那條路負責。回成功並附註是騙人，回失敗會讓消費者再送一次而產生
+        // 兩場會議 —— 這裡選成功，因為命令確實發生了。
+        match receipt.accepted {
+            true => Ok(()),
+            false => Err(receipt.note.unwrap_or_else(|| "命令被拒絕".to_owned())),
+        }
+    })
 }
 
 /// 原型用的降級注入。真實來源是 Adapter 回報，不是命令。

@@ -19,7 +19,18 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tokio = { version = "1", features = ["time"] }
+# sync/net/macros 是 sink 要的：有界通道與 watch（sync）、WebSocket 底下的
+# TCP（net）、轉發迴圈的 select!（macros）。
+tokio = { version = "1", features = ["time", "sync", "net", "macros"] }
+# 事件 sink 的傳輸層。只走 ws://：外部消費者跑在同一台機器上（§5.1 的
+# 「本機優先」），為此掛一份 TLS 實作只會多一顆原生相依。
+tokio-tungstenite = "0.29"
+# tokio-tungstenite 的 Stream/Sink 要靠它的 extension trait 才能用。
+# 已經在相依樹裡，這裡只是把它變成直接相依。
+futures-util = { version = "0.3", default-features = false, features = [
+    "std",
+    "sink",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }

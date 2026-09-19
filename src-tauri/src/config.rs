@@ -562,6 +562,53 @@ pub fn save_secret(config: State<ConfigHandle>, kind: String, value: String) -> 
         .map_err(|e| e.to_string())
 }
 
+/// 事件 sink 的 WebSocket 目標。空字串代表關閉。
+///
+/// 跟 provider 設定分開存：那三欄是「哪個服務、哪個模型」，
+/// 這一個是本機的一條輸出管線，兩者沒有共同的生命週期。
+pub const SINK_URL: &str = "sink_url";
+
+#[tauri::command]
+pub fn get_sink_url(store: State<crate::store::StoreHandle>) -> Result<Option<String>, String> {
+    let st = store.exclusive().map_err(|e| e.to_string())?;
+    Ok(st
+        .app_setting(SINK_URL)
+        .map_err(|e| e.to_string())?
+        .filter(|u| !u.trim().is_empty()))
+}
+
+/// 設定或清除轉發目標，立即生效。
+///
+/// 先寫資料庫再套用：反過來的話，寫入失敗時執行中的行為會跟持久化的設定
+/// 不一致，而使用者看到的是後者。
+#[tauri::command]
+pub fn set_sink_url(
+    app: tauri::AppHandle,
+    store: State<crate::store::StoreHandle>,
+    sink: State<crate::sink::SinkHandle>,
+    url: Option<String>,
+) -> Result<(), String> {
+    let url = url.map(|u| u.trim().to_owned()).filter(|u| !u.is_empty());
+    // 只收 ws://。沒有掛 TLS，接受 wss:// 只會在連線時安靜地失敗，
+    // 而使用者在設定當下就該知道這件事。
+    if let Some(u) = &url {
+        if !u.starts_with("ws://") {
+            return Err("目標必須是 ws:// 開頭的位址".into());
+        }
+    }
+    store
+        .exclusive()
+        .map_err(|e| e.to_string())?
+        .set_app_setting(SINK_URL, url.as_deref().unwrap_or(""))
+        .map_err(|e| e.to_string())?;
+    sink.set_url(
+        url,
+        Some(crate::session::sink_snapshot(app.clone())),
+        Some(crate::session::sink_command_handler(app)),
+    );
+    Ok(())
+}
+
 #[tauri::command]
 pub fn clear_secret(config: State<ConfigHandle>, kind: String) -> Result<(), String> {
     let kind = ProviderKind::parse(&kind).ok_or("未知的 Provider 類別")?;
