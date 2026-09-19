@@ -1,0 +1,18 @@
+# llama-cpp-sys-2 的 build script 一律把 GGML_NATIVE 設成 OFF（除非 RUSTFLAGS
+# 帶 target-cpu=native），x86 的 SIMD 改由 CARGO_CFG_TARGET_FEATURE 決定。
+# 而 x86_64 各平台的 Rust 預設目標特性只有 SSE2，所以不管原生組建還是從
+# Linux 交叉編譯到 Windows，ggml 都會退回沒有 AVX 的路徑 —— whisper.cpp 時代
+# 量過，那是慢九倍（RTF 3.96 對 0.45）。
+#
+# 這裡用 build script 明文支援的 GGML_* 環境變數（它們被轉成 cmake 快取項，
+# 只有 build script 沒有明確設定的選項才會生效，AVX 系列正是這種）把指令集
+# 打開。目標是 2015 年後的 x86-64 桌機，這四組可以安全假設存在。只影響 ggml，
+# 不改 Rust 程式碼的 codegen；aarch64 上 ggml 的 CMake 不讀這幾個選項。
+#
+# 放在 repo 根目錄而不是 src-tauri/：cargo 從工作目錄往上找設定檔，CI 是在根
+# 目錄用 --manifest-path 呼叫的。
+[env]
+GGML_AVX = "ON"
+GGML_AVX2 = "ON"
+GGML_FMA = "ON"
+GGML_F16C = "ON"
