@@ -1663,8 +1663,8 @@ impl Session {
 
     /// Stop 走 §6 的 Stopping → Finalizing → Completed。
     ///
-    /// 這裡只走到 Finalizing，最後一步交給 `tick`：按下結束的當下，whisper
-    /// 那邊還積著最多十五秒沒送的音訊，也還有批次正在轉錄。三段一次跳完
+    /// 這裡只走到 Finalizing，最後一步交給 `tick`：按下結束的當下，TEA-ASR
+    /// 那邊還積著最多一個定稿批次沒送的音訊，也還有批次正在轉錄。三段一次跳完
     /// 的話 `tick` 立刻停止 poll，那些結果永遠不會落地，使用者會發現結語
     /// 從逐字稿裡消失 —— 而那通常正是整場最該留下的部分。
     pub fn stop(&mut self) -> CommandReceipt {
@@ -2321,9 +2321,21 @@ fn begin_meeting(app: &AppHandle, state: &SessionHandle, store: &StoreHandle) ->
 
     // 音訊裝置在這裡才開，不在 app 啟動時：錄音沒開始就佔住麥克風，
     // 其他程式會拿不到，而使用者不會知道是誰佔的。
-    // 批次長度模式先固定為會議記錄；切換的開關還沒接上。
-    let mode: crate::stt::live::ModeSource =
-        std::sync::Arc::new(|| crate::stt::live::FinalMode::Meeting);
+    // 這個 closure 在定稿執行緒的每一個切點都會被呼叫，因此只能讀原子
+    // 變數：`app.state` 是 O(1) 的型別表查詢，`connected()`／
+    // `resolve_and_log` 都只讀原子，沒有鎖、沒有資料庫、不會等。
+    // 兩個 handle 都用 `try_state`：sink 沒被 manage 時當成沒連線，
+    // `FinalModeHandle` 少了就退回最準確也最安全的會議模式，而不是 panic。
+    let app_for_mode = app.clone();
+    let mode: crate::stt::live::ModeSource = std::sync::Arc::new(move || {
+        let connected = app_for_mode
+            .try_state::<crate::sink::SinkHandle>()
+            .is_some_and(|s| s.connected());
+        app_for_mode
+            .try_state::<crate::stt::live::FinalModeHandle>()
+            .map(|h| h.resolve_and_log(connected))
+            .unwrap_or(crate::stt::live::FinalMode::Meeting)
+    });
     match crate::stt::live::ModelPaths::discover()
         .and_then(|m| crate::stt::live::LocalSttSource::start(m, audio_dir, mode))
     {
@@ -3147,7 +3159,7 @@ mod tests {
 
     /// 只在收尾階段才吐出結果的來源。
     ///
-    /// 模擬真實情況：使用者按下結束時，whisper 還積著沒送的音訊，結果要
+    /// 模擬真實情況：使用者按下結束時，TEA-ASR 還積著沒送的音訊，結果要
     /// 幾秒後才出來。
     struct LateSource {
         pending: Vec<TranscriptInput>,
@@ -3191,7 +3203,7 @@ mod tests {
     /// 結束會議並等收尾走完。
     ///
     /// stop 只走到 Finalizing，最後一步由 tick 在來源排空之後完成 —— 真實
-    /// 情況下那是 whisper 把殘餘音訊轉完的時間。測試的 fixture 沒有背景
+    /// 情況下那是 TEA-ASR 把殘餘音訊轉完的時間。測試的 fixture 沒有背景
     /// 工作，一個 tick 就結束。
     fn stop_and_settle(s: &mut Session) -> CommandReceipt {
         let r = s.stop();
@@ -3425,7 +3437,7 @@ mod tests {
     ///
     /// 音訊裝置在模型載入前就開始收音（否則開頭會掉字），會議時鐘卻要等
     /// `start` 才跑。少了這個常數，每一段音訊的會議時間都晚上一個模型載入
-    /// 的長度 —— whisper 那顆五百多 MB，這不是可以忽略的誤差，而且每場
+    /// 的長度 —— TEA-ASR 的模型檔案（GGUF 主模型加 mmproj 音訊編碼器）不小，這不是可以忽略的誤差，而且每場
     /// 會議都會發生，不只暫停時。
     #[test]
     fn test_audio_recorded_while_the_models_loaded_keeps_its_meeting_time() {
