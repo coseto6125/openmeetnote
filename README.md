@@ -193,9 +193,10 @@ and it takes effect on the next recording:
 
 Proper nouns are the shared blind spot of every transcription engine, and the
 names that recur in *your* meetings are not the ones that recur in anyone
-else's. Correction happens after the fact rather than as a model prompt:
-whisper's initial prompt does improve proper nouns, but measurably causes it
-to skip whole passages.
+else's. The right-hand terms also go to TEA-ASR as hotwords in the system slot
+of its prompt (at most 64 terms and 1 KB; terms that look like control tokens
+are dropped), and the correction table still runs after the fact for what the
+model gets wrong anyway.
 
 ## Summaries and deliverables
 

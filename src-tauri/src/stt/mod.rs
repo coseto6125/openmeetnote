@@ -22,11 +22,9 @@ pub struct Segment {
     pub start_ms: u64,
     pub end_ms: u64,
     pub text: String,
-    /// 引擎判斷這段沒有語音的機率。Paraformer 與 TEA-ASR 都不提供，一律 0。
-    ///
-    /// 幻覺（憑空生出「字幕志願者 XXX」這類訓練資料殘留）幾乎都伴隨高值：
-    /// 模型自己知道沒東西可轉，但解碼器仍被迫吐出 token。能量閘門擋不住
-    /// 這種情況 —— 環境噪音的能量可以剛好高過門檻。
+    /// 引擎判斷這段沒有語音的機率。目前沒有引擎提供：Paraformer 與 TEA-ASR
+    /// 都一律填 0，也沒有任何程式讀它。幻覺改由 VAD 閘門與
+    /// [`is_hallucination`] 擋。
     pub no_speech: f32,
 }
 
