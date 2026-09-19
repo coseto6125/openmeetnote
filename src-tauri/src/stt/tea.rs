@@ -510,4 +510,24 @@ mod tests {
         };
         assert!(matches!(e, SttError::Load(_)), "{e}");
     }
+
+    #[test]
+    fn test_load_file_that_is_not_gguf_is_a_load_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("broken.gguf");
+        std::fs::write(&bad, b"not a gguf file").unwrap();
+        let bad = bad.to_str().unwrap();
+        let Err(e) = Tea::load(bad, bad, 1) else {
+            panic!("壞掉的模型檔不能載入成功");
+        };
+        assert!(matches!(e, SttError::Load(_)), "{e}");
+    }
+
+    #[test]
+    fn test_backend_initialized_twice_is_the_same_instance() {
+        // llama.cpp 的 backend 第二次初始化會回錯；收尾與測試都會載兩次模型
+        let a = backend().expect("第一次") as *const LlamaBackend;
+        let b = backend().expect("第二次") as *const LlamaBackend;
+        assert_eq!(a, b);
+    }
 }
