@@ -1003,7 +1003,7 @@ fn final_loop(
             (Track::System, Some(book)) => book.split(&batch),
             _ => Vec::new(),
         };
-        match transcribe_runs(&engine, &batch, &spans, &hotwords) {
+        match transcribe_runs(&engine, &batch, &spans, &hotwords, punct.as_ref()) {
             Ok(segments) => {
                 // 能量閘門擋不住的那一種：環境噪音的 RMS 可以剛好高過門檻，
                 // 模型在上面編出字幕組署名（whisper 時代實測）。兩小時實測漏過兩筆，都在
@@ -1033,7 +1033,8 @@ fn final_loop(
                     track,
                     finalized: n,
                     batch_start_ms,
-                    punct: punct.as_ref(),
+                    // 標點已經在 transcribe_runs 裡上過了，見那裡的說明
+                    punct: None,
                     spans: &spans,
                     vocab: &vocab,
                 };
@@ -1070,7 +1071,8 @@ fn final_loop(
             (Track::System, Some(book)) => book.split(&batch),
             _ => Vec::new(),
         };
-        let Ok(segments) = transcribe_runs(&engine, &batch, &spans, &hotwords) else {
+        let Ok(segments) = transcribe_runs(&engine, &batch, &spans, &hotwords, punct.as_ref())
+        else {
             continue;
         };
         let texts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
@@ -1089,7 +1091,8 @@ fn final_loop(
             track: *track,
             finalized: n,
             batch_start_ms: buf.start_ms,
-            punct: punct.as_ref(),
+            // 標點已經在 transcribe_runs 裡上過了，見那裡的說明
+            punct: None,
             spans: &spans,
             vocab: &vocab,
         };
@@ -1425,11 +1428,16 @@ fn speaker_runs(spans: &[SpeakerSpan], batch_ms: u64) -> Vec<SpeakerRun> {
 /// 轉錄一批音訊：一位語者整批一次，兩位以上每段各一次（見 [`speaker_runs`]）。
 ///
 /// 片段時間相對於批次開頭，跟整批一次轉錄時一樣。
+///
+/// 標點在切句之前上，而不是像 whisper 時代那樣留給 `emit_final` 逐句上：
+/// TEA-ASR 常常整段不下標點（實測 90 秒只出一個逗號），切句靠的正是標點，
+/// 先切再上等於切不出句子。整段一次上也讓標點模型看得到完整上下文。
 fn transcribe_runs(
     engine: &Tea,
     batch: &[f32],
     spans: &[SpeakerSpan],
     hotwords: &str,
+    punct: Option<&SharedPunct>,
 ) -> Result<Vec<super::Segment>> {
     let per_ms = u64::from(SAMPLE_RATE) / 1000;
     let batch_ms = batch.len() as u64 / per_ms;
@@ -1438,6 +1446,10 @@ fn transcribe_runs(
         let lo = (run.cut.0 * per_ms) as usize;
         let hi = ((run.cut.1 * per_ms) as usize).min(batch.len());
         let text = engine.text(&batch[lo..hi], hotwords)?;
+        let text = match punct {
+            Some(p) if !text.is_empty() => p.apply(&text),
+            _ => text,
+        };
         out.extend(timed_sentences(&text, run.span.0, run.span.1));
     }
     Ok(out)

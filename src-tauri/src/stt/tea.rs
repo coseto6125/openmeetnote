@@ -242,7 +242,12 @@ pub fn loop_cut<T: PartialEq>(tokens: &[T]) -> Option<usize> {
 /// —— 兩者都容得下這個誤差。
 ///
 /// 在「。？！」切句；切完仍超過 [`MAX_SENTENCE_CHARS`] 的句子再從「，」
-/// 切開，逐段累積到不超過上限為止。沒有逗號的長句維持一句。
+/// 切開，逐段累積到不超過上限為止。
+///
+/// 切完還超過兩倍上限的段落（沒有任何標點的長串）平均切成不超過上限的
+/// 幾段。TEA-ASR 常常整段不下標點（實測 90 秒會議音訊只出一個逗號），
+/// 標點模型又是可選的；不切的話一整批就是畫面上一行幾百字、時間跨一分半
+/// 的片段，語者歸屬與引用定位都失去意義。切在字中間比那好。
 pub fn timed_sentences(text: &str, start_ms: u64, end_ms: u64) -> Vec<Segment> {
     let sentences: Vec<String> = split_on(text, &['。', '？', '！', '?', '!'])
         .into_iter()
@@ -253,6 +258,7 @@ pub fn timed_sentences(text: &str, start_ms: u64, end_ms: u64) -> Vec<Segment> {
                 vec![s]
             }
         })
+        .flat_map(|s| cut_evenly(s, MAX_SENTENCE_CHARS * 2, MAX_SENTENCE_CHARS))
         .collect();
     let total: usize = sentences.iter().map(|s| s.chars().count()).sum();
     if total == 0 {
@@ -282,6 +288,22 @@ fn split_on(text: &str, delims: &[char]) -> Vec<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+        .collect()
+}
+
+/// 超過 `limit` 字就平均切成每段不超過 `size` 字；沒超過的原樣回傳。
+fn cut_evenly(s: String, limit: usize, size: usize) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= limit {
+        return vec![s];
+    }
+    let parts = chars.len().div_ceil(size);
+    (0..parts)
+        .map(|i| {
+            chars[i * chars.len() / parts..(i + 1) * chars.len() / parts]
+                .iter()
+                .collect()
+        })
         .collect()
 }
 
@@ -409,11 +431,21 @@ mod tests {
     }
 
     #[test]
-    fn test_timed_sentences_one_long_clause_stays_whole() {
-        let long = "字".repeat(100);
+    fn test_timed_sentences_one_very_long_clause_is_cut_evenly() {
+        let long: String = ('一'..).take(100).collect();
         let s = timed_sentences(&long, 0, 9_000);
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].text, long);
+        assert_eq!(
+            s.iter().map(|x| x.text.chars().count()).collect::<Vec<_>>(),
+            [33, 33, 34]
+        );
+        assert_eq!(s.iter().map(|x| x.text.as_str()).collect::<String>(), long);
+        assert_eq!((s[0].start_ms, s[2].end_ms), (0, 9_000));
+    }
+
+    #[test]
+    fn test_timed_sentences_clause_up_to_twice_the_cap_stays_whole() {
+        let clause = "字".repeat(MAX_SENTENCE_CHARS * 2);
+        assert_eq!(timed_sentences(&clause, 0, 1_000).len(), 1);
     }
 
     #[test]
