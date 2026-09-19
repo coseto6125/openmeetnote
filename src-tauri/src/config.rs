@@ -588,14 +588,9 @@ pub fn set_sink_url(
     sink: State<crate::sink::SinkHandle>,
     url: Option<String>,
 ) -> Result<(), String> {
-    let url = url.map(|u| u.trim().to_owned()).filter(|u| !u.is_empty());
-    // 只收 ws://。沒有掛 TLS，接受 wss:// 只會在連線時安靜地失敗，
-    // 而使用者在設定當下就該知道這件事。
-    if let Some(u) = &url {
-        if !u.starts_with("ws://") {
-            return Err("目標必須是 ws:// 開頭的位址".into());
-        }
-    }
+    // 只收本機的 ws://。規則與理由在 `normalize_url`：啟動時的環境變數路徑
+    // 走同一個函式，兩個入口不會各自放寬。
+    let url = crate::sink::normalize_url(url.as_deref())?;
     store
         .exclusive()
         .map_err(|e| e.to_string())?

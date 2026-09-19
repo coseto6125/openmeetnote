@@ -19,6 +19,8 @@
 //! 命令本體是同步的，而且開始錄音要開裝置與載入模型，因此它跑在
 //! `spawn_blocking` 上，結果經由一條小通道回到轉發迴圈。轉發迴圈全程不等它，
 //! 命令執行期間批次照送、Ping 照回。
+//!
+//! 消費者被設計成跟 app 在同一台機器上，所以目標只收迴路位址（見 [`normalize_url`]）。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -151,6 +153,41 @@ impl SinkHandle {
             tauri::async_runtime::spawn(run(rx, url_rx, shared, snapshot, commands));
         }
     }
+}
+
+/// 檢查並正規化一個 sink 目標。`Ok(None)` 代表關閉（沒給或只有空白）。
+///
+/// 只收 `ws://` 加迴路主機（`localhost`、`127.0.0.0/8`、`::1`）：消費者被設計成
+/// 跟 app 在同一台機器上，而這條連線會收命令，所以不該連去別台機器。沒有掛
+/// TLS，所以 `wss://` 也不收 —— 使用者在設定當下就該知道，而不是連線時安靜
+/// 地失敗。scheme 大小寫不拘，回傳時統一成小寫，因為 tungstenite 只認小寫。
+pub fn normalize_url(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|u| !u.is_empty()) else {
+        return Ok(None);
+    };
+    let uri: tokio_tungstenite::tungstenite::http::Uri =
+        raw.parse().map_err(|_| format!("解析不了的位址：{raw}"))?;
+    if !uri
+        .scheme_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case("ws"))
+    {
+        return Err("目標必須是 ws:// 開頭的位址".into());
+    }
+    // `host()` 已經去掉 userinfo 與 port：`ws://localhost@evil.com` 的主機是 evil.com。
+    let host = uri.host().unwrap_or("");
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !loopback {
+        return Err(format!(
+            "目標必須是本機位址（localhost、127.0.0.1 或 [::1]），收到的主機是「{host}」"
+        ));
+    }
+    // 前五個字元一定是某種大小寫的 `ws://`：scheme 已確認是 ws，而 Uri 解析
+    // 只接受 `scheme://` 形式的絕對位址。
+    Ok(Some(format!("ws://{}", &raw[5..])))
 }
 
 fn next_backoff(cur: Duration) -> Duration {
@@ -670,5 +707,55 @@ mod tests {
         assert!(got[0].contains(r#""ok":true"#), "實際是 {}", got[0]);
         // 壞訊框沒有進到處理器
         assert_eq!(*seen.lock().unwrap(), vec!["endMeeting".to_owned()]);
+    }
+
+    /* ── 目標檢查 ─────────────────────────────────────────────────── */
+
+    /// 迴路主機的各種寫法都收，scheme 統一成小寫。
+    #[test]
+    fn test_normalize_url_loopback_forms_accepted() {
+        for (raw, want) in [
+            ("ws://127.0.0.1:8765/x", "ws://127.0.0.1:8765/x"),
+            ("  ws://localhost:8765  ", "ws://localhost:8765"),
+            ("ws://LOCALHOST:1/a", "ws://LOCALHOST:1/a"),
+            ("ws://[::1]:8765/x", "ws://[::1]:8765/x"),
+            ("WS://127.0.0.1:8765/x", "ws://127.0.0.1:8765/x"),
+            ("Ws://127.0.0.2:9", "ws://127.0.0.2:9"),
+        ] {
+            assert_eq!(
+                normalize_url(Some(raw)),
+                Ok(Some(want.to_owned())),
+                "輸入 {raw}"
+            );
+        }
+    }
+
+    /// 沒給、空字串、只有空白都等於關閉，不是錯誤。
+    #[test]
+    fn test_normalize_url_absent_or_blank_is_none() {
+        for raw in [None, Some(""), Some("   \t\n")] {
+            assert_eq!(normalize_url(raw), Ok(None), "輸入 {raw:?}");
+        }
+    }
+
+    /// 非迴路主機、偽裝成 localhost 的網域、userinfo 把戲、別的 scheme 一律拒絕。
+    #[test]
+    fn test_normalize_url_non_loopback_rejected() {
+        for raw in [
+            "ws://localhost.evil.com:8765",
+            "ws://evil.com/localhost",
+            "ws://localhost@evil.com:8765",
+            "ws://10.0.0.5:8765",
+            "ws://0.0.0.0:8765",
+            "ws://[::2]:8765",
+            "ws://[::ffff:8.8.8.8]:8765",
+            "wss://localhost:8765",
+            "http://localhost:8765",
+            "localhost:8765",
+            "ws://",
+            "不是位址",
+        ] {
+            assert!(normalize_url(Some(raw)).is_err(), "應該拒絕 {raw}");
+        }
     }
 }

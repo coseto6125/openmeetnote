@@ -71,6 +71,15 @@ pub fn run() {
             app.manage(store);
             app.manage(stt::live::FinalModeHandle::new(final_mode));
 
+            // 資料庫裡的值可能是舊版存進去的，環境變數更沒有經過設定畫面：
+            // 兩者都走 `set_sink_url` 那一道檢查。不合格就不開轉發，並記下原因。
+            let sink_url = match sink::normalize_url(sink_url.as_deref()) {
+                Ok(url) => url,
+                Err(why) => {
+                    stt::live::log(&format!("事件 sink 目標被拒絕，轉發保持關閉：{why}"));
+                    None
+                }
+            };
             if let Some(url) = sink_url {
                 stt::live::log(&format!("事件 sink 轉發到 {url}"));
                 app.state::<sink::SinkHandle>().set_url(
