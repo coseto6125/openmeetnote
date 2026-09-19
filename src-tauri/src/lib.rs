@@ -59,7 +59,17 @@ pub fn run() {
                         .and_then(|st| st.app_setting(config::SINK_URL).ok().flatten())
                         .filter(|u| !u.trim().is_empty())
                 });
+            // 跟 sink_url 同一個道理：讀不到資料庫就當成沒設定，而「沒設定」
+            // 在 `final_mode` 這裡就是 `auto`，不該讓一個設定讀不到就擋住
+            // 會議開始。
+            let stored_final_mode = store
+                .exclusive()
+                .ok()
+                .and_then(|st| st.app_setting(config::FINAL_MODE).ok().flatten());
+            let final_mode =
+                config::resolve_final_mode(&config::SystemEnv, stored_final_mode.as_deref());
             app.manage(store);
+            app.manage(stt::live::FinalModeHandle::new(final_mode));
 
             if let Some(url) = sink_url {
                 stt::live::log(&format!("事件 sink 轉發到 {url}"));
@@ -107,6 +117,8 @@ pub fn run() {
             config::clear_secret,
             config::get_sink_url,
             config::set_sink_url,
+            config::get_final_mode,
+            config::set_final_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
