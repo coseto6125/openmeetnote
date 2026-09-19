@@ -111,6 +111,7 @@ pub struct SpeakerSpan {
 static BOOK: OnceLock<Mutex<Registry>> = OnceLock::new();
 
 /// 一位已經聽過的語者：名字，加上他歷來聲紋的平均方向。
+#[derive(Clone)]
 struct Voice {
     name: String,
     /// 歷來聲紋的總和。方向就是這個人的聲紋中心。
@@ -144,6 +145,7 @@ impl Voice {
 /// 真實音訊裡會飄：同一位語者的兩個短片段可以只有 0.2 的相似度，一段不巧的
 /// 長話也可能跟誰都不像。候選制讓這兩種運氣都只留下一位等不到確認的候選，
 /// 而不是名單上的幽靈。
+#[derive(Clone)]
 struct PendingVoice {
     /// 觀測到的聲紋平均方向，算法與 [`Voice::centroid`] 相同。
     centroid: Vec<f32>,
@@ -176,10 +178,58 @@ impl PendingVoice {
     }
 }
 
-struct Registry {
-    extractor: EmbeddingExtractor,
+/// 名單與候選池：語者辨識會學習的全部狀態。
+#[derive(Clone, Default)]
+struct Roster {
     known: Vec<Voice>,
     pending: Vec<PendingVoice>,
+}
+
+impl Roster {
+    /// 把一段聲紋歸給某個人，必要時更新名單與候選池。
+    fn learn(&mut self, embedding: &[f32], ms: u64) -> Option<String> {
+        match judge(nearest(&self.known, embedding), ms) {
+            Verdict::Same(i) => {
+                self.known[i].absorb(embedding);
+                Some(self.known[i].name.clone())
+            }
+            Verdict::Likely(i) => Some(self.known[i].name.clone()),
+            // 跟誰都不像：先當候選。兩段獨立的長音訊互相吻合才登記，
+            // 見 [`PendingVoice`] 與模組開頭「名單為什麼會長出不存在的人」。
+            Verdict::New | Verdict::Unknown => {
+                confirm_pending(&mut self.pending, &mut self.known, embedding, ms)
+            }
+        }
+    }
+}
+
+struct Registry {
+    extractor: EmbeddingExtractor,
+    roster: Roster,
+    /// 名單每被寫回一次就加一，草稿用它判斷自己是不是從最新的名單分出去的。
+    generation: u64,
+}
+
+/// 一批音訊對名單的學習結果，還沒寫回全域的名單。
+///
+/// 語者切點要在轉錄之前算，但這批最後可能被當成幻覺丟掉、或轉錄失敗。
+/// 那種批次的聲紋不能教名單：丟掉的內容本來就可疑，拿它登記或修正語者，
+/// 名單會長出不存在的人。所以切點算在一份複本上，批次確定送出定稿之後
+/// 才用 [`SpeakerBook::commit`] 寫回；沒寫回的草稿直接丟掉即可。
+pub struct SpeakerDraft {
+    base: u64,
+    roster: Roster,
+}
+
+/// 把草稿寫回名單。草稿分出去之後名單已經被別人寫過，就丟掉這份草稿：
+/// 覆蓋會把中間那次的學習一起抹掉。回傳有沒有寫回。
+fn apply_draft(roster: &mut Roster, generation: &mut u64, draft: SpeakerDraft) -> bool {
+    if draft.base != *generation {
+        return false;
+    }
+    *roster = draft.roster;
+    *generation += 1;
+    true
 }
 
 /// 一段聲紋跟名單比對之後的結論。
@@ -333,8 +383,8 @@ impl SpeakerBook {
             .map_err(|e| super::SttError::Load(e.to_string()))?;
             let _ = BOOK.set(Mutex::new(Registry {
                 extractor,
-                known: Vec::new(),
-                pending: Vec::new(),
+                roster: Roster::default(),
+                generation: 0,
             }));
         }
         let segmenter = match segmentation {
@@ -353,11 +403,50 @@ impl SpeakerBook {
         })
     }
 
-    /// 切出這批音訊裡各段是誰講的，語者名稱跨批次一致。
+    /// 切出這批音訊裡各段是誰講的，並立刻把學到的聲紋寫回名單。
+    ///
+    /// 給不會丟棄批次的呼叫端（量測工具）用；定稿路徑用 [`Self::propose`]
+    /// 加 [`Self::commit`]。
+    pub fn split(&mut self, samples: &[f32]) -> Vec<SpeakerSpan> {
+        let (spans, draft) = self.propose(samples);
+        self.commit(draft);
+        spans
+    }
+
+    /// 切出這批音訊裡各段是誰講的，語者名稱跨批次一致。全域名單不變：
+    /// 學到的東西在回傳的 [`SpeakerDraft`] 裡，交給 [`Self::commit`] 才生效。
     ///
     /// 回傳空的代表這批分不出來，呼叫端應沿用軌道的預設語者 —— 這條路徑
     /// 必須永遠可用，語者分不出來只是少了一個資訊，不該讓逐字稿跟著沒有。
-    pub fn split(&mut self, samples: &[f32]) -> Vec<SpeakerSpan> {
+    pub fn propose(&mut self, samples: &[f32]) -> (Vec<SpeakerSpan>, SpeakerDraft) {
+        let mut draft = match BOOK.get().and_then(|b| b.lock().ok()) {
+            Some(reg) => SpeakerDraft {
+                base: reg.generation,
+                roster: reg.roster.clone(),
+            },
+            None => SpeakerDraft {
+                base: u64::MAX,
+                roster: Roster::default(),
+            },
+        };
+        let spans = self.cut(samples, &mut draft.roster);
+        (spans, draft)
+    }
+
+    /// 把 [`Self::propose`] 的學習結果寫回全域名單。
+    pub fn commit(&self, draft: SpeakerDraft) {
+        let Some(mut reg) = BOOK.get().and_then(|b| b.lock().ok()) else {
+            return;
+        };
+        let Registry {
+            roster, generation, ..
+        } = &mut *reg;
+        if !apply_draft(roster, generation, draft) {
+            super::live::log("語者名單在這批切點算完之前已被更新，這批的聲紋不寫回");
+        }
+    }
+
+    fn cut(&mut self, samples: &[f32], roster: &mut Roster) -> Vec<SpeakerSpan> {
         // 分割模型給的切點跟著語者變化走，靜音切點辦不到的快問快答就靠它。
         // 切出來的每一段照舊交給 attribute() 憑聲紋決定是誰，模型只負責切，
         // 不負責認。整段沒人開口或推論失敗時落回 VAD 路徑，這條路必須永遠
@@ -368,7 +457,11 @@ impl SpeakerBook {
                     return turns
                         .iter()
                         .filter_map(|t| {
-                            self.attribute(&samples[t.start_sample..t.end_sample], t.start_sample)
+                            Self::attribute(
+                                roster,
+                                &samples[t.start_sample..t.end_sample],
+                                t.start_sample,
+                            )
                         })
                         .collect();
                 }
@@ -406,7 +499,7 @@ impl SpeakerBook {
                 let speech = vad.front().samples;
                 vad.pop();
                 let start = consumed.saturating_sub(speech.len());
-                if let Some(span) = self.attribute(&speech, start) {
+                if let Some(span) = Self::attribute(roster, &speech, start) {
                     spans.push(span);
                 }
             }
@@ -416,42 +509,29 @@ impl SpeakerBook {
             let speech = vad.front().samples;
             vad.pop();
             let start = consumed.saturating_sub(speech.len());
-            if let Some(span) = self.attribute(&speech, start) {
+            if let Some(span) = Self::attribute(roster, &speech, start) {
                 spans.push(span);
             }
         }
         spans
     }
 
-    /// 把一段發言歸給某個人，必要時登記一位新語者。
-    fn attribute(&self, speech: &[f32], start_sample: usize) -> Option<SpeakerSpan> {
+    /// 把一段發言歸給某個人，必要時在 `roster` 裡登記一位新語者。
+    fn attribute(roster: &mut Roster, speech: &[f32], start_sample: usize) -> Option<SpeakerSpan> {
         let ms = speech.len() as u64 * 1000 / u64::from(SAMPLE_RATE);
         if ms < MIN_EMBED_MS {
             return None;
         }
-        let lock = BOOK.get()?;
-        let mut reg = lock.lock().ok()?;
-
-        let mut embedding = reg
+        // 鎖只包住聲紋計算：抽取器在全域表裡，名單則是這批的複本
+        let mut embedding = BOOK
+            .get()?
+            .lock()
+            .ok()?
             .extractor
             .compute_speaker_embedding(speech.to_vec(), SAMPLE_RATE)
             .ok()?;
         normalize(&mut embedding);
-
-        let speaker = match judge(nearest(&reg.known, &embedding), ms) {
-            Verdict::Same(i) => {
-                reg.known[i].absorb(&embedding);
-                reg.known[i].name.clone()
-            }
-            Verdict::Likely(i) => reg.known[i].name.clone(),
-            // 跟誰都不像：先當候選。兩段獨立的長音訊互相吻合才登記，
-            // 見 [`PendingVoice`] 與模組開頭「名單為什麼會長出不存在的人」。
-            Verdict::New | Verdict::Unknown => {
-                // 一次拆借兩個欄位：reg 是 MutexGuard，欄位存取會走 DerefMut
-                let Registry { known, pending, .. } = &mut *reg;
-                confirm_pending(pending, known, &embedding, ms)?
-            }
-        };
+        let speaker = roster.learn(&embedding, ms)?;
 
         let start_ms = start_sample as u64 * 1000 / u64::from(SAMPLE_RATE);
         Some(SpeakerSpan {
@@ -707,5 +787,64 @@ mod tests {
             (cosine(&v.centroid, &v.centroid.clone()) - 1.0).abs() < 1e-5,
             "中心必須維持單位長度，否則相似度不再是餘弦"
         );
+    }
+
+    /// 兩段吻合的長音訊足以登記一位新語者。
+    fn enrolling_batch(roster: &mut Roster) -> Vec<Option<String>> {
+        [at(0.0), at(5.0)]
+            .iter()
+            .map(|e| roster.learn(e, 3_000))
+            .collect()
+    }
+
+    #[test]
+    fn test_propose_on_a_rejected_batch_leaves_the_registry_unchanged() {
+        // 草稿是複本：批次被丟掉（草稿沒寫回）時全域名單一個人都不多
+        let registry = Roster::default();
+        let mut draft = SpeakerDraft {
+            base: 0,
+            roster: registry.clone(),
+        };
+        let names = enrolling_batch(&mut draft.roster);
+        assert_eq!(names, [None, Some("s1".to_owned())]);
+        drop(draft);
+        assert!(registry.known.is_empty());
+        assert!(registry.pending.is_empty());
+    }
+
+    #[test]
+    fn test_apply_draft_accepted_batch_updates_the_registry() {
+        let mut registry = Roster::default();
+        let mut generation = 0;
+        let mut draft = SpeakerDraft {
+            base: generation,
+            roster: registry.clone(),
+        };
+        enrolling_batch(&mut draft.roster);
+        assert!(apply_draft(&mut registry, &mut generation, draft));
+        assert_eq!(registry.known.len(), 1);
+        assert_eq!(generation, 1);
+    }
+
+    #[test]
+    fn test_apply_draft_stale_base_is_dropped() {
+        // 草稿分出去之後名單被寫過：覆蓋會抹掉中間那次的學習
+        let mut registry = Roster::default();
+        let mut generation = 0;
+        let mut first = SpeakerDraft {
+            base: generation,
+            roster: registry.clone(),
+        };
+        let mut second = SpeakerDraft {
+            base: generation,
+            roster: registry.clone(),
+        };
+        enrolling_batch(&mut first.roster);
+        second.roster.learn(&at(90.0), 3_000);
+        assert!(apply_draft(&mut registry, &mut generation, first));
+        assert!(!apply_draft(&mut registry, &mut generation, second));
+        assert_eq!(registry.known.len(), 1);
+        assert!(registry.pending.is_empty());
+        assert_eq!(generation, 1);
     }
 }
